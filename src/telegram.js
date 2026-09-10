@@ -99,7 +99,15 @@ function formatDateHashtag(dateStr) {
     return '#Date_' + day + '_' + month + '_' + year;
   }
 
-  // Case 3: Parse full JavaScript Date string from Google Sheets (e.g., "Sat Sep 05 2026 00:00:00 GMT+0530")
+  // Case 3: A bare Excel date serial (days since 1899-12-30), which is what a
+  // date-formatted cell reads as from a local .xlsx. 20000–80000 is 1954–2119.
+  if (/^\d{5}$/.test(clean) && Number(clean) >= 20000 && Number(clean) <= 80000) {
+    const d = new Date(Date.UTC(1899, 11, 30) + Number(clean) * 86400000);
+    return '#Date_' + String(d.getUTCDate()).padStart(2, '0') + '_' +
+      String(d.getUTCMonth() + 1).padStart(2, '0') + '_' + d.getUTCFullYear();
+  }
+
+  // Case 4: Parse full JavaScript Date string from Google Sheets (e.g., "Sat Sep 05 2026 00:00:00 GMT+0530")
   const parsed = new Date(clean);
   // Validate that the parsed timestamp is a real calendar date
   if (!isNaN(parsed.getTime())) {
@@ -115,7 +123,7 @@ function formatDateHashtag(dateStr) {
     return '#Date_' + get('day') + '_' + get('month') + '_' + get('year');
   }
 
-  // Case 4: Fallback for non-standard formats — strip special symbols and ensure Telegram hashtag compatibility
+  // Case 5: Fallback for non-standard formats — strip special symbols and ensure Telegram hashtag compatibility
   const fallback = clean.replace(/[^a-zA-Z0-9_]/g, '_');
   // Check if cleaned fallback text contains any valid characters
   if (!fallback) return '';
@@ -147,8 +155,10 @@ function formatNewspaperHashtag(name) {
     // Capitalize first letter, keep rest as-is
     return w.charAt(0).toUpperCase() + w.slice(1);
   }).join('');
-  // Remove any remaining non-alphanumeric characters (e.g., periods, hyphens)
-  const clean = pascal.replace(/[^a-zA-Z0-9]/g, '');
+  // Remove anything a hashtag cannot hold (periods, hyphens, apostrophes).
+  // Letters, marks and digits of any script stay: Telegram renders #ఈనాడు as a
+  // hashtag, and an ASCII-only filter turned every Telugu paper into nothing.
+  const clean = pascal.replace(/[^\p{L}\p{M}\p{N}_]/gu, '');
   return clean ? '#' + clean : '';
 }
 
@@ -317,13 +327,83 @@ async function sendWithFloodWait(send, attempts = 3) {
   throw lastErr;
 }
 
+/** Telegram's hard limits for a poll: question text and each option. */
+const POLL_QUESTION_MAX = 300;
+const POLL_OPTION_MAX = 100;
+
+/**
+ * buildQuizPost — decides how one question is laid out across its messages.
+ *
+ * Telegram refuses a poll whose question passes 300 characters or any option
+ * passes 100. Statement-style APPSC questions hit both, so:
+ *
+ *   - every option fits    → options go in the poll, as they always have
+ *   - any option too long  → question AND all four options go out as a normal
+ *                            message, and the poll carries just A / B / C / D
+ *   - only the question is too long → the question goes out as a message and
+ *                            the poll keeps the real options
+ *
+ * The Date and Newspaper hashtags are returned as their own line. They cannot
+ * go in the poll (poll text never renders hashtags as tappable), so they ride
+ * on the answer message, which every question gets.
+ *
+ * Pure — no bot calls — so the layout can be tested without Telegram.
+ *
+ * @param {Object} question Question object from the sheet
+ * @returns {{leadMessage: string|null, pollQuestion: string, options: string[], tagLine: string}}
+ */
+function buildQuizPost(question) {
+  const text = String(question.question_text || '').trim();
+  const realOptions = ['option_a', 'option_b', 'option_c', 'option_d']
+    .map((key) => String(question[key] || '').trim());
+  const letters = ['A', 'B', 'C', 'D'];
+
+  const optionsTooLong = realOptions.some((opt) => opt.length > POLL_OPTION_MAX);
+  // Leave a little headroom under 300 for the pointer text added below.
+  const questionTooLong = text.length > POLL_QUESTION_MAX - 10;
+
+  const dateTag = formatDateHashtag(question.date);
+  const newspaperTag = formatNewspaperHashtag(question.newspaper);
+  const tagLine = [dateTag && '📅 ' + dateTag, newspaperTag && '📰 ' + newspaperTag]
+    .filter(Boolean).join('  ');
+
+  if (optionsTooLong) {
+    const optionLines = realOptions.map((opt, i) => `${letters[i]}) ${escapeHtml(opt)}`).join('\n');
+    return {
+      leadMessage: `📝 <b>Question:</b>\n\n${escapeHtml(text)}\n\n${optionLines}`,
+      pollQuestion: 'Choose the correct option for the above question',
+      options: letters.slice(),
+      tagLine
+    };
+  }
+
+  if (questionTooLong) {
+    // Reuse the concluding prompt (e.g. "Which of the statements given above
+    // are correct?") as the poll question when it is short enough to fit.
+    const lines = text.split('\n');
+    const lastLine = lines[lines.length - 1].trim();
+    const pollQuestion = lastLine.endsWith('?') && lastLine.length < 250
+      ? `👆 ${lastLine} (Refer to statements above)`
+      : '👆 Choose the correct answer for the question above:';
+    return {
+      leadMessage: `📝 <b>Question:</b>\n\n${escapeHtml(text)}`,
+      pollQuestion,
+      options: realOptions,
+      tagLine
+    };
+  }
+
+  return { leadMessage: null, pollQuestion: text, options: realOptions, tagLine };
+}
+
 /**
  * sendQuizPoll — Sends a quiz-type poll to a specific forum topic.
  * The poll shows 4 options, marks the correct one, and shows
  * an explanation via the 💡 (lightbulb) icon after the user answers.
+ * Layout for over-long questions and options is decided by buildQuizPost.
  *
  * @param {number} threadId — The message_thread_id of the target forum topic
- * @param {Object} question — Question object from the Excel parser
+ * @param {Object} question — Question object from the sheet
  * @param {string} question.question_text — The question text
  * @param {string} question.option_a — Option A text
  * @param {string} question.option_b — Option B text
@@ -331,22 +411,18 @@ async function sendWithFloodWait(send, attempts = 3) {
  * @param {string} question.option_d — Option D text
  * @param {string} question.correct_answer — Correct answer letter (A/B/C/D)
  * @param {string} question.explanation — Explanation for the 💡 popup
+ * @param {string} [question.date] — Date column, posted as #Date_DD_MM_YYYY
+ * @param {string} [question.newspaper] — Newspaper column, posted as #PaperName
  * @returns {Promise<Object>} The sent message object from Telegram
  */
 async function sendQuizPoll(threadId, question) {
   if (!bot) throw new Error('Bot not initialized');
 
-  // Build the array of 4 poll options
-  const options = [
-    question.option_a,  // Index 0 → Answer A
-    question.option_b,  // Index 1 → Answer B
-    question.option_c,  // Index 2 → Answer C
-    question.option_d   // Index 3 → Answer D
-  ];
+  const post = buildQuizPost(question);
 
   // Map correct answer letter (A/B/C/D) to 0-based index
   const correctMap = { 'A': 0, 'B': 1, 'C': 2, 'D': 3 };
-  const correctIndex = correctMap[question.correct_answer];
+  const correctIndex = correctMap[String(question.correct_answer || '').toUpperCase()];
 
   // Truncate explanation to 200 chars (Telegram's hard limit for quiz explanations)
   let explanation = question.explanation || '';
@@ -368,32 +444,14 @@ async function sendQuizPoll(threadId, question) {
     pollConfig.explanation_parse_mode = 'HTML';     // Allow basic HTML formatting
   }
 
-  // The date / newspaper hashtag line that used to sit under the question was
-  // removed on request: it added visual noise to every poll and pushed long
-  // questions over Telegram's 300-character poll limit for no benefit. The
-  // Date and Newspaper columns are still recorded in the sheet.
-
-  // Telegram limits poll question text to 300 characters. APPSC and other
-  // competitive-exam questions with multiple statements routinely exceed that,
-  // so anything longer goes out as a normal topic message first and the poll
-  // then points at it.
-  let pollQuestion = question.question_text;
-  if (pollQuestion.length > 290) {
-    await sendWithFloodWait(() => bot.sendMessage(groupId, `📝 <b>Question:</b>\n\n${escapeHtml(question.question_text)}`, {
+  if (post.leadMessage) {
+    await sendWithFloodWait(() => bot.sendMessage(groupId, post.leadMessage, {
       message_thread_id: threadId, // Direct message to the specific subject forum topic
       parse_mode: 'HTML'           // Format as HTML for clean readability
     }));
-
-    // Reuse the concluding prompt (e.g. "Which of the statements given above
-    // are correct?") as the poll question when it is short enough to fit.
-    const lines = question.question_text.trim().split('\n');
-    const lastLine = lines[lines.length - 1].trim();
-    if (lastLine.endsWith('?') && lastLine.length < 250) {
-      pollQuestion = `👆 ${lastLine} (Refer to statements above)`;
-    } else {
-      pollQuestion = '👆 Choose the correct answer for the question above:';
-    }
   }
+  const pollQuestion = post.pollQuestion;
+  const options = post.options;
 
   // Send the quiz poll to the Telegram group, targeting the specific topic
   const sent = await sendWithFloodWait(() => bot.sendPoll(groupId, pollQuestion, options, pollConfig));
@@ -413,7 +471,9 @@ async function sendQuizPoll(threadId, question) {
     const spoilerMessage =
       `💡 <b>Answer &amp; Explanation</b> <i>(Tap below to reveal)</i>:\n` +
       `<tg-spoiler>✅ <b>Correct Answer: Option ${answerLetter}</b>\n\n` +
-      `📖 <b>Explanation:</b>\n${explanationText}</tg-spoiler>`;
+      `📖 <b>Explanation:</b>\n${explanationText}</tg-spoiler>` +
+      // Hashtags sit outside the spoiler so they are tappable before revealing.
+      (post.tagLine ? `\n\n${post.tagLine}` : '');
 
     // Send the spoiler message to the specific forum topic thread
     // The poll itself is already out and the row is about to be marked posted,
@@ -658,6 +718,7 @@ module.exports = {
   testConnection,
   createForumTopic,
   sendQuizPoll,
+  buildQuizPost,
   setGroupId,
   extractGroupIdFromLink,
   detectGroupId,
