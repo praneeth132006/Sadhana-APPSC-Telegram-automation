@@ -55,15 +55,18 @@ const { buildQuizPost } = require('../src/telegram');
 const base = {
   question_text: 'Who is the head of the Lok Sabha?',
   option_a: 'Speaker', option_b: 'President', option_c: 'Prime Minister', option_d: 'Chief Justice',
-  correct_answer: 'A', date: '10-09-2026', newspaper: 'The Hindu'
+  correct_answer: 'A', date: '10-09-2026', newspaper: 'The Hindu', topic: 'Fundamental Rights'
 };
 
 test('buildQuizPost keeps short options in the poll and tags the post', () => {
   const post = buildQuizPost(base);
-  assert.equal(post.leadMessage, null);
   assert.equal(post.pollQuestion, base.question_text);
   assert.deepEqual(post.options, ['Speaker', 'President', 'Prime Minister', 'Chief Justice']);
-  assert.equal(post.tagLine, '📅 #Date_10_09_2026  📰 #TheHindu');
+  assert.equal(post.tagLine, '📅 #Date_10_09_2026  📰 #TheHindu  🏷️ #FundamentalRights');
+  // The poll cannot render hashtags and there is no question message, so the
+  // tags fall back to the answer message.
+  assert.equal(post.leadMessage, null);
+  assert.equal(post.answerTagLine, post.tagLine);
 });
 
 test('buildQuizPost moves every option into the question when one passes 100 characters', () => {
@@ -74,17 +77,24 @@ test('buildQuizPost moves every option into the question when one passes 100 cha
   assert.equal(post.pollQuestion, 'Choose the correct option for the above question');
   assert.ok(post.leadMessage.includes(base.question_text));
   assert.ok(post.leadMessage.includes('A) Speaker\nB) ' + longOption + '\nC) x &lt; y &amp; z\nD) Chief Justice'));
+  assert.ok(post.leadMessage.endsWith('\n\n' + post.tagLine));
+  assert.equal(post.answerTagLine, '');
 });
 
 test('buildQuizPost sends only the question ahead when the question alone is too long', () => {
   const longQ = 'Consider the following statements. '.repeat(10) + '\nWhich of the above are correct?';
   const post = buildQuizPost({ ...base, question_text: longQ });
   assert.ok(post.leadMessage.includes('Consider the following'));
+  assert.ok(post.leadMessage.endsWith('\n\n' + post.tagLine));
+  assert.equal(post.answerTagLine, '');
   assert.equal(post.pollQuestion, '👆 Which of the above are correct? (Refer to statements above)');
   assert.deepEqual(post.options, ['Speaker', 'President', 'Prime Minister', 'Chief Justice']);
 });
 
 test('buildQuizPost omits the tag line when the sheet has no date or newspaper', () => {
-  assert.equal(buildQuizPost({ ...base, date: '', newspaper: '' }).tagLine, '');
-  assert.equal(buildQuizPost({ ...base, date: '' }).tagLine, '📰 #TheHindu');
+  const untagged = buildQuizPost({ ...base, date: '', newspaper: '', topic: '' });
+  assert.equal(untagged.tagLine, '');
+  assert.equal(untagged.leadMessage, null);
+  assert.equal(untagged.answerTagLine, '');
+  assert.equal(buildQuizPost({ ...base, date: '', topic: '' }).tagLine, '📰 #TheHindu');
 });
