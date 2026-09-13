@@ -169,6 +169,8 @@ function getUnpostedQuestions(subject, count = Infinity, excelPath = DEFAULT_EXC
       option_d: optionD,
       correct_answer: correctAnswer,
       explanation: String(row['Explanation'] || '').trim(),
+      date: String(row['Date'] || '').trim(),
+      newspaper: String(row['Newspaper'] || '').trim(),
       row_index: i,           // 0-based index in the data array (for writing back)
       excel_row: i + 2         // 1-based Excel row number (row 1 = headers, row 2 = first data)
     });

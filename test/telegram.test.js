@@ -38,3 +38,53 @@ test('formatNewspaperHashtag formats into PascalCase hashtag', () => {
   // Test empty string handling
   assert.equal(formatNewspaperHashtag(''), '');
 });
+
+test('formatNewspaperHashtag keeps non-Latin scripts and drops punctuation', () => {
+  assert.equal(formatNewspaperHashtag('ఈనాడు'), '#ఈనాడు');
+  assert.equal(formatNewspaperHashtag('the hindu'), '#TheHindu');
+  assert.equal(formatNewspaperHashtag("Times of India."), '#TimesOfIndia');
+});
+
+test('formatDateHashtag reads an Excel date serial', () => {
+  // 46275 is 10 Sep 2026 in Excel's day count.
+  assert.equal(formatDateHashtag('46275'), '#Date_10_09_2026');
+});
+
+const { buildQuizPost } = require('../src/telegram');
+
+const base = {
+  question_text: 'Who is the head of the Lok Sabha?',
+  option_a: 'Speaker', option_b: 'President', option_c: 'Prime Minister', option_d: 'Chief Justice',
+  correct_answer: 'A', date: '10-09-2026', newspaper: 'The Hindu'
+};
+
+test('buildQuizPost keeps short options in the poll and tags the post', () => {
+  const post = buildQuizPost(base);
+  assert.equal(post.leadMessage, null);
+  assert.equal(post.pollQuestion, base.question_text);
+  assert.deepEqual(post.options, ['Speaker', 'President', 'Prime Minister', 'Chief Justice']);
+  assert.equal(post.tagLine, '📅 #Date_10_09_2026  📰 #TheHindu');
+});
+
+test('buildQuizPost moves every option into the question when one passes 100 characters', () => {
+  const longOption = 'The Speaker need not be a member of the House at the time of election, but must be elected within six months';
+  assert.ok(longOption.length > 100);
+  const post = buildQuizPost({ ...base, option_b: longOption, option_c: 'x < y & z' });
+  assert.deepEqual(post.options, ['A', 'B', 'C', 'D']);
+  assert.equal(post.pollQuestion, 'Choose the correct option for the above question');
+  assert.ok(post.leadMessage.includes(base.question_text));
+  assert.ok(post.leadMessage.includes('A) Speaker\nB) ' + longOption + '\nC) x &lt; y &amp; z\nD) Chief Justice'));
+});
+
+test('buildQuizPost sends only the question ahead when the question alone is too long', () => {
+  const longQ = 'Consider the following statements. '.repeat(10) + '\nWhich of the above are correct?';
+  const post = buildQuizPost({ ...base, question_text: longQ });
+  assert.ok(post.leadMessage.includes('Consider the following'));
+  assert.equal(post.pollQuestion, '👆 Which of the above are correct? (Refer to statements above)');
+  assert.deepEqual(post.options, ['Speaker', 'President', 'Prime Minister', 'Chief Justice']);
+});
+
+test('buildQuizPost omits the tag line when the sheet has no date or newspaper', () => {
+  assert.equal(buildQuizPost({ ...base, date: '', newspaper: '' }).tagLine, '');
+  assert.equal(buildQuizPost({ ...base, date: '' }).tagLine, '📰 #TheHindu');
+});
