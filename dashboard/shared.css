@@ -1332,3 +1332,7 @@
   padding-top: 12px;
   padding-bottom: 12px;
 }
+
+/* The `hidden` attribute must win over component display rules — `.btn` and
+   `.editor-field` set display, which otherwise leaves "hidden" elements visible. */
+[hidden] { display: none !important; }

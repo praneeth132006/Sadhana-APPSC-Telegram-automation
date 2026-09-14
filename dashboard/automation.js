@@ -14,9 +14,18 @@ import {
   initDashboard, api, el, replaceChildren, statCard, emptyState, pill,
   num, showToast, $, SUBJECTS
 } from './shared.js';
+import {
+  availableToPost, resolvePostCount, estimateDuration, runPostBatches, SERVER_BATCH_LIMIT
+} from './post-plan.js';
 
 /** Latest analytics payload, used for runway and pending counts. */
 let analytics = null;
+
+/** True while a posting run is in progress. */
+let posting = false;
+
+/** Set by the Stop button; checked between batches. */
+let stopRequested = false;
 
 /** Telegram bot connection state from /api/telegram/status. */
 let botState = { configured: false, connected: false };
@@ -95,6 +104,51 @@ function renderSubjectSummary() {
     (entry.threadId ? ` · topic thread #${entry.threadId}` : ' · ⚠️ no Telegram topic configured');
 }
 
+/** Eligible stock for the currently selected subject and eligibility. */
+function currentAvailable() {
+  if (!analytics) return 0;
+  const entry = analytics.subjects.find((s) => s.subject === $('postSubject').value);
+  return availableToPost(entry, $('requireApproved').value === 'true');
+}
+
+/**
+ * renderPostCount — shows the custom input when needed, caps it at the
+ * eligible stock, and explains what the current choice will do.
+ * Returns the resolved count so callers can reuse the validation.
+ */
+function renderPostCount() {
+  const choice = $('postCount').value;
+  const custom = $('postCustomCount');
+  const hint = $('postCountHint');
+  const available = currentAvailable();
+
+  $('postCustomField').hidden = choice !== 'custom';
+  custom.max = String(Math.max(1, available));
+
+  if (!analytics) { hint.textContent = ''; return { ok: false, error: 'Subject data is still loading.' }; }
+
+  const resolved = resolvePostCount(choice, custom.value, available);
+  custom.setAttribute('aria-invalid', String(choice === 'custom' && !resolved.ok && custom.value !== ''));
+
+  if (!resolved.ok) {
+    hint.textContent = choice === 'custom' && custom.value === ''
+      ? `Enter a number from 1 to ${available}.`
+      : resolved.error;
+    hint.style.color = choice === 'custom' && custom.value === '' ? '' : 'var(--accent-danger)';
+  } else {
+    hint.style.color = '';
+    const batches = Math.ceil(resolved.count / SERVER_BATCH_LIMIT);
+    hint.textContent = choice === 'all' || choice === 'custom'
+      ? `Will post ${num(resolved.count)} of ${num(available)} eligible question(s)` +
+        (batches > 1 ? ` in ${batches} batches of up to ${SERVER_BATCH_LIMIT}` : '') +
+        ` — ${estimateDuration(resolved.count)}.`
+      : '';
+  }
+
+  if (!posting) $('postNowBtn').disabled = !resolved.ok && (choice === 'all' || choice === 'custom');
+  return resolved;
+}
+
 /** Table of cron cadence, batch size and runway per subject. */
 function renderCadence() {
   const area = $('cadenceArea');
@@ -166,12 +220,27 @@ function renderCliList() {
 // Actions
 // ---------------------------------------------------------------------------
 
-/** Posts the selected batch to Telegram after an explicit confirmation. */
+/**
+ * Posts the selected number of questions to Telegram after an explicit
+ * confirmation. The server takes at most SERVER_BATCH_LIMIT per request (and a
+ * request must finish inside the function timeout), so "All" and large custom
+ * numbers run as consecutive batches that stop on the first failure.
+ */
 async function postNow() {
+  if (posting) return;
   const subject = $('postSubject').value;
-  const count = Number($('postCount').value);
+  const choice = $('postCount').value;
   const requireApproved = $('requireApproved').value === 'true';
   const button = $('postNowBtn');
+  const stopButton = $('postStopBtn');
+
+  const resolved = renderPostCount();
+  if (!resolved.ok) {
+    showToast('error', resolved.error);
+    if (choice === 'custom') $('postCustomCount').focus();
+    return;
+  }
+  const count = resolved.count;
 
   if (!botState.connected) {
     showToast('error', botState.configured
@@ -181,8 +250,13 @@ async function postNow() {
   }
 
   // Posting is public and irreversible, so it always asks first.
+  const batches = Math.ceil(count / SERVER_BATCH_LIMIT);
   const confirmed = window.confirm(
-    `Post up to ${count} question(s) from "${subject}" to Telegram now?\n\n` +
+    (choice === 'all'
+      ? `Post ALL ${count} eligible question(s) from "${subject}" to Telegram now?`
+      : `Post up to ${count} question(s) from "${subject}" to Telegram now?`) +
+    (batches > 1 ? `\n\nThis runs as ${batches} batches and takes ${estimateDuration(count)}. Keep this tab open.` : '') +
+    '\n\n' +
     (requireApproved
       ? 'Only Approved or Scheduled questions will be sent.'
       : '⚠️ Draft questions are included — they may not have been reviewed.') +
@@ -196,39 +270,66 @@ async function postNow() {
   // so a batch is paced rather than fired off at once. Say so, or a run that is
   // working normally looks like a hang.
   if (count > 3) {
-    log('postLog', `Pacing this batch for Telegram's rate limit — about ${Math.ceil(count * 3 / 60) || 1} minute(s). Leave this tab open.`, 'muted');
+    log('postLog', `Pacing for Telegram's rate limit — ${estimateDuration(count)}. Leave this tab open.`, 'muted');
   }
 
+  let postedSoFar = 0;
+  posting = true;
+  stopRequested = false;
   button.disabled = true;
-  button.textContent = 'Posting…';
+  button.textContent = batches > 1 ? `Posting… (batch 1 of ${batches})` : 'Posting…';
+  stopButton.hidden = batches <= 1;
+  stopButton.disabled = false;
+  stopButton.textContent = '⏹ Stop after this batch';
 
   try {
-    const result = await api('/api/telegram/post', {
-      method: 'POST',
-      body: { subject, count, requireApproved }
+    const outcome = await runPostBatches({
+      total: count,
+      shouldStop: () => stopRequested,
+      postBatch: async (size) => {
+        button.textContent = batches > 1
+          ? `Posting… (${num(postedSoFar)} of ${num(count)} sent)`
+          : 'Posting…';
+        return api('/api/telegram/post', {
+          method: 'POST',
+          body: { subject, count: size, requireApproved }
+        });
+      },
+      onBatch: (result, info) => {
+        postedSoFar = info.postedSoFar;
+        if (batches > 1) log('postLog', `Batch ${info.batch}:`, 'muted');
+        (result.results || []).forEach((r) => {
+          log('postLog',
+            (r.ok ? '✅ ' : '❌ ') + (r.questionId || '') + ' — ' + (r.ok ? r.preview : r.error),
+            r.ok ? 'ok' : 'fail');
+        });
+        log('postLog', result.message, result.failedCount ? 'fail' : (result.postedCount ? 'ok' : 'muted'));
+      }
     });
 
-    if (result.postedCount === 0 && (!result.results || !result.results.length)) {
-      log('postLog', result.message, 'muted');
-      showToast('info', result.message);
-    } else {
-      (result.results || []).forEach((r) => {
-        log('postLog',
-          (r.ok ? '✅ ' : '❌ ') + (r.questionId || '') + ' — ' + (r.ok ? r.preview : r.error),
-          r.ok ? 'ok' : 'fail');
-      });
-      log('postLog', result.message, result.failedCount ? 'fail' : 'ok');
-      showToast(result.failedCount ? 'warn' : 'success', result.message);
-    }
+    const summary = {
+      done: `Done — ${outcome.posted} of ${count} question(s) posted to "${subject}".`,
+      stopped: `Stopped as asked — ${outcome.posted} of ${count} question(s) posted to "${subject}".`,
+      failed: `Stopped after a failure — ${outcome.posted} of ${count} posted. Check the errors above before posting more.`,
+      exhausted: `Queue empty — ${outcome.posted} of ${count} question(s) posted; nothing else was eligible.`
+    }[outcome.stopReason];
 
-    // Refresh the counts so runway and pending totals reflect what just went out.
-    await loadAnalytics();
+    if (batches > 1 || outcome.stopReason !== 'done') log('postLog', summary, outcome.stopReason === 'failed' ? 'fail' : 'ok');
+    const tone = outcome.stopReason === 'failed' ? 'warn'
+      : outcome.posted === 0 ? 'info' : 'success';
+    showToast(tone, summary);
   } catch (err) {
-    log('postLog', 'Failed: ' + err.message, 'fail');
+    log('postLog', `Failed after ${postedSoFar} posted: ` + err.message, 'fail');
     showToast('error', err.message, 9000);
   } finally {
+    posting = false;
     button.disabled = false;
     button.textContent = '🚀 Post to Telegram';
+    stopButton.hidden = true;
+    // Refresh the counts so runway, pending totals and the custom cap reflect
+    // what just went out. renderPostCount() re-applies the button state.
+    try { await loadAnalytics(); } catch (refreshErr) { console.error(refreshErr); }
+    renderPostCount();
   }
 }
 
@@ -354,6 +455,7 @@ async function loadAnalytics() {
   analytics = await api('/api/analytics');
   renderStats();
   renderSubjectSummary();
+  renderPostCount();
   renderCadence();
 }
 
@@ -396,6 +498,18 @@ initDashboard({
     initSubjectSelects();
     renderCliList();
     $('postNowBtn').addEventListener('click', postNow);
+    $('postStopBtn').addEventListener('click', () => {
+      stopRequested = true;
+      $('postStopBtn').disabled = true;
+      $('postStopBtn').textContent = 'Stopping after this batch…';
+    });
+    ['postSubject', 'requireApproved', 'postCount'].forEach((id) =>
+      $(id).addEventListener('change', renderPostCount));
+    $('postCustomCount').addEventListener('input', renderPostCount);
+    $('postCustomCount').addEventListener('keydown', (e) => { if (e.key === 'Enter') postNow(); });
+    window.addEventListener('beforeunload', (e) => {
+      if (posting) { e.preventDefault(); e.returnValue = ''; }
+    });
   $('reconcileBtn').addEventListener('click', reconcileChannel);
     $('scheduleBtn').addEventListener('click', queueForLater);
     $('refreshBtn').addEventListener('click', load);
