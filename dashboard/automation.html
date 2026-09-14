@@ -55,8 +55,15 @@
                   <option value="3">3 questions</option>
                   <option value="5" selected>5 questions</option>
                   <option value="10">10 questions</option>
-                  <option value="20">20 questions (max, ~1 minute)</option>
+                  <option value="20">20 questions (~1 minute)</option>
+                  <option value="all">All eligible questions</option>
+                  <option value="custom">Custom number…</option>
                 </select>
+              </div>
+              <div id="postCustomField" class="editor-field full" hidden>
+                <label for="postCustomCount">Custom number</label>
+                <input id="postCustomCount" class="field-input" type="number" inputmode="numeric"
+                       min="1" step="1" placeholder="e.g. 25" aria-describedby="postCountHint">
               </div>
               <div class="editor-field full">
                 <label for="requireApproved">Eligibility</label>
@@ -67,9 +74,11 @@
               </div>
             </div>
 
-            <p id="subjectSummary" class="hint-text" style="margin-bottom:14px"></p>
+            <p id="subjectSummary" class="hint-text" style="margin-bottom:6px"></p>
+            <p id="postCountHint" class="hint-text" style="margin-bottom:14px" aria-live="polite"></p>
 
             <button id="postNowBtn" class="btn btn-send" style="width:100%">🚀 Post to Telegram</button>
+            <button id="postStopBtn" class="btn btn-ghost" style="width:100%;margin-top:8px" hidden>⏹ Stop after this batch</button>
 
             <p class="hint-text" style="margin-top:12px">
               Posts go to the forum topic configured for the subject in the Config tab. Each question

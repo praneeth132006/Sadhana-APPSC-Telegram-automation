@@ -984,7 +984,7 @@ test('only allowlisted file extensions are served', async () => {
 });
 
 test('static assets inside dashboard/ are served normally', async () => {
-  for (const asset of ['/', '/index.html', '/analytics.html', '/questions.html', '/automation.html', '/health.html', '/shared.js', '/style.css', '/shared.css']) {
+  for (const asset of ['/', '/index.html', '/analytics.html', '/questions.html', '/automation.html', '/health.html', '/shared.js', '/post-plan.js', '/style.css', '/shared.css']) {
     const res = await call(asset);
     assert.equal(res.status, 200, `${asset} was not served`);
   }
