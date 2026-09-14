@@ -139,7 +139,7 @@ function formatDateHashtag(dateStr) {
  * formatNewspaperHashtag — Converts a newspaper name to a Telegram-clickable hashtag.
  * What it does: Removes spaces and special characters, joining words in PascalCase.
  * What it brings: Users can tap the hashtag in Telegram to find all questions from that newspaper.
- * Where changes can be seen: Appended as a footer below each quiz poll in Telegram topics.
+ * Where changes can be seen: The tag line posted with each question (also used for the Topic tag).
  *
  * Examples: "The Hindu" → "#TheHindu", "Indian Express" → "#IndianExpress", "Eenadu" → "#Eenadu"
  *
@@ -343,14 +343,16 @@ const POLL_OPTION_MAX = 100;
  *   - only the question is too long → the question goes out as a message and
  *                            the poll keeps the real options
  *
- * The Date and Newspaper hashtags are returned as their own line. They cannot
- * go in the poll (poll text never renders hashtags as tappable), so they ride
- * on the answer message, which every question gets.
+ * The Date, Newspaper and Topic hashtags go with the question, never the
+ * answer. Poll text never renders hashtags as tappable, so they are added to
+ * the lead message when there is one. When the poll holds the whole question
+ * there is no lead message, so they fall back to the answer message instead
+ * (answerTagLine), outside the spoiler so they are tappable before revealing.
  *
  * Pure — no bot calls — so the layout can be tested without Telegram.
  *
  * @param {Object} question Question object from the sheet
- * @returns {{leadMessage: string|null, pollQuestion: string, options: string[], tagLine: string}}
+ * @returns {{leadMessage: string|null, pollQuestion: string, options: string[], tagLine: string, answerTagLine: string}}
  */
 function buildQuizPost(question) {
   const text = String(question.question_text || '').trim();
@@ -364,16 +366,23 @@ function buildQuizPost(question) {
 
   const dateTag = formatDateHashtag(question.date);
   const newspaperTag = formatNewspaperHashtag(question.newspaper);
-  const tagLine = [dateTag && '📅 ' + dateTag, newspaperTag && '📰 ' + newspaperTag]
-    .filter(Boolean).join('  ');
+  // A topic tags the same way a paper name does: "Fundamental Rights" → #FundamentalRights.
+  const topicTag = formatNewspaperHashtag(question.topic);
+  const tagLine = [
+    dateTag && '📅 ' + dateTag,
+    newspaperTag && '📰 ' + newspaperTag,
+    topicTag && '🏷️ ' + topicTag
+  ].filter(Boolean).join('  ');
+  const withTags = (message) => (tagLine ? `${message}\n\n${tagLine}` : message);
 
   if (optionsTooLong) {
     const optionLines = realOptions.map((opt, i) => `${letters[i]}) ${escapeHtml(opt)}`).join('\n');
     return {
-      leadMessage: `📝 <b>Question:</b>\n\n${escapeHtml(text)}\n\n${optionLines}`,
+      leadMessage: withTags(`📝 <b>Question:</b>\n\n${escapeHtml(text)}\n\n${optionLines}`),
       pollQuestion: 'Choose the correct option for the above question',
       options: letters.slice(),
-      tagLine
+      tagLine,
+      answerTagLine: ''
     };
   }
 
@@ -386,14 +395,15 @@ function buildQuizPost(question) {
       ? `👆 ${lastLine} (Refer to statements above)`
       : '👆 Choose the correct answer for the question above:';
     return {
-      leadMessage: `📝 <b>Question:</b>\n\n${escapeHtml(text)}`,
+      leadMessage: withTags(`📝 <b>Question:</b>\n\n${escapeHtml(text)}`),
       pollQuestion,
       options: realOptions,
-      tagLine
+      tagLine,
+      answerTagLine: ''
     };
   }
 
-  return { leadMessage: null, pollQuestion: text, options: realOptions, tagLine };
+  return { leadMessage: null, pollQuestion: text, options: realOptions, tagLine, answerTagLine: tagLine };
 }
 
 /**
@@ -413,6 +423,7 @@ function buildQuizPost(question) {
  * @param {string} question.explanation — Explanation for the 💡 popup
  * @param {string} [question.date] — Date column, posted as #Date_DD_MM_YYYY
  * @param {string} [question.newspaper] — Newspaper column, posted as #PaperName
+ * @param {string} [question.topic] — Topic column, posted as #TopicName
  * @returns {Promise<Object>} The sent message object from Telegram
  */
 async function sendQuizPoll(threadId, question) {
@@ -472,8 +483,9 @@ async function sendQuizPoll(threadId, question) {
       `💡 <b>Answer &amp; Explanation</b> <i>(Tap below to reveal)</i>:\n` +
       `<tg-spoiler>✅ <b>Correct Answer: Option ${answerLetter}</b>\n\n` +
       `📖 <b>Explanation:</b>\n${explanationText}</tg-spoiler>` +
-      // Hashtags sit outside the spoiler so they are tappable before revealing.
-      (post.tagLine ? `\n\n${post.tagLine}` : '');
+      // Only when the question had no message of its own to carry the tags.
+      // Outside the spoiler so they are tappable before revealing.
+      (post.answerTagLine ? `\n\n${post.answerTagLine}` : '');
 
     // Send the spoiler message to the specific forum topic thread
     // The poll itself is already out and the row is about to be marked posted,
