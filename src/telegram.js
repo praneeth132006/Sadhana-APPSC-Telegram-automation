@@ -355,7 +355,7 @@ const POLL_OPTION_MAX = 100;
  * @returns {{leadMessage: string|null, pollQuestion: string, options: string[], tagLine: string, answerTagLine: string}}
  */
 function buildQuizPost(question) {
-  const text = String(question.question_text || '').trim();
+  const text = formatListLayout(question.question_text);
   const realOptions = ['option_a', 'option_b', 'option_c', 'option_d']
     .map((key) => String(question[key] || '').trim());
   const letters = ['A', 'B', 'C', 'D'];
@@ -404,6 +404,73 @@ function buildQuizPost(question) {
   }
 
   return { leadMessage: null, pollQuestion: text, options: realOptions, tagLine, answerTagLine: tagLine };
+}
+
+// Markers that start a new line. Each item pattern captures the item's label
+// so runs can be checked for counting order (1, 2, 3 … / A, B, C …).
+const LIST_ITEM_PATTERNS = [
+  { re: /(?<!\S)(?:\((\d{1,2})\)|(\d{1,2})[.)])(?=\s)/g, index: (s) => Number(s) },
+  { re: /(?<!\S)(?:\(([a-hA-H])\)|([a-hA-H])\))(?=\s)/g, index: (s) => s.toUpperCase().charCodeAt(0) - 64 },
+  {
+    re: /(?<!\S)(?:\((i|ii|iii|iv|v|vi|vii|viii)\)|(i|ii|iii|iv|v|vi|vii|viii)[.)])(?=\s)/g,
+    index: (s) => ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii'].indexOf(s) + 1
+  }
+];
+const LIST_HEADER_RE = /(?<!\S)(?:(?:List|Column)[\s-]*(?:IV|I{1,3}|[1-4])(?![\w-])|Statement[\s-]*(?:IV|I{1,3}|[1-4])\s*[:.–-]|Assertion\s*\(A\)|Reason\s*\(R\))/g;
+const CLOSING_PROMPT_RE = /(?<!\S)(?:Select the correct|Choose the correct|Which of the (?:statements|above|following|given)|How many of the (?:above|statements|pairs)|Codes?\s*:)/gi;
+
+/**
+ * formatListLayout — puts list items back on their own lines.
+ *
+ * Sheet cells often hold a match-the-following or multi-statement question as
+ * one flat line ("List I 1. Mangallu 2. Bayyaram … A) Danarnava B) …"), which
+ * Telegram shows as a single wall of text. This breaks the line before:
+ *   - numbered items 1. 2. 3. / (1) (2), lettered A) B) / (a) (b), roman (i) (ii)
+ *   - headers such as List I, List II, Statement I:, Assertion (A), Reason (R)
+ *   - a closing prompt ("Select the correct answer…") that follows a list
+ *
+ * Item labels only count when they form a run that starts at 1 / A / i and
+ * counts up, so a stray "Article 21. It…" is left as written. Text that
+ * already has its line breaks comes back unchanged.
+ *
+ * @param {string} raw Question or explanation text
+ * @returns {string} The text with list items on separate lines, trimmed
+ */
+function formatListLayout(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+
+  const breaks = new Set();
+  for (const { re, index } of LIST_ITEM_PATTERNS) {
+    let run = [];
+    let expected = 1;
+    const flush = () => { if (run.length >= 2) run.forEach((pos) => breaks.add(pos)); run = []; };
+    for (const m of text.matchAll(re)) {
+      const n = index(m[1] || m[2]);
+      if (n === 1) { flush(); run = [m.index]; expected = 2; }
+      else if (run.length && n === expected) { run.push(m.index); expected++; }
+    }
+    flush();
+  }
+
+  const hasList = breaks.size > 0;
+  for (const m of text.matchAll(LIST_HEADER_RE)) breaks.add(m.index);
+  if (hasList) {
+    const lastBreak = Math.max(...breaks);
+    for (const m of text.matchAll(CLOSING_PROMPT_RE)) {
+      if (m.index > lastBreak) breaks.add(m.index);
+    }
+  }
+
+  let out = '';
+  let from = 0;
+  for (const pos of [...breaks].sort((a, b) => a - b)) {
+    if (pos === 0) continue;
+    out += text.slice(from, pos).replace(/[ \t]+$/, '');
+    if (!out.endsWith('\n')) out += '\n';
+    from = pos;
+  }
+  return (out + text.slice(from)).trim();
 }
 
 /**
@@ -476,7 +543,7 @@ async function sendQuizPoll(threadId, question) {
     // Format the correct answer option letter (e.g. "D")
     const answerLetter = String(question.correct_answer || '').toUpperCase();
     // Sanitize the explanation text against HTML entity parsing issues
-    const explanationText = escapeHtml(question.explanation || 'No detailed explanation provided.');
+    const explanationText = escapeHtml(formatListLayout(question.explanation) || 'No detailed explanation provided.');
 
     // Construct the formatted spoiler message payload
     const spoilerMessage =
@@ -731,6 +798,7 @@ module.exports = {
   createForumTopic,
   sendQuizPoll,
   buildQuizPost,
+  formatListLayout,
   setGroupId,
   extractGroupIdFromLink,
   detectGroupId,
