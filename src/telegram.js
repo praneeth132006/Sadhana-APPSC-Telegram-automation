@@ -330,6 +330,13 @@ async function sendWithFloodWait(send, attempts = 3) {
 /** Telegram's hard limits for a poll: question text and each option. */
 const POLL_QUESTION_MAX = 300;
 const POLL_OPTION_MAX = 100;
+/**
+ * Telegram keeps only the first two line breaks in a poll question and turns
+ * the rest into spaces, so a list question ("1. … 2. … A) … B) …") arrives as
+ * one run-on paragraph. Past this many breaks the question goes out as a
+ * normal message, where every line survives.
+ */
+const POLL_QUESTION_MAX_LINE_BREAKS = 2;
 
 /**
  * buildQuizPost — decides how one question is laid out across its messages.
@@ -340,8 +347,9 @@ const POLL_OPTION_MAX = 100;
  *   - every option fits    → options go in the poll, as they always have
  *   - any option too long  → question AND all four options go out as a normal
  *                            message, and the poll carries just A / B / C / D
- *   - only the question is too long → the question goes out as a message and
- *                            the poll keeps the real options
+ *   - only the question is too long, or has more line breaks than a poll
+ *     keeps → the question goes out as a message and the poll keeps the
+ *     real options
  *
  * The Date, Newspaper and Topic hashtags go with the question, never the
  * answer. Poll text never renders hashtags as tappable, so they are added to
@@ -362,7 +370,8 @@ function buildQuizPost(question) {
 
   const optionsTooLong = realOptions.some((opt) => opt.length > POLL_OPTION_MAX);
   // Leave a little headroom under 300 for the pointer text added below.
-  const questionTooLong = text.length > POLL_QUESTION_MAX - 10;
+  const questionTooLong = text.length > POLL_QUESTION_MAX - 10 ||
+    (text.match(/\n/g) || []).length > POLL_QUESTION_MAX_LINE_BREAKS;
 
   const dateTag = formatDateHashtag(question.date);
   const newspaperTag = formatNewspaperHashtag(question.newspaper);
