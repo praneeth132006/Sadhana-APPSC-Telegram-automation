@@ -138,3 +138,20 @@ test('buildQuizPost posts list questions with their line breaks', () => {
   const post = buildQuizPost({ ...base, question_text: 'Consider: 1. Alpha 2. Beta' });
   assert.equal(post.pollQuestion, 'Consider:\n1. Alpha\n2. Beta');
 });
+
+test('buildQuizPost sends a question with more than two line breaks as a message, since polls flatten them', () => {
+  // The exact text from the sheet that Telegram posted as one run-on line.
+  const listQ = 'Match the following historical inscriptions:\nList I (Inscription)\n1. Mangallu Inscription\n' +
+    '2. Bayyaram Tank Inscription\n3. Draksharama Inscription\n4. Vilasa Copper Plate Grant\n' +
+    'List II (Associated Figure)\nA) Danarnava\nB) Mailamba\nC) Hemadri Reddy\nD) Musunuri Prolaya Nayaka';
+  assert.ok(listQ.length < 290, 'short enough that length alone would have kept it in the poll');
+  const post = buildQuizPost({ ...base, question_text: listQ, option_a: '1-A, 2-B, 3-C, 4-D' });
+  assert.ok(post.leadMessage.includes('\n1. Mangallu Inscription\n2. Bayyaram Tank Inscription\n'));
+  assert.ok(post.leadMessage.includes('\nC) Hemadri Reddy\nD) Musunuri Prolaya Nayaka'));
+  assert.ok(!post.pollQuestion.includes('\n'));
+  assert.equal(post.options[0], '1-A, 2-B, 3-C, 4-D');
+  assert.equal(post.answerTagLine, '');
+
+  const twoBreaks = buildQuizPost({ ...base, question_text: 'Consider:\n1. Alpha\n2. Beta' });
+  assert.equal(twoBreaks.leadMessage, null);
+});
