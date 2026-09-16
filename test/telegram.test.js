@@ -98,3 +98,43 @@ test('buildQuizPost omits the tag line when the sheet has no date or newspaper',
   assert.equal(untagged.answerTagLine, '');
   assert.equal(buildQuizPost({ ...base, date: '', topic: '' }).tagLine, '📰 #TheHindu');
 });
+
+const { formatListLayout } = require('../src/telegram');
+
+test('formatListLayout puts a flattened match-the-following list on separate lines', () => {
+  const flat = 'Match the following historical inscriptions:\nList I (Inscription)\n' +
+    '1. Mangallu Inscription 2. Bayyaram Tank Inscription 3. Draksharama Inscription ' +
+    '4. Vilasa Copper Plate Grant List II (Associated Figure) A) Danarnava B) Mailamba ' +
+    'C) Hemadri Reddy D) Musunuri Prolaya Nayaka';
+  assert.equal(formatListLayout(flat), [
+    'Match the following historical inscriptions:',
+    'List I (Inscription)',
+    '1. Mangallu Inscription',
+    '2. Bayyaram Tank Inscription',
+    '3. Draksharama Inscription',
+    '4. Vilasa Copper Plate Grant',
+    'List II (Associated Figure)',
+    'A) Danarnava',
+    'B) Mailamba',
+    'C) Hemadri Reddy',
+    'D) Musunuri Prolaya Nayaka'
+  ].join('\n'));
+});
+
+test('formatListLayout splits statements and the closing prompt, but not stray numbers', () => {
+  const flat = 'Consider the following statements: 1. Article 21. It protects life. ' +
+    '2. It applies to citizens. Which of the statements given above is/are correct?';
+  assert.equal(formatListLayout(flat),
+    'Consider the following statements:\n1. Article 21. It protects life.\n' +
+    '2. It applies to citizens.\nWhich of the statements given above is/are correct?');
+  assert.equal(formatListLayout('Who was Dr. A. P. J. Abdul Kalam in 1998?'),
+    'Who was Dr. A. P. J. Abdul Kalam in 1998?');
+  assert.equal(formatListLayout('Assertion (A): X is true. Reason (R): Y causes X.'),
+    'Assertion (A): X is true.\nReason (R): Y causes X.');
+  assert.equal(formatListLayout('Already\n1. fine\n2. okay'), 'Already\n1. fine\n2. okay');
+});
+
+test('buildQuizPost posts list questions with their line breaks', () => {
+  const post = buildQuizPost({ ...base, question_text: 'Consider: 1. Alpha 2. Beta' });
+  assert.equal(post.pollQuestion, 'Consider:\n1. Alpha\n2. Beta');
+});
