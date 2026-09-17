@@ -1341,12 +1341,14 @@ function refreshBotSettings(payBotEnv) {
  * @returns {Promise<boolean>} true when the route was handled
  */
 async function handleSupportRoute(pathname, method, req, res, query, groupId, selectedDb, actor) {
-  const { group, primary } = familyOf(groupId);
+  const { group, family, primary } = familyOf(groupId);
   // A bot's tickets and settings live in its first group's sheet, whichever of
   // its groups the dashboard is looking at.
   const db = primary.id === group.id ? selectedDb : sheets.forGroup(primary.id);
+  const familyIds = family.map((g) => g.id);
   const context = {
     groupId: group.id,
+    groups: family.map((g) => ({ id: g.id, name: g.shortName })),
     primaryGroupId: primary.id,
     primaryGroupName: primary.shortName,
     isPrimary: primary.id === group.id,
@@ -1364,6 +1366,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
       waitingOn: ['admin', 'student'].includes(waitingOn) ? waitingOn : '',
       sort: str(query.get('sort'), 10) === 'waiting' ? 'waiting' : '',
       search: str(query.get('search'), 120),
+      group: familyIds.includes(str(query.get('group'), 40)) ? str(query.get('group'), 40) : '',
       page: str(query.get('page'), 8) || '1',
       pageSize: str(query.get('pageSize'), 4) || '50'
     });
@@ -1420,10 +1423,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
     if (!app) return true;
 
     try {
-      await app.bot.sendMessage(ticket.telegram_id,
-        `${support.esc(support.replyLine(ticketId))}\n\n${support.esc(text)}\n\n` +
-        '<i>Reply to this message to answer.</i>',
-        { parse_mode: 'HTML' });
+      await app.bot.sendMessage(ticket.telegram_id, support.studentReplyHtml(ticketId, text), { parse_mode: 'HTML' });
     } catch (err) {
       sendJSON(res, 502, {
         success: false,
@@ -1445,7 +1445,9 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
     }
 
     await mirrorToSupportChat(app, ticket,
-      `💻 Answered from the dashboard by ${support.esc(actor)}:\n\n${support.esc(text)}`);
+      `💻 <b>Answered from the dashboard</b> · by ${support.esc(actor)}\n` +
+      `<blockquote>${support.esc(text)}</blockquote>\n` +
+      `<b>Status:</b> ${support.statusLine('in_progress', 'student')}`);
 
     sendJSON(res, 200, { success: true, data: updated, warning });
     return true;
@@ -1519,9 +1521,13 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
           expiry: p.subscriber ? p.subscriber.expiry_date : '',
           totalPaid: p.subscriber ? p.subscriber.total_paid : 0,
           paymentId: p.subscriber ? p.subscriber.payment_id : '',
-          lastPaymentAt: p.subscriber ? p.subscriber.last_payment_at : ''
+          lastPaymentAt: p.subscriber ? p.subscriber.last_payment_at : '',
+          // The sheet could not be read: not the same as having no pass.
+          error: Boolean(p.error),
+          aboutThisTicket: Boolean(ticket.group) && p.group.id === ticket.group
         })),
-        suggestion: support.suggestNextStep(ticket.category, passes),
+        ticketGroup: ticket.group || '',
+        suggestion: support.suggestNextStep(ticket.category, passes, ticket.group || ''),
         paymentIdInTicket: support.findPaymentId(ticket.conversation)
       }
     });
@@ -1612,6 +1618,23 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
   // Only an admin action closes a ticket, and this route is how the dashboard
   // does it. "open" and "in_progress" both mean reopen: once an admin has
   // touched a ticket it is never "not picked up" again.
+  if (pathname === '/api/support/group' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    const newGroup = str(body.group, 40);
+    if (!TICKET_ID_RE.test(ticketId) || (newGroup && !familyIds.includes(newGroup))) {
+      sendJSON(res, 400, { success: false, error: 'ticketId and one of this bot\'s groups (or blank) are required.' });
+      return true;
+    }
+    const updated = await db.setTicketGroup(ticketId, newGroup, actor);
+    if (!updated) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found in this group's sheet.` });
+      return true;
+    }
+    sendJSON(res, 200, { success: true, data: updated });
+    return true;
+  }
+
   if (pathname === '/api/support/status' && method === 'POST') {
     const body = await readJsonBody(req);
     const ticketId = str(body.ticketId, 20);
@@ -1637,11 +1660,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
     const app = paymentBotEnvs().includes(updated.bot) ? paymentBotFor(updated.bot) : null;
     if (app && changed && status === 'closed' && body.notify !== false) {
       try {
-        await app.bot.sendMessage(updated.telegram_id,
-          `${support.esc(support.replyLine(ticketId))}\n\n` +
-          '✅ This ticket has been marked as resolved. If you still need help, just send another message ' +
-          'or /support.',
-          { parse_mode: 'HTML' });
+        await app.bot.sendMessage(updated.telegram_id, support.resolvedHtml(ticketId), { parse_mode: 'HTML' });
         notified = true;
       } catch (err) {
         console.warn(`[support] could not tell ${updated.telegram_id} that ${ticketId} closed: ${err.message}`);
@@ -1882,7 +1901,7 @@ async function mirrorToSupportChat(app, ticket, html, { closed = false } = {}) {
   if (chat.threadId) options.message_thread_id = chat.threadId;
   try {
     await app.bot.sendMessage(chat.chatId,
-      `${support.ticketHeader(ticket.ticket_id, ticket.telegram_id)}\n${html}`, options);
+      `${support.ticketHeaderHtml(ticket.ticket_id, ticket.telegram_id)}\n${html}`, options);
   } catch (err) {
     console.warn(`[support] could not mirror ${ticket.ticket_id} to the support chat: ${err.message}`);
   }

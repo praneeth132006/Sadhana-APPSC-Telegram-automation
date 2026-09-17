@@ -66,6 +66,7 @@ const STUDENT_COMMANDS = [
 const ADMIN_COMMANDS = [
   { command: 'summary', description: 'How many tickets need a reply, are open, in progress, closed' },
   { command: 'tickets', description: 'Tickets needing a reply (or: open, progress, student, closed)' },
+  { command: 'find', description: 'Look up a pay_ id, a student (id or @username) or a ticket id' },
   { command: 'msg', description: 'Message a student: /msg <id or @username> text' },
   { command: 'settings', description: 'Bot texts, pass name and price' },
   { command: 'supporthelp', description: 'How to handle support' }

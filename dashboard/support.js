@@ -13,7 +13,7 @@ import {
 } from './shared.js';
 
 /** Which tickets the list shows. Starts on the queue that needs work. */
-const filters = { tab: 'needs_reply', search: '' };
+const filters = { tab: 'needs_reply', search: '', group: '' };
 
 /** The list tabs, and the query each one sends. */
 const TABS = [
@@ -54,7 +54,8 @@ const ACTION_WORDS = {
   pass_grant_refused: 'tried to grant a pass (refused)',
   pass_grant_failed: 'tried to grant a pass (failed)',
   closed: 'resolved and closed the ticket',
-  reopened: 'reopened the ticket'
+  reopened: 'reopened the ticket',
+  group_changed: 'changed which group the ticket is about'
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,27 @@ function duration(minutes) {
   const days = Math.floor(m / 1440);
   const hours = Math.floor((m % 1440) / 60);
   return `${days} day${days === 1 ? '' : 's'}${hours ? ` ${hours} h` : ''}`;
+}
+
+/** The groups this page's payment bot sells. */
+function familyGroups() {
+  return (meta.context && meta.context.groups) || [];
+}
+
+/** Whether tickets need to say which group they are about. */
+function multiGroup() {
+  return familyGroups().length > 1;
+}
+
+function groupName(id) {
+  const group = familyGroups().find((g) => g.id === id);
+  return group ? group.name : '';
+}
+
+/** A pill naming the group a ticket is about, or saying it was not given. */
+function groupPill(id) {
+  const name = groupName(id);
+  return name ? pill(`👥 ${name}`, 'info') : pill('👥 Group not specified', 'muted');
 }
 
 function category(id) {
@@ -173,6 +195,7 @@ function renderHowItWorks() {
       el('h3', { text: 'How to answer a ticket' }),
       el('ol', { class: 'sp-plain-list' }, [
         el('li', { text: 'Start with "Needs reply" — longest waiting first.' }),
+        el('li', { text: 'Check which group the ticket is about. A student can be in both — "Student\'s access" puts that group first and marks it. If they did not say, set it at the top of the ticket.' }),
         el('li', { text: 'Read "Student\'s access" — it shows their pass, whether they are in the group, and a suggested next step.' }),
         el('li', { text: 'Type a reply, or insert a quick reply, and press Send. Tick "close after sending" when that answer settles it.' }),
         el('li', { text: 'Link problem with a valid pass? Use "Send new invite link". Says they paid? Ask for the payment id, then "Check payment".' })
@@ -180,7 +203,7 @@ function renderHowItWorks() {
     ]),
     el('div', {}, [
       el('h3', { text: 'In Telegram' }),
-      el('p', { class: 'hint-text', text: 'The same tickets arrive in the support chat with buttons for all of this. Send /supporthelp there for the full list. Replies made in either place show up in both.' })
+      el('p', { class: 'hint-text', text: 'The same tickets arrive in the support chat with buttons for all of this. There, /summary shows the counts, and /find pay_… (or pasting a payment id) looks up a payment. Send /supporthelp for the full list. Replies made in either place show up in both.' })
     ])
   ]));
 }
@@ -263,7 +286,9 @@ function renderStats(stats) {
     statCard('Today', `${num(stats.opened_today || 0)} in · ${num(stats.closed_today || 0)} closed`, { tone: 'muted', sub: 'tickets opened and closed today' }),
     statCard('Longest waiting', oldest ? duration(oldest.minutes) : '—', {
       tone: oldest && oldest.minutes > 24 * 60 ? 'danger' : oldest ? 'warn' : 'ok',
-      sub: oldest ? `${oldest.name} · ${category(oldest.category).label}` : 'nobody is waiting'
+      sub: oldest
+        ? [oldest.name, category(oldest.category).label, multiGroup() ? groupName(oldest.group) : ''].filter(Boolean).join(' · ')
+        : 'nobody is waiting'
     })
   );
   renderAnalysis(stats);
@@ -310,11 +335,31 @@ function renderAnalysis(stats) {
     ])])
     : emptyState('🧑‍💼', `No admin activity in the last ${stats.period_days} days.`);
 
+  const byGroup = stats.by_group || {};
+  const groupRows = multiGroup()
+    ? [...familyGroups().map((g) => [g.name, byGroup[g.id]]), ['Not specified', byGroup.unspecified]].filter(([, row]) => row)
+    : [];
+  const groupTable = groupRows.length
+    ? el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+      el('thead', {}, [el('tr', {}, ['Group', 'Needs reply', 'Open', 'In progress', 'Closed', 'Total'].map((h) => el('th', { text: h })))]),
+      el('tbody', {}, groupRows.map(([name, row]) => el('tr', {}, [
+        el('td', { class: 'sp-strong', text: name }),
+        el('td', { class: 'num', text: num(row.needs_reply) }),
+        el('td', { class: 'num', text: num(row.open) }),
+        el('td', { class: 'num', text: num(row.in_progress) }),
+        el('td', { class: 'num', text: num(row.closed) }),
+        el('td', { class: 'num', text: num(row.total) })
+      ])))
+    ])])
+    : null;
+
   replaceChildren($('analysisBody'),
     el('div', { class: 'sp-analysis-head' }, [
       el('p', { class: 'hint-text', text: `${num(stats.opened_in_period || 0)} tickets opened and ${num(stats.closed_in_period || 0)} closed in the last ${stats.period_days} days. Everything here is counted from the Support and Support Log tabs.` }),
       period
     ]),
+    groupTable ? el('h3', { class: 'sp-box-title', text: 'By group (all tickets)' }) : null,
+    groupTable,
     el('h3', { class: 'sp-box-title', text: 'By issue type (all tickets)' }),
     categoryTable,
     el('h3', { class: 'sp-box-title', text: `By admin (last ${stats.period_days} days)` }),
@@ -338,6 +383,7 @@ function ticketCard(t) {
       el('span', { class: 'sp-card-time', text: timeAgo(t.updated_at), title: t.updated_at })
     ]),
     el('div', { class: 'sp-card-issue', text: `${cat.emoji} ${cat.label}` }),
+    multiGroup() ? el('div', { class: 'sp-card-meta' }, [groupPill(t.group)]) : null,
     el('div', { class: 'sp-card-student', text: studentName(t) }),
     el('div', { class: 'sp-card-snippet', text: String(t.last_message || '') }),
     el('div', { class: 'sp-card-handler', text: t.picked_up_by ? `Picked up by ${t.picked_up_by}` : 'Not picked up yet' })
@@ -349,7 +395,9 @@ async function loadTickets() {
   replaceChildren(list, el('div', { class: 'loading-row' }, [el('div', { class: 'spinner' }), el('span', { text: 'Loading tickets…' })]));
   try {
     const tab = TABS.find((t) => t.id === filters.tab) || TABS[0];
-    const page = await api('/api/support/tickets', { query: Object.assign({ search: filters.search, pageSize: 100 }, tab.query) });
+    const page = await api('/api/support/tickets', {
+      query: Object.assign({ search: filters.search, group: filters.group, pageSize: 100 }, tab.query)
+    });
     renderNotices(page.context);
     renderTabs(page.counts);
     lastTickets = page.tickets || [];
@@ -409,6 +457,7 @@ function renderWorkspace(ticket) {
       el('div', { class: 'sp-pills' }, statusPills(ticket))
     ]),
     el('p', { class: 'sp-ws-meaning', text: status.meaning }),
+    aboutPanel(ticket, cat),
     el('div', { class: 'sp-ws-facts' }, [
       el('span', { class: 'sp-strong', text: studentName(ticket) }),
       el('span', { text: `Telegram id ${ticket.telegram_id}` }),
@@ -445,6 +494,42 @@ function renderWorkspace(ticket) {
   loadStudent(ticket);
 }
 
+/**
+ * Issue, group and student at a glance. With two groups the group can be
+ * corrected here, since a student in both may not have said which.
+ */
+function aboutPanel(ticket, cat) {
+  const rows = [
+    ['Issue', el('span', { text: `${cat.emoji} ${cat.label}` })],
+    ['Student', el('span', { text: `${studentName(ticket)} · Telegram id ${ticket.telegram_id}` })]
+  ];
+  if (multiGroup()) {
+    const select = el('select', { class: 'field-select', 'aria-label': 'Which group this ticket is about' }, [
+      el('option', { value: '', text: 'Not specified' }),
+      ...familyGroups().map((g) => el('option', { value: g.id, text: g.name }))
+    ]);
+    select.value = ticket.group || '';
+    select.addEventListener('change', async () => {
+      select.disabled = true;
+      try {
+        await api('/api/support/group', { method: 'POST', body: { ticketId: ticket.ticket_id, group: select.value } });
+        showToast('success', select.value ? `Ticket filed under ${groupName(select.value)}.` : 'Group cleared.');
+        await refreshAfterAction(ticket.ticket_id);
+      } catch (err) {
+        select.value = ticket.group || '';
+        showToast('error', err.message, 9000);
+      } finally {
+        select.disabled = false;
+      }
+    });
+    rows.splice(1, 0, ['Group', el('span', { class: 'sp-inline-form' }, [
+      select,
+      ticket.group ? null : el('span', { class: 'hint-text', text: 'The student did not say — check "Student\'s access" below.' })
+    ])]);
+  }
+  return el('dl', { class: 'sp-ws-about' }, rows.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', {}, [v])]));
+}
+
 function conversationView(ticket) {
   const messages = parseConversation(ticket.conversation);
   if (!messages.length) {
@@ -466,9 +551,12 @@ async function loadStudent(ticket) {
   if (!box) return;
   try {
     const data = await api('/api/support/student', { query: { ticketId: ticket.ticket_id } });
-    const rows = data.passes.map((p) => {
+    // The ticket's own group first, so it is the first thing read.
+    const passes = data.passes.slice().sort((a, b) => Number(b.aboutThisTicket) - Number(a.aboutThisTicket));
+    const rows = passes.map((p) => {
       let state;
-      if (!p.hasPass) state = pill('No pass', 'muted');
+      if (p.error) state = pill('Could not check just now — press Refresh', 'warn');
+      else if (!p.hasPass) state = pill('No pass', 'muted');
       else if (p.valid) state = pill(`Valid until ${String(p.expiry).split(',')[0]}`, 'ok');
       else state = pill(p.reason, 'danger');
       const inGroup = p.hasPass
@@ -479,8 +567,12 @@ async function loadStudent(ticket) {
         ? [p.passName, p.totalPaid ? `paid ₹${p.totalPaid}` : '', p.paymentId, p.lastPaymentAt ? `last payment ${p.lastPaymentAt}` : '']
           .filter(Boolean).join(' · ')
         : '';
-      return el('div', { class: 'sp-pass-row' }, [
-        el('div', { class: 'sp-pass-group', text: p.group }),
+      const rowClass = 'sp-pass-row' + (p.aboutThisTicket ? ' about' : data.ticketGroup ? ' other' : '');
+      return el('div', { class: rowClass }, [
+        el('div', { class: 'sp-pass-head' }, [
+          el('span', { class: 'sp-pass-group', text: p.group }),
+          p.aboutThisTicket && passes.length > 1 ? pill('📌 This ticket is about this group', 'info') : null
+        ]),
         el('div', { class: 'sp-pass-state' }, [state, inGroup]),
         details ? el('div', { class: 'sp-pass-details', text: details }) : null
       ]);
@@ -767,9 +859,24 @@ function renderSettings() {
 // Boot
 // ---------------------------------------------------------------------------
 
+/** The group filter, shown only when this bot sells more than one group. */
+function renderGroupFilter() {
+  const select = $('groupFilter');
+  select.hidden = !multiGroup();
+  if (!multiGroup()) {
+    filters.group = '';
+    return;
+  }
+  replaceChildren(select,
+    el('option', { value: '', text: 'All groups' }),
+    ...familyGroups().map((g) => el('option', { value: g.id, text: g.name })));
+  select.value = familyGroups().some((g) => g.id === filters.group) ? filters.group : '';
+}
+
 async function loadMeta() {
   const data = await api('/api/support/settings');
   meta = data;
+  renderGroupFilter();
   renderNotices(data.context);
   renderHowItWorks();
   renderSettings();
@@ -800,6 +907,11 @@ initDashboard({
       const panel = $('howItWorks');
       panel.hidden = !panel.hidden;
       $('helpBtn').setAttribute('aria-expanded', String(!panel.hidden));
+    });
+
+    $('groupFilter').addEventListener('change', (e) => {
+      filters.group = e.target.value;
+      loadTickets();
     });
 
     let searchTimer;

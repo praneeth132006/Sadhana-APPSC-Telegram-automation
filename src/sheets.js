@@ -42,7 +42,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -599,6 +599,12 @@ async function setTicketStatus(ctx, ticketId, status, handledBy) {
   return result.data || null;
 }
 
+/** Sets the group id a ticket is about ('' for not specified). Resolves null for an unknown ticket. */
+async function setTicketGroup(ctx, ticketId, group, handledBy) {
+  const result = await request(ctx, 'POST', { action: 'setTicketGroup', ticketId, group: group || '', handledBy: handledBy || '' });
+  return result.data || null;
+}
+
 /** Newest-first ticket list with per-status counts. */
 async function listTickets(ctx, filters = {}) {
   const result = await request(ctx, 'GET', Object.assign({ action: 'listTickets' }, filters));
@@ -725,7 +731,7 @@ const IMPLEMENTATIONS = {
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,
-  upsertCoupon, deleteCoupon, recordRedemption, listRedemptions, getSupportStats, findPayment
+  upsertCoupon, deleteCoupon, recordRedemption, listRedemptions, getSupportStats, findPayment, setTicketGroup
 };
 
 API_NAMES.forEach((name) => {
