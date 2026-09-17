@@ -1616,9 +1616,24 @@ function appendQuestionsToSheet(subject, questions, addedBy, skipDuplicates) {
   var existingHashes = {};
   var existingIds = {};
   if (lastRow > 1) {
-    var hashCol = sheet.getRange(2, colNum(map, 'Dup Hash'), lastRow - 1, 1).getValues();
+    var hashColNum = colNum(map, 'Dup Hash');
+    var hashCol = sheet.getRange(2, hashColNum, lastRow - 1, 1).getValues();
+    // Rows written while non-Latin scripts hashed to nothing all carry the same
+    // useless fingerprint. Recompute theirs from the question itself, so a
+    // Telugu question already in the sheet is recognised when it is uploaded
+    // again instead of being added a second time.
+    var broken = degenerateHash();
+    var questionCol = null;
     for (var h = 0; h < hashCol.length; h++) {
       var val = String(hashCol[h][0] || '').trim();
+      if (val === broken) {
+        if (!questionCol) questionCol = sheet.getRange(2, colNum(map, 'Question'), lastRow - 1, 1).getValues();
+        var storedText = String(questionCol[h][0] || '').trim();
+        if (storedText) {
+          val = hashQuestion(storedText);
+          sheet.getRange(h + 2, hashColNum).setValue(val);
+        }
+      }
       if (val) existingHashes[val] = true;
     }
     var idCol = sheet.getRange(2, colNum(map, 'Question ID'), lastRow - 1, 1).getValues();
@@ -1650,7 +1665,7 @@ function appendQuestionsToSheet(subject, questions, addedBy, skipDuplicates) {
     if (!text) continue;
 
     var hash = hashQuestion(text);
-    if (skipDuplicates && (existingHashes[hash] || seenInBatch[hash])) {
+    if (skipDuplicates && (seenInBatch[hash] || isKnownQuestion(text, existingHashes))) {
       skippedQuestions.push({ question: text.substring(0, 90), reason: 'duplicate' });
       continue;
     }
@@ -3919,7 +3934,9 @@ function backfillQuestionIds() {
         sheet.getRange(r, idCol).setValue(code + '-' + stamp + '-' + padNumber(r - 1, 4));
         filled++;
       }
-      if (!String(sheet.getRange(r, hashCol).getValue() || '').trim()) {
+      // Missing, or written while non-Latin scripts hashed to nothing.
+      var storedHash = String(sheet.getRange(r, hashCol).getValue() || '').trim();
+      if (!storedHash || storedHash === degenerateHash()) {
         sheet.getRange(r, hashCol).setValue(hashQuestion(text));
       }
     }
@@ -3954,22 +3971,75 @@ function padNumber(n, width) {
 }
 
 /**
- * hashQuestion — stable fingerprint of a question, used to detect duplicates.
- * The text is lowercased and stripped of punctuation and whitespace first, so
- * cosmetic edits do not create a "new" question.
+ * Characters that are only cosmetic: whitespace, ASCII punctuation, and the
+ * common Unicode punctuation (quotes, dashes, ellipsis, the danda). Letters
+ * and digits of EVERY script survive, which is the whole point — see
+ * hashQuestion.
  */
-function hashQuestion(text) {
-  var normalised = String(text || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '')
-    .substring(0, 4000);
-  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, normalised);
+var COSMETIC_CHARS = /[\s!-\/:-@\[-`{-~\u00A0\u00AB\u00BB\u0964\u0965\u2010-\u205E\u3000-\u303F\uFF01-\uFF0F\uFF1A-\uFF20]+/g;
+
+/** How many Latin characters a question must have for the old hash to mean anything. */
+var LEGACY_HASH_MIN_CHARS = 24;
+
+/** The first 8 bytes of a SHA-256, as hex — the shape every Dup Hash has. */
+function shortDigest(text) {
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text);
   var hex = '';
   for (var i = 0; i < 8; i++) {
     var b = (digest[i] + 256) % 256;
     hex += (b < 16 ? '0' : '') + b.toString(16);
   }
   return hex;
+}
+
+/**
+ * hashQuestion — stable fingerprint of a question, used to detect duplicates.
+ * The text is lowercased and stripped of punctuation and whitespace first, so
+ * cosmetic edits do not create a "new" question.
+ *
+ * It used to strip everything outside a-z0-9, which threw away Telugu, Hindi
+ * and every other non-Latin script: a whole upload of Telugu questions
+ * normalised to the same empty string, so the first row was added and the rest
+ * were refused as duplicates of it. Only punctuation is dropped now.
+ */
+function hashQuestion(text) {
+  var normalised = String(text || '').toLowerCase().replace(COSMETIC_CHARS, '').substring(0, 4000);
+  // Punctuation only (an image-only or "?" question): fall back to the raw
+  // text, so two such rows are still told apart.
+  if (!normalised) normalised = String(text || '').toLowerCase().substring(0, 4000);
+  return shortDigest(normalised);
+}
+
+/**
+ * legacyHashQuestion — the fingerprint this sheet used before non-Latin
+ * scripts were kept, so a question added then is still recognised when it is
+ * uploaded again.
+ *
+ * Returns '' when the old normalisation kept too little to identify anything
+ * — which is exactly the case that was broken: every Telugu question collapsed
+ * to the same few characters, and matching on that would refuse them all over
+ * again.
+ */
+function legacyHashQuestion(text) {
+  var normalised = String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '').substring(0, 4000);
+  if (normalised.length < LEGACY_HASH_MIN_CHARS) return '';
+  return shortDigest(normalised);
+}
+
+/**
+ * The fingerprint every question in a non-Latin script used to get: the old
+ * hash of an empty string. A row carrying it says nothing about its question,
+ * so it is repaired rather than trusted.
+ */
+function degenerateHash() {
+  return shortDigest('');
+}
+
+/** Whether a question is already in `existingHashes`, under either fingerprint. */
+function isKnownQuestion(text, existingHashes) {
+  if (existingHashes[hashQuestion(text)]) return true;
+  var legacy = legacyHashQuestion(text);
+  return Boolean(legacy && existingHashes[legacy]);
 }
 
 /** Coerces a value to one of a fixed set, case-insensitively, with a fallback. */

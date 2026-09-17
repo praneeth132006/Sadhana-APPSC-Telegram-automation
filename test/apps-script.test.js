@@ -236,6 +236,48 @@ test('hashQuestion ignores cosmetic differences but separates real ones', () => 
   assert.equal(base.length, 16, 'hash is a stable 16 hex characters');
 });
 
+test('questions in a non-Latin script get their own hashes, not one shared empty one', () => {
+  const s = freshScript();
+  const telugu = [
+    'మచిలీపట్నంలో ఫ్యాక్టరీని స్థాపించడానికి ఇంగ్లీష్ ఈస్ట్ ఇండియా కంపెనీకి ఎవరు అనుమతి ఇచ్చారు?',
+    'బెరార్ రాజ్యాన్ని ఏ రాజవంశం స్థాపించింది?',
+    'ఆది మహాదేవ (త్రయంబకేశ్వర్) ఆలయం సమీపంలో ఏ నది ఉద్భవిస్తుంది?',
+    'భగవద్గీతను పర్షియన్ భాషలోకి ఎవరు అనువదించారు?'
+  ];
+  const hashes = telugu.map((q) => s.hashQuestion(q));
+  assert.equal(new Set(hashes).size, telugu.length, 'every Telugu question must hash differently');
+
+  // Cosmetic differences still do not matter, in any script.
+  assert.equal(hashes[1], s.hashQuestion('  బెరార్ రాజ్యాన్ని ఏ రాజవంశం స్థాపించింది!  '));
+
+  // A question that is only punctuation cannot collapse onto another one.
+  assert.notEqual(s.hashQuestion('???'), s.hashQuestion('!!!'));
+});
+
+test('a question added under the old Latin-only hash is still recognised', () => {
+  const s = freshScript();
+  // Plain English text hashes the same as it always did, so old rows match
+  // without any fallback at all.
+  const english = 'Who was the first President of India?';
+  assert.equal(s.hashQuestion(english), s.legacyHashQuestion(english));
+
+  // Text the old hash mangled — a rupee sign, an accent — now hashes
+  // differently, so the old fingerprint is checked as well.
+  const priced = 'What was the price of the scheme in 2020, in rupees (₹500 crore)?';
+  const legacy = s.legacyHashQuestion(priced);
+  assert.notEqual(legacy, s.hashQuestion(priced));
+  const existing = {};
+  existing[legacy] = true;
+  assert.ok(s.isKnownQuestion(priced, existing), 'a row hashed before the fix is still a duplicate');
+
+  // The old hash of a Telugu question is the degenerate one every Telugu
+  // question shared, so it must never be matched on.
+  assert.equal(s.legacyHashQuestion('బెరార్ రాజ్యాన్ని ఏ రాజవంశం స్థాపించింది?'), '');
+  const degenerate = {};
+  degenerate[s.hashQuestion('')] = true;
+  assert.ok(!s.isKnownQuestion('ఆది మహాదేవ ఆలయం సమీపంలో ఏ నది ఉద్భవిస్తుంది?', degenerate));
+});
+
 test('normaliseChoice coerces to the allowed set with a fallback', () => {
   const s = freshScript();
   assert.equal(s.normaliseChoice('approved', s.STATUS_VALUES, 'Draft'), 'Approved');
@@ -540,6 +582,60 @@ test('appendQuestionsToSheet assigns ids, timestamps and skips duplicates', () =
     { question: 'First question?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd', correct_answer: 'A' }
   ], 'Curator', false);
   assert.equal(third.added, 1);
+});
+
+test('a batch of Telugu questions is added in full, not swallowed as duplicates', () => {
+  const s = freshScript();
+  const sheet = new FakeSheet('AP Geography', [s.QUESTION_HEADERS.slice()]);
+  const script = loadScript(new FakeSpreadsheet([sheet]));
+
+  const questions = [
+    'మచిలీపట్నంలో ఫ్యాక్టరీని స్థాపించడానికి ఇంగ్లీష్ ఈస్ట్ ఇండియా కంపెనీకి ఎవరు అనుమతి ఇచ్చారు?',
+    'బెరార్ రాజ్యాన్ని ఏ రాజవంశం స్థాపించింది?',
+    'ఆది మహాదేవ (త్రయంబకేశ్వర్) ఆలయం సమీపంలో ఏ నది ఉద్భవిస్తుంది?',
+    'భగవద్గీతను పర్షియన్ భాషలోకి ఎవరు అనువదించారు?',
+    "ప్రాకృత భాషలో సంకలనం చేయబడిన 'గాథ సప్తసతి' గ్రంథం దేనిని వివరిస్తుంది?",
+    'భారతదేశంపై దండెత్తిన మొదటి ముస్లిం పాలకుడు ఎవరు?',
+    'కింది జతలలో ఏది తప్పు?',
+    'కింది నిర్మాణాలలో ఏది ముహమ్మద్ కులీ కుతుబ్ షాచే నిర్మించబడలేదు?',
+    "ఏ సంఘటన జ్ఞాపకార్థం 'చార్మినార్' నిర్మించబడింది?",
+    'ఔరంగజేబు గోల్కొండను ఏ సంవత్సరంలో జయించాడు?'
+  ].map((question) => ({
+    question, option_a: 'ఎ', option_b: 'బి', option_c: 'సి', option_d: 'డి', correct_answer: 'B',
+    explanation: 'వివరణ', topic: 'Qutubshahi'
+  }));
+
+  const result = script.appendQuestionsToSheet('AP Geography', questions, 'Curator', true);
+  assert.equal(result.added, 10, 'all ten Telugu questions should be added');
+  assert.equal(result.skipped, 0);
+
+  // Uploading the same file again is still recognised as a repeat.
+  const again = script.appendQuestionsToSheet('AP Geography', questions, 'Curator', true);
+  assert.equal(again.added, 0);
+  assert.equal(again.skipped, 10);
+});
+
+test('a Telugu question already stored under the broken hash is repaired, not added twice', () => {
+  const s = freshScript();
+  const question = 'బెరార్ రాజ్యాన్ని ఏ రాజవంశం స్థాపించింది?';
+  const sheet = new FakeSheet('AP Geography', [s.QUESTION_HEADERS.slice()]);
+  const script = loadScript(new FakeSpreadsheet([sheet]));
+  const map = script.headerMap(sheet);
+
+  // A row as the old hash left it: the same fingerprint every Telugu question got.
+  const row = new Array(s.QUESTION_HEADERS.length).fill('');
+  row[map['S.No']] = 1;
+  row[map['Question']] = question;
+  row[map['Dup Hash']] = script.degenerateHash();
+  sheet.values.push(row);
+
+  const result = script.appendQuestionsToSheet('AP Geography', [
+    { question, option_a: 'ఎ', option_b: 'బి', option_c: 'సి', option_d: 'డి', correct_answer: 'A' }
+  ], 'Curator', true);
+
+  assert.equal(result.added, 0, 'the question is already in the sheet');
+  assert.equal(result.skipped, 1);
+  assert.equal(sheet.values[1][map['Dup Hash']], script.hashQuestion(question), 'the stored row was repaired');
 });
 
 test('updateQuestionRow only writes allowlisted fields', () => {
