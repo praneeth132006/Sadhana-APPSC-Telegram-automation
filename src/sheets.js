@@ -42,7 +42,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -558,6 +558,58 @@ async function upsertSubscriber(ctx, subscriber, event = 'payment') {
   return result.data;
 }
 
+// ---------------------------------------------------------------------------
+// Support
+// ---------------------------------------------------------------------------
+
+/** Every stored bot setting as { key: value }. */
+async function getBotSettings(ctx) {
+  const result = await request(ctx, 'GET', { action: 'getBotSettings' });
+  return result.data || {};
+}
+
+/** Writes the given settings; returns everything stored afterwards. */
+async function updateBotSettings(ctx, settings, updatedBy) {
+  const result = await request(ctx, 'POST', { action: 'updateBotSettings', settings, updated_by: updatedBy });
+  return result.data || {};
+}
+
+/**
+ * createTicket — records a support ticket. Idempotent on ticket_id.
+ *
+ * @param {Object} ticket ticket_id, telegram_id, username, name, category, bot, message
+ */
+async function createTicket(ctx, ticket) {
+  const result = await request(ctx, 'POST', { action: 'createTicket', ticket });
+  return result.data || null;
+}
+
+/** Adds a message to a ticket's thread. Resolves null for an unknown ticket. */
+async function appendTicketMessage(ctx, ticketId, { author, text, status, handledBy } = {}) {
+  const result = await request(ctx, 'POST', {
+    action: 'appendTicketMessage', ticketId, author, text, status: status || '', handledBy: handledBy || ''
+  });
+  return result.data || null;
+}
+
+/** Sets a ticket to open, answered or closed. Resolves null for an unknown ticket. */
+async function setTicketStatus(ctx, ticketId, status, handledBy) {
+  const result = await request(ctx, 'POST', { action: 'setTicketStatus', ticketId, status, handledBy: handledBy || '' });
+  return result.data || null;
+}
+
+/** Newest-first ticket list with per-status counts. */
+async function listTickets(ctx, filters = {}) {
+  const result = await request(ctx, 'GET', Object.assign({ action: 'listTickets' }, filters));
+  return result.data || { total: 0, tickets: [], counts: {}, page: 1, totalPages: 1 };
+}
+
+/** One ticket including its whole conversation, or null. */
+async function getTicket(ctx, ticketId) {
+  const result = await request(ctx, 'GET', { action: 'getTicket', ticketId });
+  return result.data || null;
+}
+
 module.exports = {
   forGroup,
   contextFor,
@@ -606,7 +658,9 @@ const IMPLEMENTATIONS = {
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   unpostQuestions, listPosted, bulkStatus, scheduleQuestions, getSubscriber,
-  listSubscribers, getExpiring, getRevenue, upsertSubscriber
+  listSubscribers, getExpiring, getRevenue, upsertSubscriber,
+  getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
+  setTicketStatus, listTickets, getTicket
 };
 
 API_NAMES.forEach((name) => {

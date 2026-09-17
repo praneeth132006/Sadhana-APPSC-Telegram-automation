@@ -36,6 +36,7 @@ const razorpay = require('./src/razorpay');
 const membership = require('./src/membership');
 const plans = require('./src/plans');
 const botapp = require('./src/botapp');
+const support = require('./src/support');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -1236,6 +1237,232 @@ async function handlePublicRoute(pathname, method, req, res) {
   return false;
 }
 
+/** The groups one payment bot sells, in configuration order. */
+function familyOf(groupId) {
+  const group = groupRegistry.requireGroup(groupId);
+  const family = groupRegistry.listGroups()
+    .filter((g) => g.ready && g.paymentBotEnv && g.paymentBotEnv === group.paymentBotEnv);
+  return { group, family, primary: family[0] || group };
+}
+
+/** Invalidates a running bot's cached settings, so a dashboard save applies at once. */
+function refreshBotSettings(payBotEnv) {
+  const app = paymentBots.get(payBotEnv);
+  if (app && app.settingsCache) app.settingsCache.invalidate();
+}
+
+/**
+ * handleSupportRoute — tickets and bot settings for the Support page.
+ *
+ * @returns {Promise<boolean>} true when the route was handled
+ */
+async function handleSupportRoute(pathname, method, req, res, query, groupId, db, actor) {
+  const { group, primary } = familyOf(groupId);
+  const context = {
+    groupId: group.id,
+    primaryGroupId: primary.id,
+    primaryGroupName: primary.shortName,
+    isPrimary: primary.id === group.id,
+    payBotEnv: group.paymentBotEnv || '',
+    botConfigured: paymentBotEnvs().includes(group.paymentBotEnv),
+    supportChatConfigured: Boolean(support.supportChatFor(group.paymentBotEnv))
+  };
+
+  if (pathname === '/api/support/tickets' && method === 'GET') {
+    const status = str(query.get('status'), 20).toLowerCase();
+    const data = await db.listTickets({
+      status: support.TICKET_STATUSES.includes(status) ? status : '',
+      search: str(query.get('search'), 120),
+      page: str(query.get('page'), 8) || '1',
+      pageSize: str(query.get('pageSize'), 4) || '50'
+    });
+    sendJSON(res, 200, { success: true, data: Object.assign({ context }, data) });
+    return true;
+  }
+
+  if (pathname === '/api/support/ticket' && method === 'GET') {
+    const ticketId = str(query.get('id'), 20);
+    if (!TICKET_ID_RE.test(ticketId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticket id (T-yymmdd-XXXX) is required.' });
+      return true;
+    }
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found in this group's sheet.` });
+      return true;
+    }
+    sendJSON(res, 200, { success: true, data: ticket });
+    return true;
+  }
+
+  if (pathname === '/api/support/reply' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    const text = str(body.text, support.MAX_MESSAGE_CHARS + 1);
+    if (!TICKET_ID_RE.test(ticketId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticketId is required.' });
+      return true;
+    }
+    if (!text) {
+      sendJSON(res, 400, { success: false, error: 'The reply is empty.' });
+      return true;
+    }
+    if (text.length > support.MAX_MESSAGE_CHARS) {
+      sendJSON(res, 400, { success: false, error: `Replies are limited to ${support.MAX_MESSAGE_CHARS} characters.` });
+      return true;
+    }
+
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found in this group's sheet.` });
+      return true;
+    }
+
+    const app = supportBotFor(res, ticket);
+    if (!app) return true;
+
+    try {
+      await app.bot.sendMessage(ticket.telegram_id,
+        `${support.esc(support.replyLine(ticketId))}\n\n${support.esc(text)}\n\n` +
+        '<i>Reply to this message to answer.</i>',
+        { parse_mode: 'HTML' });
+    } catch (err) {
+      sendJSON(res, 502, {
+        success: false,
+        error: `Telegram did not deliver the reply: ${err.message}. The student may have blocked the bot.`
+      });
+      return true;
+    }
+
+    let updated = null;
+    let warning = '';
+    try {
+      updated = await db.appendTicketMessage(ticketId, {
+        author: `Admin ${actor}`, text, status: 'answered', handledBy: actor
+      });
+    } catch (err) {
+      // The student already has the message; failing the request now would
+      // invite a second send.
+      warning = `Delivered, but the sheet was not updated: ${err.message}`;
+    }
+
+    await mirrorToSupportChat(app, ticket,
+      `💻 Answered from the dashboard by ${support.esc(actor)}:\n\n${support.esc(text)}`);
+
+    sendJSON(res, 200, { success: true, data: updated, warning });
+    return true;
+  }
+
+  if (pathname === '/api/support/status' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    const status = str(body.status, 20).toLowerCase();
+    if (!TICKET_ID_RE.test(ticketId) || !support.TICKET_STATUSES.includes(status)) {
+      sendJSON(res, 400, {
+        success: false,
+        error: `ticketId and a status of ${support.TICKET_STATUSES.join(' / ')} are required.`
+      });
+      return true;
+    }
+
+    const updated = await db.setTicketStatus(ticketId, status, actor);
+    if (!updated) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found in this group's sheet.` });
+      return true;
+    }
+
+    let notified = false;
+    if (status === 'closed' && body.notify !== false && paymentBotEnvs().includes(updated.bot)) {
+      try {
+        const app = paymentBotFor(updated.bot);
+        await app.bot.sendMessage(updated.telegram_id,
+          `${support.esc(support.replyLine(ticketId))}\n\n` +
+          '✅ This ticket has been marked as resolved. If you still need help, reply to this message ' +
+          'or send /support.',
+          { parse_mode: 'HTML' });
+        notified = true;
+        await mirrorToSupportChat(app, updated, `✅ Closed from the dashboard by ${support.esc(actor)}`);
+      } catch (err) {
+        console.warn(`[support] could not tell ${updated.telegram_id} that ${ticketId} closed: ${err.message}`);
+      }
+    }
+
+    sendJSON(res, 200, { success: true, data: updated, notified });
+    return true;
+  }
+
+  if (pathname === '/api/support/settings' && method === 'GET') {
+    const stored = await db.getBotSettings();
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        context,
+        definitions: support.SETTINGS,
+        settings: support.normaliseSettings(stored),
+        categories: support.CATEGORIES.map((c) => ({ id: c.id, label: c.label, emoji: c.emoji }))
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/support/settings' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const checked = support.validateSettingsPatch(body.settings);
+    if (!checked.ok) {
+      sendJSON(res, 400, { success: false, error: checked.error });
+      return true;
+    }
+    const stored = await db.updateBotSettings(checked.value, actor);
+    refreshBotSettings(group.paymentBotEnv);
+    sendJSON(res, 200, {
+      success: true,
+      data: { context, settings: support.normaliseSettings(stored) }
+    });
+    return true;
+  }
+
+  sendJSON(res, 404, { success: false, error: `Unknown API route: ${method} ${pathname}` });
+  return true;
+}
+
+const TICKET_ID_RE = /^T-\d{6}-[A-Z0-9]{4}$/;
+
+/**
+ * supportBotFor — the bot a ticket's student talks to, or an error response.
+ *
+ * Replies must come from that same bot: a student who only ever started the
+ * UPSC bot cannot be messaged by the newspaper bot at all.
+ */
+function supportBotFor(res, ticket) {
+  if (!paymentBotEnvs().includes(ticket.bot)) {
+    sendJSON(res, 409, {
+      success: false,
+      error: `This ticket came through ${ticket.bot || 'an unknown bot'}, which is not configured on this server.`
+    });
+    return null;
+  }
+  try {
+    return paymentBotFor(ticket.bot);
+  } catch (err) {
+    sendJSON(res, 409, { success: false, error: err.message.split('\n')[0] });
+    return null;
+  }
+}
+
+/** Keeps the admin support chat in step with what happened on the dashboard. */
+async function mirrorToSupportChat(app, ticket, html) {
+  const chat = support.supportChatFor(ticket.bot);
+  if (!chat) return;
+  const options = { parse_mode: 'HTML', disable_web_page_preview: true };
+  if (chat.threadId) options.message_thread_id = chat.threadId;
+  try {
+    await app.bot.sendMessage(chat.chatId,
+      `${support.ticketHeader(ticket.ticket_id, ticket.telegram_id)}\n${html}`, options);
+  } catch (err) {
+    console.warn(`[support] could not mirror ${ticket.ticket_id} to the support chat: ${err.message}`);
+  }
+}
+
 /**
  * handleAuthedRoute — everything that reads or writes real data.
  * `user` is the verified Firebase identity; it is the only source of the
@@ -1652,6 +1879,14 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const summary = await membership.runDailyCheckAllGroups({ dryRun: body.dryRun !== false });
     sendJSON(res, 200, { success: true, data: summary });
     return true;
+  }
+
+  // ---- Support ---------------------------------------------------------------
+  // Tickets live in the sheet of the first group a payment bot sells (see
+  // primaryGroup in src/botapp.js). Every route reports which group that is, so
+  // the page can say where to look instead of showing an empty list.
+  if (pathname.startsWith('/api/support/')) {
+    return handleSupportRoute(pathname, method, req, res, query, groupId, db, actor);
   }
 
   // ---- Telegram status -----------------------------------------------------

@@ -333,6 +333,39 @@ from the bot with a test card and watch the invite arrive.
 | `/status` | Current pass, expiry date, days left |
 | `/cancel` | Stop auto-renewal, keeping the paid period |
 | `/help` | How the flow works |
+| `/support` | Help topics with instant answers, and a way to raise a ticket |
+
+Typing any ordinary message to the bot also offers to send it to support.
+
+### Support tickets and bot settings
+
+A student picks an issue in `/support`, gets the instant answer for it, and can
+then raise a ticket (text or a screenshot). Each ticket is:
+
+- written to the **Support** tab of the sheet of the first group the bot sells,
+- posted to the admin **support chat**, if one is configured, together with the
+  student's current pass status, and
+- listed on the dashboard's **🆘 Support** page.
+
+Admins answer either by **replying to the ticket message in the support chat**
+or from the **Support** page. The student's reply to an answer goes back into
+the same ticket. In the support chat, reply `/close` or `/reopen` to a ticket;
+`/tickets` lists open ones, `/settings` shows the bot texts and
+`/set key value` changes one. `/supporthelp` lists these.
+
+The texts students see — support hours, response time, a fallback contact, an
+extra `/start` note, and the instant answer for each issue — live in the sheet's
+**Bot Settings** tab and are edited from the Support page or with `/set`. No
+deploy is needed; the bot picks changes up within a minute.
+
+Setup:
+
+1. Re-paste the generated `apps-script/<group>.gs.js` into each sheet and deploy a
+   new version. Until then the bot still answers with the default texts and still
+   delivers tickets to the support chat, but cannot save them to the sheet.
+2. Optional: create a **private** Telegram group for admins, add each payment bot,
+   and set `SUPPORT_CHAT_ID` (see `.env.example` for per-bot chats and forum
+   topics). Everyone in that group can answer students and change bot texts.
 
 ---
 

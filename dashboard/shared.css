@@ -1336,3 +1336,69 @@
 /* The `hidden` attribute must win over component display rules — `.btn` and
    `.editor-field` set display, which otherwise leaves "hidden" elements visible. */
 [hidden] { display: none !important; }
+
+/* ---- Support page ------------------------------------------------------ */
+
+.support-thread {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-md);
+  padding: 14px;
+}
+
+.support-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.support-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  font-size: 0.85rem;
+}
+
+.support-meta .muted { color: var(--text-muted); }
+
+.support-snippet {
+  max-width: 360px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.support-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 16px 20px;
+}
+
+.support-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+.support-field label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.support-field .field-input,
+.support-field .field-select { width: 100%; box-sizing: border-box; }
+
+.support-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.support-actions.spread { justify-content: space-between; }
+.support-actions.end { justify-content: flex-end; }
+.support-actions .btn { flex: 0 0 auto; width: auto; }
