@@ -33,6 +33,7 @@ const sheets = require('./sheets');
 const membership = require('./membership');
 const razorpay = require('./razorpay');
 const groupRegistry = require('./groups');
+const support = require('./support');
 
 /**
  * createPaymentBot — builds one family's bot with all its handlers attached.
@@ -114,6 +115,51 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return String(text || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
+
+  // ---------------------------------------------------------------------------
+  // Support: shared state
+  // ---------------------------------------------------------------------------
+
+  /** Keyboard with a single button that opens the support menu. */
+  const SUPPORT_BUTTON = { inline_keyboard: [[{ text: '🆘 Support', callback_data: 'sup:menu' }]] };
+
+  /** How long /start waits for settings before greeting without the extra note. */
+  const START_SETTINGS_WAIT_MS = 2500;
+
+  /** How long a support flow waits for settings before using the defaults. */
+  const SUPPORT_SETTINGS_WAIT_MS = 8000;
+
+  /**
+   * The family's first group. A bot's settings are read from, and its tickets
+   * written to, this group's sheet, so a student in a two-group family never
+   * has a ticket split across sheets.
+   */
+  function primaryGroup() {
+  return familyGroups()[0];
+  }
+
+  const botId = support.botIdFromToken(process.env[payBotEnv]);
+
+  const settingsCache = support.createSettingsCache({
+    load: () => sheetFor(primaryGroup().id).getBotSettings()
+  });
+
+  /** Settings, or the defaults if the sheet does not answer within `ms`. */
+  async function settingsWithin(ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      settingsCache.get(),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(support.normaliseSettings({})), ms);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  }
+
+  const allowTicket = support.createThrottle({ limit: 5, windowMs: 10 * 60 * 1000 });
 
   // ---------------------------------------------------------------------------
   // Menus
@@ -270,14 +316,20 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     ? `the <b>${esc(groups[0].shortName)}</b> group`
     : `our <b>${esc(groups[0].label)}</b> groups`;
 
+  // Bounded: a slow sheet must never hold up the greeting.
+  const settings = await settingsWithin(START_SETTINGS_WAIT_MS);
+  const note = settings.welcome_note ? `${esc(settings.welcome_note)}\n\n` : '';
+
   await bot.sendMessage(msg.chat.id,
     `👋 Hello ${esc(name)}!\n\n` +
     `This bot gives you access to ${what} — daily practice questions with ` +
     'explanations.\n\n' +
+    note +
     'Commands:\n' +
     '/plans — see the passes and subscribe\n' +
     '/status — check your current pass\n' +
-    '/help — how it all works',
+    '/help — how it all works\n' +
+    '/support — get help with a problem',
     { parse_mode: 'HTML' }
   );
   await offerGroups(msg.chat.id);
@@ -321,7 +373,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
   } catch (err) {
     console.error('[bot] /status failed:', err.message);
-    await bot.sendMessage(msg.chat.id, '⚠️ Could not read your status right now. Please try again shortly.');
+    await bot.sendMessage(msg.chat.id, '⚠️ Could not read your status right now. Please try again shortly.',
+      { reply_markup: SUPPORT_BUTTON });
   }
   });
 
@@ -341,8 +394,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     'You will get a reminder before your pass runs out. Check /status any time.\n\n' +
     '<b>On Monthly Auto-Pay?</b> Send /cancel to stop future charges. You keep the ' +
     'access you have already paid for, right up to its expiry date.\n\n' +
-    'Trouble? Reply here and an admin will help.',
-    { parse_mode: 'HTML' }
+    'Trouble? Send /support, or just type your question here.',
+    { parse_mode: 'HTML', reply_markup: SUPPORT_BUTTON }
   );
   });
 
@@ -376,7 +429,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
   } catch (err) {
     console.error('[bot] /cancel failed:', err.message);
-    await bot.sendMessage(msg.chat.id, '⚠️ Could not cancel automatically. Please message an admin.');
+    await bot.sendMessage(msg.chat.id, '⚠️ Could not cancel automatically. Tap below to reach an admin.',
+      { reply_markup: SUPPORT_BUTTON });
   }
   });
 
@@ -412,6 +466,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       parse_mode: 'HTML',
       reply_markup: planKeyboard(group.id)
     });
+    return;
+  }
+
+  if (data.startsWith('sup:')) {
+    await handleSupportCallback(query, data, ack);
     return;
   }
 
@@ -481,7 +540,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     console.error('[bot] could not create checkout:', err.message);
     await bot.sendMessage(user.id,
       '⚠️ Could not create your payment link just now. Please try again in a minute, ' +
-      'or message an admin if it keeps happening.');
+      'or tap below to reach an admin if it keeps happening.',
+      { reply_markup: SUPPORT_BUTTON });
   }
   });
 
@@ -520,6 +580,508 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     callbackUrl: base ? `${base}/payment-success.html` : undefined
   });
   return { url: link.short_url };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Support
+  // ---------------------------------------------------------------------------
+  // Nothing about a conversation is kept in memory (see src/support.js): every
+  // step is recovered from the message being replied to or the button tapped.
+
+  /** How a Telegram user reads in a ticket thread. */
+  function displayUser(user) {
+  const name = [user.first_name, user.last_name].filter(Boolean).join(' ');
+  if (user.username) return name ? `${name} (@${user.username})` : `@${user.username}`;
+  return name || String(user.id);
+  }
+
+  /** The line students see when tickets are switched off or cannot be raised. */
+  function contactLine(settings) {
+  return settings.support_contact ? `\n\nYou can also reach us at ${esc(settings.support_contact)}.` : '';
+  }
+
+  /** The support chat, if one is configured for this family. */
+  function supportChat() {
+  return support.supportChatFor(payBotEnv);
+  }
+
+  /** Options for a message into the support chat, keeping forum topics intact. */
+  function supportChatOptions(chat, extra = {}) {
+  const options = Object.assign({ parse_mode: 'HTML', disable_web_page_preview: true }, extra);
+  if (chat.threadId && !options.message_thread_id) options.message_thread_id = chat.threadId;
+  // The client form-encodes every key it is given, undefined included.
+  Object.keys(options).forEach((key) => {
+    if (options[key] === undefined) delete options[key];
+  });
+  return options;
+  }
+
+  /** The support menu: one button per issue type. */
+  async function sendSupportMenu(chatId) {
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  await bot.sendMessage(chatId,
+    '🆘 <b>Support</b>\n\nWhat do you need help with?\n\n' +
+    `<i>Support hours: ${esc(settings.support_hours)}</i>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: support.CATEGORIES.map((category) => ([{
+          text: `${category.emoji} ${category.label}`,
+          callback_data: `sup:faq:${category.id}`
+        }]))
+      }
+    });
+  }
+
+  /** Asks the student to describe the problem, as a message they reply to. */
+  async function sendSupportPrompt(chatId, category) {
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  if (!support.ticketsEnabled(settings)) {
+    await bot.sendMessage(chatId,
+      'Support tickets are not being taken through the bot right now.' + contactLine(settings),
+      { parse_mode: 'HTML' });
+    return;
+  }
+  await bot.sendMessage(chatId,
+    `${esc(support.promptLine(category))}\n\n` +
+    'Describe the problem in one message. If it is about a payment, include the payment ID or ' +
+    'attach a screenshot.\n\n<i>Reply to this message.</i>',
+    {
+      parse_mode: 'HTML',
+      reply_markup: { force_reply: true, input_field_placeholder: 'Describe your issue' }
+    });
+  }
+
+  /**
+   * notifyAdmins — posts a ticket, or a follow-up to one, into the support chat.
+   *
+   * @returns {Promise<boolean>} true when the admins were reached
+   */
+  async function notifyAdmins({ ticketId, user, category, text, held, source, followUp }) {
+  const chat = supportChat();
+  if (!chat) return false;
+
+  const passes = held
+    ? (held.length
+      ? held.map(({ group, subscriber }) =>
+        `${esc(group.shortName)}: <b>${esc(subscriber.status || 'unknown')}</b>` +
+        (subscriber.expiry_date ? ` until ${esc(subscriber.expiry_date)}` : '')).join('\n')
+      : 'No pass on record')
+    : null;
+
+  const lines = [
+    support.ticketHeader(ticketId, user.id),
+    followUp ? '<b>Follow-up from the student</b>' : `<b>New ticket</b> · ${esc(category.emoji)} ${esc(category.label)}`,
+    `From: ${esc(displayUser(user))}`
+  ];
+  if (passes) lines.push(passes);
+  lines.push('', esc(text || '(attachment below)'), '',
+    '<i>Reply to this message to answer · reply /close to close</i>');
+
+  try {
+    await bot.sendMessage(chat.chatId, lines.join('\n'), supportChatOptions(chat));
+  } catch (err) {
+    console.error(`[support] ${payBotEnv}: could not reach the support chat — ${err.message}`);
+    return false;
+  }
+
+  if (source && support.hasMedia(source)) {
+    try {
+      const caption = `${support.ticketHeader(ticketId, user.id)}\n${support.messageText(source)}`.slice(0, 1000);
+      await bot.copyMessage(chat.chatId, source.chat.id, source.message_id,
+        supportChatOptions(chat, { caption, parse_mode: undefined }));
+    } catch (err) {
+      console.error(`[support] ${payBotEnv}: could not copy an attachment — ${err.message}`);
+    }
+  }
+  return true;
+  }
+
+  /**
+   * openTicket — turns a student's message into a ticket.
+   *
+   * The sheet and the support chat are written independently, so either one
+   * being down still leaves the ticket somewhere an admin will see it.
+   */
+  async function openTicket(source, category, user) {
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  if (!support.ticketsEnabled(settings)) {
+    await bot.sendMessage(user.id,
+      'Support tickets are not being taken through the bot right now.' + contactLine(settings),
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  const text = support.messageText(source);
+  if (!text && !support.hasMedia(source)) {
+    await bot.sendMessage(user.id, 'Please describe the problem in words, or attach a screenshot.');
+    return;
+  }
+  if (!allowTicket(String(user.id))) {
+    await bot.sendMessage(user.id,
+      'You have sent several support messages in the last few minutes. An admin will get to them — ' +
+      'please wait a little before sending more.');
+    return;
+  }
+
+  const ticketId = support.newTicketId();
+  const [saved, held] = await Promise.all([
+    sheetFor(primaryGroup().id).createTicket({
+      ticket_id: ticketId,
+      telegram_id: String(user.id),
+      username: user.username || '',
+      name: [user.first_name, user.last_name].filter(Boolean).join(' '),
+      category: category.id,
+      bot: payBotEnv,
+      message: text || '(attachment)'
+    }).then(() => true, (err) => {
+      console.error(`[support] ${payBotEnv}: could not record ticket ${ticketId} — ${err.message}`);
+      return false;
+    }),
+    findSubscriptions(user.id)
+  ]);
+
+  const delivered = await notifyAdmins({ ticketId, user, category, text, held, source });
+
+  if (!saved && !delivered) {
+    await bot.sendMessage(user.id,
+      '⚠️ Could not submit your ticket just now. Please try again in a few minutes.' + contactLine(settings),
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  await bot.sendMessage(user.id,
+    `${esc(support.receivedLine(ticketId))}\n\n` +
+    `Thanks — an admin will reply <b>${esc(settings.support_response_time)}</b>, right here in this chat.\n` +
+    `Support hours: ${esc(settings.support_hours)}\n\n` +
+    '<i>To add more details, reply to this message.</i>',
+    { parse_mode: 'HTML' });
+  }
+
+  /** A student replying to their ticket confirmation or to an admin's answer. */
+  async function followUpTicket(source, ticketId, user) {
+  const text = support.messageText(source);
+  if (!text && !support.hasMedia(source)) return;
+  if (!allowTicket(String(user.id))) {
+    await bot.sendMessage(user.id,
+      'You have sent several support messages in the last few minutes. Please wait a little before sending more.');
+    return;
+  }
+
+  const [saved, delivered] = await Promise.all([
+    sheetFor(primaryGroup().id).appendTicketMessage(ticketId, {
+      author: displayUser(user),
+      text: text || '(attachment)',
+      status: 'open'
+    }).then((ticket) => Boolean(ticket), (err) => {
+      console.error(`[support] ${payBotEnv}: could not add to ticket ${ticketId} — ${err.message}`);
+      return false;
+    }),
+    notifyAdmins({ ticketId, user, text, source, followUp: true })
+  ]);
+
+  if (!saved && !delivered) {
+    await bot.sendMessage(user.id,
+      '⚠️ Could not add that to your ticket just now. Please try again in a few minutes.');
+    return;
+  }
+  await bot.sendMessage(user.id,
+    `${esc(support.receivedLine(ticketId))}\n\nAdded to your ticket. An admin will reply here.`,
+    { parse_mode: 'HTML' });
+  }
+
+  /** Taps on any sup:* button. */
+  async function handleSupportCallback(query, data, ack) {
+  const user = query.from;
+  const [, action, arg] = data.split(':');
+
+  if (action === 'menu') {
+    await ack();
+    await sendSupportMenu(user.id);
+    return;
+  }
+
+  if (action === 'faq') {
+    await ack();
+    const category = support.categoryById(arg);
+    const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+    const buttons = support.ticketsEnabled(settings)
+      ? [
+        [{ text: '📨 I still need help', callback_data: `sup:ask:${category.id}` }],
+        [{ text: '✅ That solved it', callback_data: 'sup:solved' }]
+      ]
+      : [[{ text: '✅ That solved it', callback_data: 'sup:solved' }]];
+    await bot.sendMessage(user.id,
+      `${esc(category.emoji)} <b>${esc(category.label)}</b>\n\n${esc(settings[category.settingKey])}` +
+      (support.ticketsEnabled(settings) ? '' : contactLine(settings)),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } });
+    return;
+  }
+
+  if (action === 'ask') {
+    await ack();
+    await sendSupportPrompt(user.id, support.categoryById(arg));
+    return;
+  }
+
+  if (action === 'solved') {
+    await ack('Glad that helped! Send /support any time.');
+    return;
+  }
+
+  const offer = query.message;
+
+  if (action === 'dismiss') {
+    await ack();
+    if (offer) {
+      try {
+        await bot.deleteMessage(offer.chat.id, offer.message_id);
+      } catch (err) {
+        // Too old to delete; harmless.
+      }
+    }
+    return;
+  }
+
+  if (action === 'send') {
+    const original = offer && offer.reply_to_message;
+    if (!original || !original.from || String(original.from.id) !== String(user.id)) {
+      await ack('That message is no longer available — send /support instead.');
+      return;
+    }
+    await ack('Sending to support…');
+    try {
+      await bot.editMessageReplyMarkup({ inline_keyboard: [] },
+        { chat_id: offer.chat.id, message_id: offer.message_id });
+    } catch (err) {
+      // Buttons that stay visible are cosmetic; the ticket still goes through.
+    }
+    await openTicket(original, support.categoryById('other'), user);
+    return;
+  }
+
+  await ack();
+  }
+
+  // Everything a student types that is not a command, and everything said in
+  // the admin support chat.
+  bot.on('message', async (msg) => {
+  if (!msg || !msg.chat || !msg.from || msg.from.is_bot) return;
+
+  const chat = supportChat();
+  if (chat && String(msg.chat.id) === chat.chatId) {
+    await handleSupportChatMessage(msg, chat);
+    return;
+  }
+
+  // Only private chats. The bot is an admin in the paid groups and sees every
+  // message there; answering those would be spam at best.
+  if (msg.chat.type !== 'private') return;
+
+  if (/^\/support(?:@\w+)?(?:\s|$)/i.test(String(msg.text || ''))) {
+    await sendSupportMenu(msg.chat.id);
+    return;
+  }
+  // Other commands have their own handlers.
+  if (String(msg.text || '').startsWith('/')) return;
+
+  const replied = msg.reply_to_message;
+  if (replied && replied.from && String(replied.from.id) === botId) {
+    const repliedText = support.messageText(replied);
+    const category = support.parsePrompt(repliedText);
+    if (category) {
+      await openTicket(msg, category, msg.from);
+      return;
+    }
+    const ticketId = support.parseReplyLine(repliedText);
+    if (ticketId) {
+      await followUpTicket(msg, ticketId, msg.from);
+      return;
+    }
+  }
+
+  // Service messages (a join, a pinned message) carry neither.
+  if (!support.messageText(msg) && !support.hasMedia(msg)) return;
+
+  // A free-typed message used to vanish: /help said "reply here and an admin
+  // will help" and nothing was listening. Offer to turn it into a ticket; the
+  // offer replies to the message, so the tap can find it again statelessly.
+  await bot.sendMessage(msg.chat.id,
+    'Would you like to send this message to our support team?',
+    {
+      reply_to_message_id: msg.message_id,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📨 Send to support', callback_data: 'sup:send' }],
+          [{ text: '🆘 Browse help topics', callback_data: 'sup:menu' }],
+          [{ text: '✖️ No thanks', callback_data: 'sup:dismiss' }]
+        ]
+      }
+    });
+  });
+
+  /** This bot's @username, fetched once. */
+  let ownUsername = null;
+  async function isAddressedToThisBot(mention) {
+  if (!mention) return true;
+  if (ownUsername === null) {
+    try {
+      ownUsername = String((await bot.getMe()).username || '');
+    } catch (err) {
+      return false;
+    }
+  }
+  return ownUsername.toLowerCase() === String(mention).toLowerCase();
+  }
+
+  /**
+   * handleSupportChatMessage — admins answering from the support chat.
+   *
+   * Anyone in that chat is treated as an admin, so it must be a private group
+   * of admins. Several family bots can share one chat: a reply is only acted on
+   * by the bot that posted the ticket being replied to.
+   */
+  async function handleSupportChatMessage(msg, chat) {
+  const command = support.parseCommand(msg.text);
+  if (command && !(await isAddressedToThisBot(command.mention))) return;
+
+  const admin = msg.from.username ? `@${msg.from.username}` : displayUser(msg.from);
+  const where = supportChatOptions(chat, {
+    reply_to_message_id: msg.message_id,
+    message_thread_id: msg.message_thread_id || chat.threadId || undefined
+  });
+
+  const replied = msg.reply_to_message;
+  const ticket = replied && replied.from && String(replied.from.id) === botId
+    ? support.parseTicketHeader(support.messageText(replied))
+    : null;
+
+  if (ticket) {
+    if (command && (command.name === 'close' || command.name === 'reopen')) {
+      const status = command.name === 'close' ? 'closed' : 'open';
+      try {
+        await sheetFor(primaryGroup().id).setTicketStatus(ticket.ticketId, status, admin);
+      } catch (err) {
+        console.error(`[support] ${payBotEnv}: could not set ${ticket.ticketId} to ${status} — ${err.message}`);
+      }
+      if (status === 'closed') {
+        try {
+          await bot.sendMessage(ticket.telegramId,
+            `${esc(support.replyLine(ticket.ticketId))}\n\n` +
+            '✅ This ticket has been marked as resolved. If you still need help, reply to this message ' +
+            'or send /support.',
+            { parse_mode: 'HTML' });
+        } catch (err) {
+          // Blocked the bot; the ticket is closed either way.
+        }
+      }
+      await bot.sendMessage(chat.chatId,
+        `${support.ticketHeader(ticket.ticketId, ticket.telegramId)}\n` +
+        (status === 'closed' ? '✅ Closed by ' : '🔓 Reopened by ') + esc(admin), where);
+      return;
+    }
+    if (command) return;
+
+    const text = support.messageText(msg);
+    if (!text && !support.hasMedia(msg)) return;
+
+    try {
+      if (support.hasMedia(msg)) {
+        await bot.copyMessage(ticket.telegramId, msg.chat.id, msg.message_id, {
+          caption: `${support.replyLine(ticket.ticketId)}\n\n${text}`.slice(0, 1000)
+        });
+      } else {
+        await bot.sendMessage(ticket.telegramId,
+          `${esc(support.replyLine(ticket.ticketId))}\n\n${esc(text)}\n\n` +
+          '<i>Reply to this message to answer.</i>',
+          { parse_mode: 'HTML' });
+      }
+    } catch (err) {
+      await bot.sendMessage(chat.chatId,
+        `${support.ticketHeader(ticket.ticketId, ticket.telegramId)}\n` +
+        `⚠️ Not delivered: ${esc(err.message)}\nThe student may have blocked the bot.`, where);
+      return;
+    }
+
+    try {
+      await sheetFor(primaryGroup().id).appendTicketMessage(ticket.ticketId, {
+        author: `Admin ${admin}`,
+        text: text || '(attachment)',
+        status: 'answered',
+        handledBy: admin
+      });
+    } catch (err) {
+      console.error(`[support] ${payBotEnv}: could not record the answer to ${ticket.ticketId} — ${err.message}`);
+    }
+
+    await bot.sendMessage(chat.chatId,
+      `${support.ticketHeader(ticket.ticketId, ticket.telegramId)}\n✅ Delivered to the student.`, where);
+    return;
+  }
+
+  if (!command) return;
+  const family = esc(primaryGroup().label || primaryGroup().shortName);
+
+  if (command.name === 'tickets') {
+    try {
+      const list = await sheetFor(primaryGroup().id).listTickets({ status: 'open', pageSize: 20 });
+      const counts = list.counts || {};
+      const lines = (list.tickets || []).map((t) =>
+        `• <code>${esc(t.ticket_id)}</code> · ${esc(t.username ? '@' + t.username : (t.name || t.telegram_id))} · ` +
+        `${esc(support.categoryById(t.category).label)}\n  ${esc(String(t.last_message || '').slice(0, 120))}`);
+      await bot.sendMessage(chat.chatId,
+        `<b>${family} — open tickets</b>\n` +
+        `Open ${counts.open || 0} · Answered ${counts.answered || 0} · Closed ${counts.closed || 0}\n\n` +
+        (lines.length ? lines.join('\n') : 'Nothing open. 🎉') +
+        '\n\n<i>Reply to a ticket message to answer it.</i>', where);
+    } catch (err) {
+      await bot.sendMessage(chat.chatId, `⚠️ Could not read tickets: ${esc(err.message)}`, where);
+    }
+    return;
+  }
+
+  if (command.name === 'settings') {
+    settingsCache.invalidate();
+    const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+    const lines = support.SETTINGS.map((def) => {
+      const value = String(settings[def.key] || '');
+      const shown = value.length > 80 ? value.slice(0, 80) + '…' : (value || '(empty)');
+      return `<code>${def.key}</code>: ${esc(shown)}`;
+    });
+    await bot.sendMessage(chat.chatId,
+      `<b>${family} — bot settings</b>\n\n${lines.join('\n')}\n\n` +
+      'Change one with <code>/set key new value</code>, or use the Support page on the dashboard.', where);
+    return;
+  }
+
+  if (command.name === 'set') {
+    const key = command.args.split(/\s+/)[0] || '';
+    const value = command.args.slice(key.length).trim();
+    const checked = support.validateSettingsPatch(key ? { [key]: value } : {});
+    if (!checked.ok) {
+      await bot.sendMessage(chat.chatId,
+        `⚠️ ${esc(checked.error)}\n\nUsage: <code>/set key new value</code>`, where);
+      return;
+    }
+    try {
+      await sheetFor(primaryGroup().id).updateBotSettings(checked.value, admin);
+      settingsCache.invalidate();
+      await bot.sendMessage(chat.chatId, `✅ <code>${esc(key)}</code> updated by ${esc(admin)}.`, where);
+    } catch (err) {
+      await bot.sendMessage(chat.chatId, `⚠️ Could not save: ${esc(err.message)}`, where);
+    }
+    return;
+  }
+
+  if (command.name === 'supporthelp') {
+    await bot.sendMessage(chat.chatId,
+      `<b>${family} — support commands</b>\n\n` +
+      '• Reply to a ticket message to answer the student.\n' +
+      '• Reply <code>/close</code> or <code>/reopen</code> to a ticket message.\n' +
+      '• <code>/tickets</code> — open tickets\n' +
+      '• <code>/settings</code> — current bot texts\n' +
+      '• <code>/set key value</code> — change one', where);
+  }
   }
 
   // ---------------------------------------------------------------------------
@@ -595,7 +1157,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     console.error(`[bot] ${payBotEnv} polling error: ${err.message}`);
   });
 
-  return { payBotEnv, bot, familyGroups, plansFor, ALLOWED_UPDATES, settle };
+  return { payBotEnv, bot, familyGroups, plansFor, ALLOWED_UPDATES, settle, primaryGroup, settingsCache };
 
 }
 

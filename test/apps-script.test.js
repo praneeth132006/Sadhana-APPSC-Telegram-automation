@@ -1632,3 +1632,148 @@ test('listQuestions counts posted rows across the whole filter', () => {
   assert.equal(first.counts.posted, 2, 'counted only the single row on the page');
   assert.equal(first.total, 3);
 });
+
+// ===========================================================================
+// Support tickets and bot settings
+// ===========================================================================
+
+function newTicket(overrides) {
+  return Object.assign({
+    ticket_id: 'T-260917-AB2C',
+    telegram_id: '7234356929',
+    username: 'student',
+    name: 'A Student',
+    category: 'payment',
+    bot: 'TELEGRAM_PAYBOT_UPSC',
+    message: 'I paid but got no link'
+  }, overrides || {});
+}
+
+test('the Support and Bot Settings tabs are never mistaken for question subjects', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.updateBotSettings({ support_hours: '24x7' }, 'admin');
+  script.book().insertSheet('Polity');
+
+  const subjects = Array.from(script.listSubjectSheets());
+  assert.deepEqual(subjects, ['Polity']);
+});
+
+test('createTicket opens a ticket and a repeated delivery does not open a second', () => {
+  const script = freshScript();
+
+  const first = script.createTicket(newTicket());
+  assert.equal(first.status, 'open');
+  assert.equal(first.telegram_id, '7234356929');
+  assert.match(first.conversation, /@student:\nI paid but got no link/);
+
+  const again = script.createTicket(newTicket({ message: 'a retry' }));
+  assert.equal(again.ticket_id, first.ticket_id);
+  assert.equal(again.last_message, 'I paid but got no link', 'a retry overwrote the original ticket');
+  assert.equal(script.book().getSheetByName('Support').getLastRow(), 2, 'header plus one ticket');
+});
+
+test('appendTicketMessage grows the thread and moves the status', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+
+  const answered = script.appendTicketMessage('T-260917-AB2C', 'Admin @helper', 'Resent your link', 'answered', '@helper');
+  assert.equal(answered.status, 'answered');
+  assert.equal(answered.last_message, 'Resent your link');
+  assert.equal(answered.handled_by, '@helper');
+  assert.match(answered.conversation, /I paid but got no link[\s\S]*Admin @helper:\nResent your link/);
+
+  // An unrecognised status leaves the current one alone.
+  const kept = script.appendTicketMessage('T-260917-AB2C', 'A Student', 'thanks', 'bogus');
+  assert.equal(kept.status, 'answered');
+
+  assert.equal(script.appendTicketMessage('T-000000-NONE', 'x', 'y'), null);
+});
+
+test('a long thread is trimmed from the oldest end to fit one cell', () => {
+  const script = freshScript();
+  script.createTicket(newTicket({ message: 'FIRST MESSAGE' }));
+  const chunk = 'x'.repeat(3000);
+  let ticket;
+  for (let i = 0; i < 20; i++) ticket = script.appendTicketMessage('T-260917-AB2C', 'someone', chunk + i);
+
+  assert.ok(ticket.conversation.length <= script.MAX_CONVERSATION_CHARS + 40, 'the thread outgrew a sheet cell');
+  assert.ok(!ticket.conversation.includes('FIRST MESSAGE'), 'the oldest message should be the one dropped');
+  assert.ok(ticket.conversation.endsWith(chunk + 19), 'the newest message must survive');
+});
+
+test('setTicketStatus accepts only known statuses', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+
+  assert.equal(script.setTicketStatus('T-260917-AB2C', 'CLOSED', 'admin@example.com').status, 'closed');
+  assert.throws(() => script.setTicketStatus('T-260917-AB2C', 'deleted'), /Status must be one of/);
+  assert.equal(script.setTicketStatus('T-000000-NONE', 'open'), null);
+});
+
+test('listTickets is newest first, filters, counts every status and leaves threads out', () => {
+  const script = freshScript();
+  script.createTicket(newTicket({ ticket_id: 'T-260917-AAAA', telegram_id: '1', message: 'first' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-BBBB', telegram_id: '2', message: 'second refund' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-CCCC', telegram_id: '3', message: 'third' }));
+  script.setTicketStatus('T-260917-CCCC', 'closed');
+
+  const all = script.listTickets({});
+  assert.deepEqual(Array.from(all.tickets, (t) => t.ticket_id), ['T-260917-CCCC', 'T-260917-BBBB', 'T-260917-AAAA']);
+  assert.equal(all.counts.open, 2);
+  assert.equal(all.counts.closed, 1);
+  assert.equal(all.counts.total, 3);
+  assert.ok(all.tickets.every((t) => t.conversation === ''), 'the list should not carry whole threads');
+
+  assert.equal(script.listTickets({ status: 'open' }).total, 2);
+  assert.equal(script.listTickets({ search: 'refund' }).tickets[0].ticket_id, 'T-260917-BBBB');
+  assert.equal(script.listTickets({ telegramId: '1' }).total, 1);
+  assert.equal(script.getTicket('T-260917-AAAA').conversation.includes('first'), true);
+});
+
+test('updateBotSettings upserts by key and refuses malformed keys', () => {
+  const script = freshScript();
+
+  script.updateBotSettings({ support_hours: '9-5', welcome_note: 'Hi' }, 'a@example.com');
+  const after = script.updateBotSettings({ support_hours: '24x7' }, 'b@example.com');
+  assert.equal(after.support_hours, '24x7');
+  assert.equal(after.welcome_note, 'Hi', 'a key that was not sent must be left alone');
+
+  const sheet = script.book().getSheetByName('Bot Settings');
+  assert.equal(sheet.getLastRow(), 3, 'header plus one row per key, not per save');
+
+  assert.throws(() => script.updateBotSettings({ 'bad key!': 'x' }, 'a'), /Invalid setting key/);
+  assert.equal(script.getBotSettings().support_hours, '24x7');
+});
+
+test('the support actions are routed over HTTP and still require the token', () => {
+  const script = freshScript();
+  scriptProperties.API_TOKEN = 'secret-token';
+  try {
+    const denied = JSON.parse(script.doGet({ parameter: { action: 'listTickets' } }).text);
+    assert.equal(denied.success, false, 'listTickets answered without a token');
+
+    const created = JSON.parse(script.doPost({ postData: { contents: JSON.stringify({
+      action: 'createTicket', token: 'secret-token', ticket: newTicket()
+    }) } }).text);
+    assert.equal(created.success, true, created.error);
+
+    const listed = JSON.parse(script.doGet({ parameter: { action: 'listTickets', token: 'secret-token' } }).text);
+    assert.equal(listed.data.total, 1);
+
+    const missing = JSON.parse(script.doPost({ postData: { contents: JSON.stringify({
+      action: 'appendTicketMessage', token: 'secret-token', ticketId: 'T-260917-AB2C'
+    }) } }).text);
+    assert.equal(missing.success, false, 'an empty message should be refused');
+
+    const saved = JSON.parse(script.doPost({ postData: { contents: JSON.stringify({
+      action: 'updateBotSettings', token: 'secret-token', settings: { support_hours: 'always' }, updated_by: 'x'
+    }) } }).text);
+    assert.equal(saved.data.support_hours, 'always');
+
+    const read = JSON.parse(script.doGet({ parameter: { action: 'getBotSettings', token: 'secret-token' } }).text);
+    assert.equal(read.data.support_hours, 'always');
+  } finally {
+    delete scriptProperties.API_TOKEN;
+  }
+});

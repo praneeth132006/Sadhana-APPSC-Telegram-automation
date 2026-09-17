@@ -1666,3 +1666,198 @@ test('health says whether the server is serverless, so 0.0.0.0 can be judged', a
   assert.equal(res.json.data.server.serverless, false, 'tests do not run on Vercel');
   assert.equal(res.json.data.server.host, '127.0.0.1');
 });
+
+// ===========================================================================
+// Support tickets and bot settings
+// ===========================================================================
+
+const TelegramBotClient = require('node-telegram-bot-api');
+
+const SAMPLE_TICKET = {
+  ticket_id: 'T-260917-AB2C', telegram_id: '4242', username: 'asha', name: 'Asha',
+  category: 'payment', status: 'open', bot: 'TELEGRAM_PAYBOT_NEWS',
+  last_message: 'paid, no link', conversation: '[now] @asha:\npaid, no link'
+};
+
+stub(sheets, 'listTickets', { total: 1, page: 1, totalPages: 1, counts: { open: 1 }, tickets: [SAMPLE_TICKET] });
+stub(sheets, 'getTicket', (ctxOrId, maybeId) => {
+  const id = maybeId === undefined ? ctxOrId : maybeId;
+  return id === SAMPLE_TICKET.ticket_id ? SAMPLE_TICKET : null;
+});
+stub(sheets, 'appendTicketMessage', (id) => Object.assign({}, SAMPLE_TICKET, { ticket_id: id, status: 'answered' }));
+stub(sheets, 'setTicketStatus', (id, status) => Object.assign({}, SAMPLE_TICKET, { ticket_id: id, status }));
+stub(sheets, 'getBotSettings', { support_hours: '24x7', not_a_setting: 'x' });
+stub(sheets, 'updateBotSettings', (patch) => patch);
+
+/** Runs `fn` with a payment bot token set and Telegram sends recorded, not made. */
+async function withRecordedBot(fn) {
+  const savedToken = process.env.TELEGRAM_PAYBOT_NEWS;
+  const savedSend = TelegramBotClient.prototype.sendMessage;
+  const sends = [];
+  process.env.TELEGRAM_PAYBOT_NEWS = savedToken || '123:TEST';
+  TelegramBotClient.prototype.sendMessage = async function (chatId, text, options) {
+    sends.push({ chatId: String(chatId), text, options });
+    return { message_id: 1 };
+  };
+  try {
+    return await fn(sends);
+  } finally {
+    TelegramBotClient.prototype.sendMessage = savedSend;
+    if (savedToken === undefined) delete process.env.TELEGRAM_PAYBOT_NEWS;
+    else process.env.TELEGRAM_PAYBOT_NEWS = savedToken;
+  }
+}
+
+test('the support routes refuse an unauthenticated caller', async () => {
+  for (const [method, path] of [
+    ['GET', '/api/support/tickets'], ['GET', '/api/support/ticket?id=T-260917-AB2C'],
+    ['POST', '/api/support/reply'], ['POST', '/api/support/status'],
+    ['GET', '/api/support/settings'], ['POST', '/api/support/settings']
+  ]) {
+    const res = await call(`${path}${path.includes('?') ? '&' : '?'}group=${TEST_GROUP}`, { method, body: method === 'POST' ? {} : undefined });
+    assert.equal(res.status, 401, `${method} ${path} answered without sign-in`);
+  }
+});
+
+test('GET /api/support/tickets lists tickets with where they are stored', async () => {
+  calls.length = 0;
+  const res = await authed('/api/support/tickets?status=nonsense&search=refund');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.data.tickets[0].ticket_id, 'T-260917-AB2C');
+  assert.equal(res.json.data.context.primaryGroupId, 'appsc_news_en');
+  assert.equal(res.json.data.context.isPrimary, true);
+
+  const forwarded = calls.find((c) => c.name === 'listTickets').args[0];
+  assert.equal(forwarded.status, '', 'an unknown status must not reach the sheet');
+  assert.equal(forwarded.search, 'refund');
+});
+
+test('the second group of a family is told which sheet holds its tickets', async () => {
+  const res = await call('/api/support/tickets?group=appsc_news_te', { token: 'valid-token' });
+  // appsc_news_te may not be configured in every environment; when it is not,
+  // the route must still refuse cleanly rather than crash.
+  if (res.status === 200) {
+    assert.equal(res.json.data.context.isPrimary, false);
+    assert.equal(res.json.data.context.primaryGroupId, 'appsc_news_en');
+  } else {
+    assert.equal(res.status, 400);
+  }
+});
+
+test('GET /api/support/ticket validates the id and reports a missing ticket', async () => {
+  assert.equal((await authed('/api/support/ticket?id=../../etc')).status, 400);
+  assert.equal((await authed('/api/support/ticket?id=T-260917-ZZZZ')).status, 404);
+  const found = await authed('/api/support/ticket?id=T-260917-AB2C');
+  assert.equal(found.status, 200);
+  assert.match(found.json.data.conversation, /paid, no link/);
+});
+
+test('POST /api/support/reply validates before sending anything', async () => {
+  await withRecordedBot(async (sends) => {
+    assert.equal((await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'bad', text: 'hi' } })).status, 400);
+    assert.equal((await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'T-260917-AB2C', text: '   ' } })).status, 400);
+    assert.equal((await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'T-260917-AB2C', text: 'x'.repeat(3501) } })).status, 400);
+    assert.equal((await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'T-260917-ZZZZ', text: 'hi' } })).status, 404);
+    assert.equal(sends.length, 0, 'an invalid reply reached Telegram');
+  });
+});
+
+test('POST /api/support/reply sends through the ticket\'s bot and records the real actor', async () => {
+  await withRecordedBot(async (sends) => {
+    calls.length = 0;
+    const res = await authed('/api/support/reply', {
+      method: 'POST',
+      body: { ticketId: 'T-260917-AB2C', text: 'Resent <b>your</b> link', actor: 'forged@evil.com' }
+    });
+    assert.equal(res.status, 200, res.json && res.json.error);
+
+    const toStudent = sends.find((s) => s.chatId === '4242');
+    assert.ok(toStudent, 'the student was not messaged');
+    assert.match(toStudent.text, /^💬 Support reply · T-260917-AB2C/);
+    assert.match(toStudent.text, /Resent &lt;b&gt;your&lt;\/b&gt; link/, 'dashboard text must be escaped');
+
+    const appended = calls.find((c) => c.name === 'appendTicketMessage');
+    assert.equal(appended.args[1].status, 'answered');
+    assert.equal(appended.args[1].handledBy, 'Test Curator (curator@example.com)');
+  });
+});
+
+test('a reply for a ticket whose bot is not configured is a 409, not a silent drop', async () => {
+  const original = clientStubs.getTicket;
+  clientStubs.getTicket = async () => Object.assign({}, SAMPLE_TICKET, { bot: 'TELEGRAM_PAYBOT_NOT_A_THING' });
+  try {
+    const res = await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'T-260917-AB2C', text: 'hi' } });
+    assert.equal(res.status, 409);
+    assert.match(res.json.error, /not configured/);
+  } finally {
+    clientStubs.getTicket = original;
+  }
+});
+
+test('a Telegram refusal is reported, and the ticket is not marked answered', async () => {
+  const savedToken = process.env.TELEGRAM_PAYBOT_NEWS;
+  const savedSend = TelegramBotClient.prototype.sendMessage;
+  process.env.TELEGRAM_PAYBOT_NEWS = savedToken || '123:TEST';
+  TelegramBotClient.prototype.sendMessage = async () => { throw new Error('Forbidden: bot was blocked by the user'); };
+  try {
+    calls.length = 0;
+    const res = await authed('/api/support/reply', { method: 'POST', body: { ticketId: 'T-260917-AB2C', text: 'hi' } });
+    assert.equal(res.status, 502);
+    assert.match(res.json.error, /blocked/);
+    assert.equal(calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
+  } finally {
+    TelegramBotClient.prototype.sendMessage = savedSend;
+    if (savedToken === undefined) delete process.env.TELEGRAM_PAYBOT_NEWS;
+    else process.env.TELEGRAM_PAYBOT_NEWS = savedToken;
+  }
+});
+
+test('POST /api/support/status closes a ticket and tells the student', async () => {
+  await withRecordedBot(async (sends) => {
+    assert.equal((await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: 'deleted' } })).status, 400);
+
+    calls.length = 0;
+    const res = await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: 'closed' } });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.notified, true);
+    assert.deepEqual(calls.find((c) => c.name === 'setTicketStatus').args,
+      ['T-260917-AB2C', 'closed', 'Test Curator (curator@example.com)']);
+    assert.ok(sends.some((s) => s.chatId === '4242' && /marked as resolved/.test(s.text)));
+  });
+});
+
+test('GET /api/support/settings returns every known setting and drops unknown ones', async () => {
+  const res = await authed('/api/support/settings');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.data.settings.support_hours, '24x7');
+  assert.equal(res.json.data.settings.not_a_setting, undefined);
+  assert.ok(res.json.data.definitions.some((d) => d.key === 'faq_payment'));
+  assert.ok(res.json.data.categories.length >= 5);
+});
+
+test('POST /api/support/settings validates and saves with the real actor', async () => {
+  assert.equal((await authed('/api/support/settings', { method: 'POST', body: { settings: { bank_details: 'x' } } })).status, 400);
+  assert.equal((await authed('/api/support/settings', { method: 'POST', body: { settings: { support_enabled: 'maybe' } } })).status, 400);
+  assert.equal((await authed('/api/support/settings', { method: 'POST', body: {} })).status, 400);
+
+  calls.length = 0;
+  const res = await authed('/api/support/settings', {
+    method: 'POST', body: { settings: { support_enabled: 'No', welcome_note: 'Hello' } }
+  });
+  assert.equal(res.status, 200);
+  const saved = calls.find((c) => c.name === 'updateBotSettings');
+  assert.deepEqual(saved.args, [{ support_enabled: 'no', welcome_note: 'Hello' }, 'Test Curator (curator@example.com)']);
+  assert.equal(res.json.data.settings.support_enabled, 'no');
+});
+
+test('an unknown support route is a 404', async () => {
+  assert.equal((await authed('/api/support/nope')).status, 404);
+});
+
+test('the Support page is served and linked from the navigation', async () => {
+  const page = await call('/support.html');
+  assert.equal(page.status, 200);
+  assert.match(page.text, /support\.js/);
+  const shared = await call('/shared.js');
+  assert.match(shared.text, /href: 'support\.html'/);
+});

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Support — Sadhana APPSC</title>
+  <meta name="description" content="Student support tickets raised through the payment bots, and the bot texts admins can change without a deploy.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+  <div class="app-container">
+    <main id="pageRoot" class="page-root" style="display:none">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Support &amp; Bot Settings</h1>
+          <p class="page-subtitle">
+            Tickets students raise with /support in the payment bot, your replies to them, and the
+            bot texts you can change without a deploy.
+          </p>
+        </div>
+        <div class="page-actions">
+          <button id="refreshBtn" class="btn btn-primary">Refresh</button>
+        </div>
+      </div>
+
+      <div id="notices"></div>
+      <div id="statGrid" class="stat-grid"></div>
+      <div id="ticketDetail"></div>
+      <div id="panels"></div>
+      <div id="settingsPanel"></div>
+    </main>
+  </div>
+
+  <script type="module" src="support.js"></script>
+</body>
+</html>
