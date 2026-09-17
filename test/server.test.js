@@ -125,6 +125,30 @@ stub(sheets, 'upsertSubscriber', { telegram_id: '555' });
 
 const server = require('../server');
 
+// .env names the real support chat. Tests that want one set it themselves.
+delete process.env.SUPPORT_CHAT_ID;
+delete process.env.SUPPORT_THREAD_ID;
+
+// No test may reach the real Telegram API. The server reads .env, which holds
+// real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
+// test forgot to stub would post into the live support group. A test that
+// wants Telegram replaces the specific method it needs, which runs instead.
+require('node-telegram-bot-api').prototype._request = async function (method) {
+  throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
+};
+
+// Nor the live Google Sheets or Razorpay: .env points at real ones.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = function guardedFetch(url, ...rest) {
+    const target = String(url && url.url ? url.url : url);
+    if (/^https:\/\/(script\.google(usercontent)?\.com|api\.razorpay\.com|api\.telegram\.org)\//.test(target)) {
+      return Promise.reject(new Error(`Network call to ${target.split('?')[0]} attempted in a test — stub it`));
+    }
+    return realFetch.call(this, url, ...rest);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -1777,7 +1801,7 @@ test('POST /api/support/reply sends through the ticket\'s bot and records the re
     assert.match(toStudent.text, /Resent &lt;b&gt;your&lt;\/b&gt; link/, 'dashboard text must be escaped');
 
     const appended = calls.find((c) => c.name === 'appendTicketMessage');
-    assert.equal(appended.args[1].status, 'answered');
+    assert.equal(appended.args[1].status, undefined, 'the sheet decides the status from who wrote');
     assert.equal(appended.args[1].handledBy, 'Test Curator (curator@example.com)');
   });
 });
@@ -2148,5 +2172,128 @@ test('POST /api/support/grant-pass needs a group from the ticket\'s bot and repo
     });
   } finally {
     razorpayModule.getPayment = original;
+  }
+});
+
+
+// ---- Ticket lifecycle over the API ----------------------------------------
+
+test('reopening from the dashboard always asks the sheet for in_progress', async () => {
+  for (const requested of ['open', 'in_progress', 'answered']) {
+    calls.length = 0;
+    const res = await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: requested } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(calls.find((c) => c.name === 'setTicketStatus').args,
+      ['T-260917-AB2C', 'in_progress', 'Test Curator (curator@example.com)'], `"${requested}" was not mapped to in_progress`);
+  }
+});
+
+test('closing a ticket that was already closed does not message the student again', async () => {
+  const original = clientStubs.setTicketStatus;
+  clientStubs.setTicketStatus = async (id) => Object.assign({}, SAMPLE_TICKET, { ticket_id: id, status: 'closed', previous_status: 'closed' });
+  try {
+    await withRecordedBot(async (sends) => {
+      const res = await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: 'closed' } });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.changed, false);
+      assert.equal(res.json.notified, false);
+      assert.equal(sends.filter((m) => m.chatId === '4242').length, 0);
+    });
+  } finally {
+    clientStubs.setTicketStatus = original;
+  }
+});
+
+test('GET /api/support/tickets passes the queue filters and drops anything else', async () => {
+  calls.length = 0;
+  await authed('/api/support/tickets?status=answered&waitingOn=admin&sort=waiting');
+  let forwarded = calls.find((c) => c.name === 'listTickets').args[0];
+  assert.equal(forwarded.status, 'in_progress');
+  assert.equal(forwarded.waitingOn, 'admin');
+  assert.equal(forwarded.sort, 'waiting');
+
+  calls.length = 0;
+  await authed('/api/support/tickets?status=deleted&waitingOn=everyone&sort=random');
+  forwarded = calls.find((c) => c.name === 'listTickets').args[0];
+  assert.equal(forwarded.status, '');
+  assert.equal(forwarded.waitingOn, '');
+  assert.equal(forwarded.sort, '');
+});
+
+test('GET /api/support/stats returns the sheet\'s analysis for the chosen period', async () => {
+  stub(sheets, 'getSupportStats', (opts) => ({ period_days: Number(opts.days), counts: { needs_reply: 2 } }));
+  calls.length = 0;
+  const res = await authed('/api/support/stats?days=7');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.data.period_days, 7);
+  assert.equal(res.json.data.counts.needs_reply, 2);
+  assert.ok(res.json.data.context);
+
+  await authed('/api/support/stats?days=abc');
+  assert.equal(calls.filter((c) => c.name === 'getSupportStats').at(-1).args[0].days, '30');
+  assert.equal((await call(`/api/support/stats?group=${TEST_GROUP}`)).status, 401);
+});
+
+// ---- Rate limiting ----------------------------------------------------------
+
+test('signed webhooks are never rate limited, so a busy minute cannot drop a payment', async () => {
+  const statuses = new Set();
+  const body = JSON.stringify({ event: 'noop' });
+  const requests = [];
+  for (let i = 0; i < 260; i++) {
+    requests.push(fetch(baseUrl + '/api/payments/webhook', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': 'bad' }, body
+    }).then((r) => statuses.add(r.status)));
+  }
+  await Promise.all(requests);
+  assert.ok(!statuses.has(429), 'the payment webhook was rate limited');
+  assert.ok(statuses.has(401));
+});
+
+test('behind Vercel the client address comes from the platform headers, elsewhere from the socket', () => {
+  const req = { headers: { 'x-real-ip': '203.0.113.9', 'x-forwarded-for': '198.51.100.1, 10.0.0.1' }, socket: { remoteAddress: '10.0.0.1' } };
+  const saved = process.env.VERCEL;
+  try {
+    delete process.env.VERCEL;
+    assert.equal(server.clientAddress(req), '10.0.0.1', 'headers must not be trusted outside Vercel');
+    process.env.VERCEL = '1';
+    assert.equal(server.clientAddress(req), '203.0.113.9');
+    assert.equal(server.clientAddress({ headers: { 'x-forwarded-for': '198.51.100.1, 10.0.0.1' }, socket: {} }), '198.51.100.1');
+  } finally {
+    if (saved === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = saved;
+  }
+});
+
+test('the daily job posts a support summary to each bot\'s support chat, and can be switched off', async () => {
+  const before = { secret: process.env.CRON_SECRET, chat: process.env.SUPPORT_CHAT_ID, daily: process.env.SUPPORT_DAILY_SUMMARY };
+  process.env.CRON_SECRET = 'a-secret-for-tests';
+  process.env.SUPPORT_CHAT_ID = '-1007777777777';
+  const membershipModule = require('../src/membership');
+  const originalSweep = membershipModule.runDailyCheckAllGroups;
+  membershipModule.runDailyCheckAllGroups = async () => ({ groups: [], totals: { reminded: 0, removed: 0 } });
+  stub(sheets, 'getSupportStats', { period_days: 7, counts: { needs_reply: 3, open: 1, in_progress: 2, closed: 5, total: 8 }, by_category: {}, by_admin: {} });
+  try {
+    await withRecordedBot(async (sends) => {
+      delete process.env.SUPPORT_DAILY_SUMMARY;
+      const res = await call('/api/cron/sweep', { method: 'POST', headers: { Authorization: 'Bearer a-secret-for-tests' } });
+      assert.equal(res.status, 200);
+      const posted = sends.filter((m) => m.chatId === '-1007777777777');
+      assert.ok(posted.length >= 1, 'no summary reached the support chat');
+      assert.match(posted[0].text, /support summary[\s\S]*Needs reply: <b>3<\/b>/);
+      assert.ok(res.json.data.supportSummaries.every((r) => r.posted));
+
+      sends.length = 0;
+      process.env.SUPPORT_DAILY_SUMMARY = 'off';
+      const off = await call('/api/cron/sweep', { method: 'POST', headers: { Authorization: 'Bearer a-secret-for-tests' } });
+      assert.equal(off.status, 200);
+      assert.equal(sends.length, 0);
+    });
+  } finally {
+    membershipModule.runDailyCheckAllGroups = originalSweep;
+    for (const [key, env] of [['secret', 'CRON_SECRET'], ['chat', 'SUPPORT_CHAT_ID'], ['daily', 'SUPPORT_DAILY_SUMMARY']]) {
+      if (before[key] === undefined) delete process.env[env];
+      else process.env[env] = before[key];
+    }
   }
 });

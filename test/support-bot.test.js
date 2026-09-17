@@ -28,6 +28,26 @@ const BOT = { id: 123, is_bot: true, first_name: 'Pay bot', username: 'upsc_pay_
 const sheets = require('../src/sheets');
 const support = require('../src/support');
 const { createPaymentBot } = require('../src/botapp');
+
+// No test may reach the real Telegram API. The server reads .env, which holds
+// real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
+// test forgot to stub would post into the live support group. A test that
+// wants Telegram replaces the specific method it needs, which runs instead.
+require('node-telegram-bot-api').prototype._request = async function (method) {
+  throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
+};
+
+// Nor the live Google Sheets or Razorpay: .env points at real ones.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = function guardedFetch(url, ...rest) {
+    const target = String(url && url.url ? url.url : url);
+    if (/^https:\/\/(script\.google(usercontent)?\.com|api\.razorpay\.com|api\.telegram\.org)\//.test(target)) {
+      return Promise.reject(new Error(`Network call to ${target.split('?')[0]} attempted in a test — stub it`));
+    }
+    return realFetch.call(this, url, ...rest);
+  };
+}
 const membership = require('../src/membership');
 
 // botapp loads .env when required, which may name a real support chat. These
@@ -54,7 +74,10 @@ function fakeSheet(overrides = {}) {
     getTicket: record('getTicket', null),
     logTicketEvent: record('logTicketEvent', (id) => ({ ticket_id: id })),
     listSubscribers: record('listSubscribers', { total: 0, subscribers: [] }),
-    getCoupon: record('getCoupon', null)
+    getCoupon: record('getCoupon', null),
+    findPayment: record('findPayment', null),
+    getSupportStats: record('getSupportStats', null),
+    listCoupons: record('listCoupons', [])
   };
   Object.entries(overrides).forEach(([name, result]) => { client[name] = record(name, result); });
   return client;
@@ -73,7 +96,7 @@ function makeBot({ sheet = fakeSheet(), supportChat = SUPPORT_CHAT, memberStatus
     sent.push({ method, args });
     return { message_id: nextId++, chat: { id: args[0] } };
   };
-  ['sendMessage', 'copyMessage', 'answerCallbackQuery', 'editMessageReplyMarkup', 'deleteMessage']
+  ['sendMessage', 'copyMessage', 'answerCallbackQuery', 'editMessageReplyMarkup', 'editMessageText', 'deleteMessage']
     .forEach((method) => { app.bot[method] = record(method); });
   app.bot.getMe = async () => BOT;
   app.bot.getChatMember = async (chatId, userId) => {
@@ -178,7 +201,7 @@ test('replying to the prompt opens a ticket in the sheet and in the admin chat',
   assert.deepEqual(support.parseTicketHeader(toAdmins.args[1]), { ticketId: ticket.ticket_id, telegramId: '42' });
   const card = toAdmins.args[1];
   assert.match(card, /NEW TICKET<\/b> · 💳 Paid, but no invite link/);
-  assert.match(card, /Status: 🟠 Waiting for admin/);
+  assert.match(card, /Status: 🆕 Open · 🔴 Needs reply/);
   assert.match(card, /UPSC Prelims<\/b>: ✅ valid until 30-11-2099 · <b>NOT in the group<\/b>/,
     'admins should see the pass and that the student is not in the group');
   assert.match(card, /paid ₹199 · pay_OLDPAYMENT0001/);
@@ -256,7 +279,7 @@ test('replying to an admin answer adds to the ticket and shows admins what came 
     '[17-09-2026, 10:12:03 AM IST] Asha (@asha):\nPaid but no link\n\n' +
     '[17-09-2026, 11:40:10 AM IST] Admin @ravi_admin:\nTry again now\n\n' +
     '[17-09-2026, 11:50:00 AM IST] Asha (@asha):\nStill not working';
-  const sheet = fakeSheet({ appendTicketMessage: (id) => ({ ticket_id: id, status: 'open', conversation }) });
+  const sheet = fakeSheet({ appendTicketMessage: (id) => ({ ticket_id: id, status: 'in_progress', waiting_on: 'admin', conversation }) });
   const { deliver, messages } = makeBot({ sheet });
   const answer = { message_id: 902, from: BOT, chat: { id: STUDENT.id, type: 'private' },
     text: support.replyLine('T-260917-AB2C') + '\n\nTry again now' };
@@ -265,14 +288,14 @@ test('replying to an admin answer adds to the ticket and shows admins what came 
 
   const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
   assert.equal(appended.args[0], 'T-260917-AB2C');
-  assert.equal(appended.args[1].status, 'open');
+  assert.equal(appended.args[1].status, undefined, 'status rules live in the sheet; the bot must not dictate one');
   assert.equal(appended.args[1].text, 'Still not working');
 
   const [toAdmins] = messages(SUPPORT_CHAT);
   const text = toAdmins.args[1];
   assert.ok(support.parseTicketHeader(text));
   assert.match(text, /STUDENT REPLIED/);
-  assert.match(text, /Status: 🟠 Waiting for admin/);
+  assert.match(text, /Status: 🟡 In progress · 🔴 Needs reply/);
   assert.match(text, /Earlier in this ticket[\s\S]*Paid but no link[\s\S]*Admin @ravi_admin:\nTry again now/);
   assert.equal((text.match(/Still not working/g) || []).length, 1, 'the new message should not also appear in the history');
   assert.ok(toAdmins.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:42'),
@@ -296,20 +319,37 @@ test('a student who just types again goes into their open ticket, not a new one'
   assert.equal(messages(SUPPORT_CHAT).length, 1);
 });
 
-test('a closed or stale ticket is not reused; the student is offered a new one', async () => {
-  const sheet = fakeSheet({
-    listTickets: { total: 2, tickets: [
-      { ticket_id: 'T-260917-AAAA', status: 'closed', updated_at: '' },
-      { ticket_id: 'T-260801-BBBB', status: 'open', updated_at: '01-08-2020, 10:00:00 AM IST' }
-    ] }
+test('a recently closed ticket is reopened when the student types again; a stale one is not', async () => {
+  const recentlyClosed = fakeSheet({
+    listTickets: { total: 1, tickets: [{ ticket_id: 'T-260917-AAAA', status: 'closed', updated_at: '' }] },
+    appendTicketMessage: (id) => ({ ticket_id: id, status: 'in_progress', waiting_on: 'admin', reopened: true })
   });
-  const { deliver, messages } = makeBot({ sheet });
-  await deliver(privateMessage('new problem'));
+  const reopen = makeBot({ sheet: recentlyClosed });
+  await reopen.deliver(privateMessage('it broke again'));
+  assert.equal(recentlyClosed.calls.find((c) => c.name === 'appendTicketMessage').args[0], 'T-260917-AAAA');
+  assert.match(reopen.messages(STUDENT.id)[0].args[1], /earlier ticket has been reopened/);
+  assert.match(reopen.messages(SUPPORT_CHAT)[0].args[1], /CLOSED TICKET — REOPENED[\s\S]*Status: 🟡 In progress · 🔴 Needs reply/);
 
-  assert.equal(sheet.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
-  assert.match(messages(STUDENT.id)[0].args[1], /send this message to our support team/);
+  const stale = fakeSheet({
+    listTickets: { total: 1, tickets: [{ ticket_id: 'T-260801-BBBB', status: 'open', updated_at: '01-08-2020, 10:00:00 AM IST' }] }
+  });
+  const fresh = makeBot({ sheet: stale });
+  await fresh.deliver(privateMessage('new problem'));
+  assert.equal(stale.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
+  assert.match(fresh.messages(STUDENT.id)[0].args[1], /send this message to our support team/);
 });
 
+test('an open ticket is preferred over a recently closed one', async () => {
+  const sheet = fakeSheet({
+    listTickets: { total: 2, tickets: [
+      { ticket_id: 'T-260917-CLOS', status: 'closed', updated_at: '' },
+      { ticket_id: 'T-260917-OPEN', status: 'in_progress', updated_at: '' }
+    ] }
+  });
+  const { deliver } = makeBot({ sheet });
+  await deliver(privateMessage('any update?'));
+  assert.equal(sheet.calls.find((c) => c.name === 'appendTicketMessage').args[0], 'T-260917-OPEN');
+});
 test('if the sheet cannot say whether a ticket is open, the student is still offered support', async () => {
   const sheet = fakeSheet({ listTickets: () => { throw new Error('Unknown GET action: listTickets'); } });
   const { deliver, messages } = makeBot({ sheet });
@@ -425,11 +465,11 @@ test('an admin reply to a ticket reaches the student and marks it answered', asy
   assert.match(toStudent.args[1], /Your link is resent &lt;3/);
 
   const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
-  assert.equal(appended.args[1].status, 'answered');
-  assert.equal(appended.args[1].handledBy, '@ravi_admin');
+  assert.equal(appended.args[1].status, undefined);
+  assert.equal(appended.args[1].handledBy, '@ravi_admin', 'an admin message is recorded as the admin, which picks the ticket up');
 
   const [confirmation] = messages(SUPPORT_CHAT);
-  assert.match(confirmation.args[1], /Delivered to the student/);
+  assert.match(confirmation.args[1], /Delivered to the student[\s\S]*Status: 🟡 In progress · ⏳ Waiting for student/);
 });
 
 test('an admin replying to a ticket another bot posted is left to that bot', async () => {
@@ -469,7 +509,7 @@ test('/close on a ticket closes it and tells the student', async () => {
   const closed = sheet.calls.find((c) => c.name === 'setTicketStatus');
   assert.deepEqual(closed.args, ['T-260917-AB2C', 'closed', '@ravi_admin']);
   assert.match(messages(STUDENT.id)[0].args[1], /marked as resolved/);
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Resolved<\/b> by @ravi_admin[\s\S]*Status: ✅ Resolved/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Closed<\/b> by @ravi_admin[\s\S]*Status: ✅ Closed/);
 });
 
 test('/set changes a setting, and refuses one that does not exist', async () => {
@@ -508,23 +548,140 @@ test('ordinary chatter in the support chat is ignored', async () => {
   assert.equal(sent.length, 0);
 });
 
-test('/tickets posts each waiting ticket with its own buttons', async () => {
+test('/tickets lists the tickets that need a reply, longest waiting first, each with buttons', async () => {
   const sheet = fakeSheet({
-    listTickets: (filters) => filters.status === 'open'
-      ? { total: 1, counts: { open: 1, answered: 1, closed: 3 },
-        tickets: [{ ticket_id: 'T-260917-AB2C', telegram_id: '42', username: 'asha', category: 'invite', status: 'open', last_message: 'link broken' }] }
-      : { total: 1, counts: { open: 1, answered: 1, closed: 3 },
-        tickets: [{ ticket_id: 'T-260916-ZZ99', telegram_id: '43', name: 'Ravi', category: 'payment', status: 'answered', last_message: 'thanks' }] }
+    listTickets: {
+      total: 2, counts: { open: 1, in_progress: 2, closed: 3, needs_reply: 2, waiting_student: 1 },
+      tickets: [
+        { ticket_id: 'T-260917-AB2C', telegram_id: '42', username: 'asha', category: 'invite', status: 'open', waiting_on: 'admin', last_message: 'link broken', updated_at: 'x' },
+        { ticket_id: 'T-260916-ZZ99', telegram_id: '43', name: 'Ravi', category: 'payment', status: 'in_progress', waiting_on: 'admin', picked_up_by: '@sita', last_message: 'still no', updated_at: 'y' }
+      ]
+    }
   });
   const { deliver, messages } = makeBot({ sheet });
   await deliver(supportChatMessage('/tickets'));
 
+  const query = sheet.calls.find((c) => c.name === 'listTickets').args[0];
+  assert.deepEqual(query, { pageSize: 10, waitingOn: 'admin', sort: 'waiting' });
+
   const posts = messages(SUPPORT_CHAT);
-  assert.match(posts[0].args[1], /Waiting for admin: 1 · 🔵 Waiting for student: 1 · ✅ Resolved: 3/);
-  assert.equal(posts.length, 3, 'a summary plus one post per waiting ticket');
-  assert.match(posts[1].args[1], /^🎫 T-260917-AB2C · user 42[\s\S]*Invite link not working[\s\S]*link broken/);
+  assert.match(posts[0].args[1], /Needs reply — longest waiting first<\/b> — 2 tickets\n🔴 Needs reply 2 · 🆕 Open 1 · 🟡 In progress 2 · ⏳ Waiting for student 1 · ✅ Closed 3/);
+  assert.equal(posts.length, 3, 'a heading plus one post per ticket');
+  assert.match(posts[1].args[1], /^🎫 T-260917-AB2C · user 42\n🆕 Open · 🔴 Needs reply[\s\S]*not picked up yet[\s\S]*link broken/);
+  assert.match(posts[2].args[1], /🟡 In progress · 🔴 Needs reply[\s\S]*picked up by @sita/);
   assert.ok(posts[1].args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:c:T-260917-AB2C:42'));
-  assert.match(posts[2].args[1], /^🎫 T-260916-ZZ99 · user 43/);
+});
+
+test('/tickets takes a queue name', async () => {
+  for (const [arg, expected] of [['open', { status: 'open', sort: 'waiting' }], ['progress', { status: 'in_progress' }],
+    ['student', { waitingOn: 'student' }], ['closed', { status: 'closed' }], ['nonsense', { waitingOn: 'admin', sort: 'waiting' }]]) {
+    const sheet = fakeSheet();
+    const { deliver } = makeBot({ sheet });
+    await deliver(supportChatMessage(`/tickets ${arg}`));
+    assert.deepEqual(sheet.calls.find((c) => c.name === 'listTickets').args[0], Object.assign({ pageSize: 10 }, expected), arg);
+  }
+});
+
+const SAMPLE_STATS = {
+  period_days: 7,
+  counts: { open: 1, in_progress: 3, closed: 12, total: 16, needs_reply: 2, waiting_student: 2 },
+  not_picked_up: 1, opened_today: 4, closed_today: 2,
+  first_reply_minutes: { average: 95, median: 40, samples: 9 },
+  oldest_needs_reply: { ticket_id: 'T-260917-AB2C', name: 'Asha', category: 'payment', minutes: 185 },
+  by_category: { payment: { open: 1, in_progress: 2, closed: 5, total: 8 }, coupon: { open: 0, in_progress: 0, closed: 3, total: 3 } },
+  by_admin: { '@ravi_admin': { replies: 5, quick_replies: 2, closed: 4, invites_sent: 1, passes_granted: 1, picked_up: 3, payments_checked: 2 } }
+};
+
+test('/summary shows the queues, today, reply time, longest waiting, issues and admins, with buttons', async () => {
+  const sheet = fakeSheet({ getSupportStats: SAMPLE_STATS });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(supportChatMessage('/summary'));
+
+  assert.deepEqual(sheet.calls.find((c) => c.name === 'getSupportStats').args[0], { days: 7 });
+  const [post] = messages(SUPPORT_CHAT);
+  const text = post.args[1];
+  assert.match(text, /support summary/);
+  assert.match(text, /🔴 Needs reply: <b>2<\/b>  \(🆕 1 not picked up yet\)/);
+  assert.match(text, /🟡 In progress: 3 · ⏳ Waiting for student: 2/);
+  assert.match(text, /✅ Closed: 12 · All tickets: 16/);
+  assert.match(text, /Today: 4 opened · 2 closed/);
+  assert.match(text, /average 1 h 35 min · median 40 min/);
+  assert.match(text, /Longest waiting: Asha — <b>3 h 5 min<\/b>/);
+  assert.match(text, /Paid, but no invite link: <b>3<\/b>/);
+  assert.ok(!/Coupon code not working: <b>/.test(text), 'an issue with nothing open is left out');
+  assert.match(text, /@ravi_admin: 7 replies · 4 closed · 1 invites · 1 passes granted/);
+
+  const buttons = post.args[2].reply_markup.inline_keyboard.flat();
+  assert.deepEqual(buttons.map((b) => b.callback_data), ['sum:needs', 'sum:open', 'sum:progress', 'sum:student', 'sum:closed', 'sum:refresh']);
+  assert.equal(buttons[0].text, '🔴 Needs reply (2)');
+});
+
+test('/stats is the same as /summary', async () => {
+  const sheet = fakeSheet({ getSupportStats: SAMPLE_STATS });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(supportChatMessage('/stats'));
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /support summary/);
+});
+
+test('a summary button lists that queue, and Refresh updates the summary in place', async () => {
+  const sheet = fakeSheet({ getSupportStats: SAMPLE_STATS });
+  const { deliver, sent } = makeBot({ sheet });
+  const summaryMessage = { message_id: 777, from: BOT, chat: { id: Number(SUPPORT_CHAT), type: 'supergroup' }, text: 'summary' };
+
+  await deliver({ callback_query: { id: 'cb1', from: ADMIN, data: 'sum:progress', message: summaryMessage } });
+  assert.deepEqual(sheet.calls.find((c) => c.name === 'listTickets').args[0], { pageSize: 10, status: 'in_progress' });
+
+  sent.length = 0;
+  await deliver({ callback_query: { id: 'cb2', from: ADMIN, data: 'sum:refresh', message: summaryMessage } });
+  const edit = sent.find((s) => s.method === 'editMessageText');
+  assert.ok(edit, 'refresh should edit the summary, not post a new one');
+  assert.equal(edit.args[1].message_id, 777);
+  assert.equal(sent.filter((s) => s.method === 'sendMessage').length, 0);
+});
+
+test('summary buttons do nothing outside the support chat', async () => {
+  const sheet = fakeSheet({ getSupportStats: SAMPLE_STATS });
+  const { deliver, sent } = makeBot({ sheet });
+  await deliver({ callback_query: { id: 'cb3', from: STUDENT, data: 'sum:needs',
+    message: { message_id: 5, from: BOT, chat: { id: STUDENT.id, type: 'private' }, text: 'x' } } });
+  assert.equal(sheet.calls.filter((c) => c.name === 'listTickets' || c.name === 'getSupportStats').length, 0);
+  assert.match(sent.find((s) => s.method === 'answerCallbackQuery').args[1].text, /only works in the support chat/);
+});
+
+test('/summary reports a sheet problem instead of staying silent', async () => {
+  const sheet = fakeSheet({ getSupportStats: () => { throw new Error('Unknown GET action: getSupportStats'); } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(supportChatMessage('/summary'));
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Could not read the support numbers/);
+});
+test('closing an already-closed ticket does not message the student again', async () => {
+  const sheet = fakeSheet({ setTicketStatus: (id) => ({ ticket_id: id, status: 'closed', previous_status: 'closed', closed_by: '@sita' }) });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(adminTap('adm:c:T-260917-AB2C:42'));
+  assert.equal(messages(STUDENT.id).length, 0);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Already closed<\/b> by @sita/);
+});
+
+test('if the sheet cannot close the ticket, the admin is told and the student is not', async () => {
+  const sheet = fakeSheet({ setTicketStatus: () => { throw new Error('Sheets down'); } });
+  const { deliver, messages } = makeBot({ sheet });
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    await deliver(adminTap('adm:c:T-260917-AB2C:42'));
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(messages(STUDENT.id).length, 0, 'never tell a student it is resolved when it was not recorded');
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Not changed<\/b>/);
+});
+
+test('reopen from a button asks the sheet for in_progress, never open', async () => {
+  const sheet = fakeSheet({ setTicketStatus: (id, status) => ({ ticket_id: id, status: 'in_progress', waiting_on: 'admin', previous_status: 'closed' }) });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(adminTap('adm:o:T-260917-AB2C:42'));
+  assert.deepEqual(sheet.calls.find((c) => c.name === 'setTicketStatus').args, ['T-260917-AB2C', 'in_progress', '@ravi_admin']);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Reopened<\/b> by @ravi_admin\nStatus: 🟡 In progress · 🔴 Needs reply/);
 });
 
 // ---------------------------------------------------------------------------
@@ -632,7 +789,7 @@ test('✍️ Reply asks for an answer that is then delivered like any other repl
     reply_to_message: { message_id: 970, from: BOT, chat: { id: Number(SUPPORT_CHAT) }, text: prompt.args[1] }
   }));
   assert.match(messages(STUDENT.id)[0].args[1], /Your pass is active, try the new link/);
-  assert.equal(sheet.calls.find((c) => c.name === 'appendTicketMessage').args[1].status, 'answered');
+  assert.equal(sheet.calls.find((c) => c.name === 'appendTicketMessage').args[1].handledBy, '@ravi_admin');
 });
 
 test('🎟 Pass status shows every group the student holds', async () => {
@@ -648,7 +805,7 @@ test('📜 Full history posts the whole conversation, or explains when it is mis
     conversation: '[17-09-2026, 10:12:03 AM IST] Asha:\nfirst <message>'
   } }) });
   await found.deliver(adminTap('adm:h:T-260917-AB2C:42'));
-  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /History<\/b> · 🔵 Waiting for student[\s\S]*first &lt;message&gt;/);
+  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /History<\/b> · 🟡 In progress[\s\S]*first &lt;message&gt;/);
 
   const missing = makeBot({ sheet: fakeSheet({ getTicket: null }) });
   await missing.deliver(adminTap('adm:h:T-260917-AB2C:42'));
@@ -860,8 +1017,9 @@ test('a quick reply is sent to the student, logged, and uses the text admins set
   const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
   assert.equal(appended.args[1].logAction, 'quick_reply:qr_payment_not_received');
   assert.equal(appended.args[1].handledBy, '@ravi_admin');
-  assert.equal(appended.args[1].status, 'answered');
-  assert.equal(sheet.calls.filter((c) => c.name === 'setTicketStatus').length, 0);
+  assert.equal(appended.args[1].status, undefined);
+  assert.equal(sheet.calls.filter((c) => c.name === 'setTicketStatus').length, 0, 'a normal quick reply must never close');
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Status: 🟡 In progress · ⏳ Waiting for student/);
   assert.match(messages(SUPPORT_CHAT)[0].args[1], /Quick reply sent<\/b> by @ravi_admin/);
 });
 
@@ -933,7 +1091,12 @@ test('granting asks which group first, then grants through the normal payment pa
       return { subscriber: { plan_label: 'Target 2026', expiry_date: '31-05-2099, 11:59:59 PM IST' }, inviteLink: 'https://t.me/+granted', alreadyProcessed: false };
     };
     try {
-      const sheet = fakeSheet({ getSubscriber: null, getBotSettings: { pass_valid_until: '31-05-2099', pass_name: 'Target 2026' } });
+      const sheet = fakeSheet({
+        getSubscriber: null,
+        getBotSettings: { pass_valid_until: '31-05-2099', pass_name: 'Target 2026' },
+        // ₹149 is only a legitimate price for this pass because this coupon exists.
+        listCoupons: [{ code: 'SAVE50', discount_type: 'flat', discount_value: 50 }]
+      });
       const { deliver, messages } = makeBot({ sheet });
 
       await deliver(adminTap('adm:g:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
@@ -974,11 +1137,36 @@ test('a grant is refused when the payment was not captured, belongs to someone e
       assert.match(messages(SUPPORT_CHAT)[0].args[1], /another student's checkout/);
     });
     await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900 }, async () => {
-      const sheet = fakeSheet({ listSubscribers: { total: 1, subscribers: [{ telegram_id: '777', payment_id: 'pay_TZ8ciB8Yng8WE3' }] } });
+      const sheet = fakeSheet({ findPayment: { telegram_id: '777', source: 'Payments' } });
       const { deliver, messages } = makeBot({ sheet });
       await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
       assert.match(messages(SUPPORT_CHAT)[0].args[1], /already recorded for Telegram id <code>777/);
       assert.equal(sheet.calls.find((c) => c.name === 'logTicketEvent').args[1].action, 'pass_grant_refused');
+    });
+    // On a sheet whose Apps Script is older than findPayment, the member rows are searched instead.
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900 }, async () => {
+      const stale = Object.assign(new Error('old script'), { staleScript: true });
+      const sheet = fakeSheet({
+        findPayment: () => { throw stale; },
+        listSubscribers: { total: 1, subscribers: [{ telegram_id: '888', payment_id: 'pay_TZ8ciB8Yng8WE3' }] }
+      });
+      const { deliver, messages } = makeBot({ sheet });
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /already recorded for Telegram id <code>888/);
+    });
+    // Any other sheet error refuses rather than granting blind.
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900 }, async () => {
+      const sheet = fakeSheet({ findPayment: () => { throw new Error('Sheets down'); } });
+      const { deliver, messages } = makeBot({ sheet });
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /Could not check the payment records, so nothing was granted/);
+    });
+    // A payment below the lowest price anyone can pay is not a payment for this pass.
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 100 }, async () => {
+      const sheet = fakeSheet({ listCoupons: [{ code: 'HALF', discount_type: 'percent', discount_value: 50 }] });
+      const { deliver, messages } = makeBot({ sheet });
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /This payment is ₹1, less than the lowest price anyone can pay for the pass today \(₹99.50/);
     });
     assert.equal(granted, 0);
   } finally {
@@ -1013,4 +1201,60 @@ test('/msg by @username finds the student in the members sheet', async () => {
   assert.match(unknown.messages(SUPPORT_CHAT)[0].args[1], /No student found/);
   await unknown.deliver(supportChatMessage('/msg 42'));
   assert.match(unknown.messages(SUPPORT_CHAT).at(-1).args[1], /Usage/);
+});
+
+
+test('a payment at the best coupon price is accepted for a grant', async () => {
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 9950, created_at: 1789000000 }, async () => {
+    const original = membership.grantAccess;
+    let granted = 0;
+    membership.grantAccess = async () => { granted++; return { subscriber: { expiry_date: 'x' }, inviteLink: '', alreadyProcessed: false }; };
+    try {
+      const sheet = fakeSheet({ getSubscriber: null, listCoupons: [{ code: 'HALF', discount_type: 'percent', discount_value: 50, active: false }] });
+      const { deliver } = makeBot({ sheet });
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.equal(granted, 1, 'a real discounted payment, even with a coupon since switched off, must still be grantable');
+    } finally {
+      membership.grantAccess = original;
+    }
+  });
+});
+
+test('coupon guessing is limited per student', async () => {
+  const sheet = fakeSheet({ getCoupon: null });
+  const { deliver, messages } = makeBot({ sheet });
+  const prompt = { message_id: 1, from: BOT, chat: { id: STUDENT.id }, text: '🎟 Coupon code for UPSC Prelims' };
+  for (let i = 0; i < 10; i++) await deliver(privateMessage(`GUESS${i}`, { reply_to_message: prompt }));
+  assert.equal(sheet.calls.filter((c) => c.name === 'getCoupon').length, 8, 'only 8 lookups in the window');
+  assert.match(messages(STUDENT.id).at(-1).args[1], /Too many coupon attempts/);
+});
+
+test('a flood of free-typed messages stops reaching the sheet', async () => {
+  const sheet = fakeSheet();
+  const { deliver } = makeBot({ sheet });
+  for (let i = 0; i < 25; i++) await deliver(privateMessage(`spam ${i}`));
+  assert.equal(sheet.calls.filter((c) => c.name === 'listTickets').length, 20);
+});
+
+test('student commands only answer in a private chat, never in a paid group or the support chat', async () => {
+  const { deliver, sent } = makeBot();
+  for (const text of ['/status', '/plans', '/start', '/help', '/cancel']) {
+    await deliver({ message: { message_id: messageSeq++, date: 1, from: STUDENT, chat: { id: -1009999999999, type: 'supergroup' }, text } });
+    await deliver(supportChatMessage(text));
+  }
+  assert.equal(sent.filter((s) => s.method === 'sendMessage').length, 0, 'a command in a group was answered in public');
+});
+
+test('student commands still answer in private, including with the bot\'s @name', async () => {
+  const { deliver, messages } = makeBot();
+  await deliver(privateMessage('/help@upsc_pay_bot'));
+  await deliver(privateMessage('/status'));
+  assert.ok(messages(STUDENT.id).length >= 2);
+});
+
+test('/statusx is not mistaken for /status', async () => {
+  const sheet = fakeSheet();
+  const { deliver } = makeBot({ sheet });
+  await deliver(privateMessage('/statusx'));
+  assert.equal(sheet.calls.filter((c) => c.name === 'getSubscriber').length, 0);
 });

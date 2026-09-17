@@ -379,23 +379,46 @@ that does not help they raise a ticket (text or a screenshot). Each ticket is:
   wrote, and a 🧭 suggested next step;
 - listed on the dashboard's **🆘 Support** page.
 
-Anything the student sends while a ticket is open (touched in the last 7 days)
-joins that ticket, and each follow-up in the support chat shows the earlier
+Anything the student sends while they have a ticket touched in the last 7 days
+joins that ticket (an open one first, otherwise the most recently closed one,
+which reopens). Each follow-up in the support chat shows the earlier
 conversation.
 
-**Ticket statuses** (Status column, and shown everywhere):
+**Ticket statuses** (Status column H, and shown everywhere). Only an admin
+closes a ticket — with ✅ Close, the *Resolved* quick reply, or "close after
+sending" on the dashboard. Nothing closes one automatically.
 
-| Status | Shown as | Means |
+| Status | Shown as | Means | Becomes |
+|---|---|---|---|
+| `open` | 🆕 Open | New — no admin has done anything with it yet | `in_progress` on the first admin action (reply, quick reply, invite, payment check, grant) |
+| `in_progress` | 🟡 In progress | An admin has picked it up | `closed` only when an admin closes it |
+| `closed` | ✅ Closed | An admin closed it | `in_progress` if the student writes again, or an admin reopens it |
+
+Separately, **Waiting On** (column Q) says who has to act next, so an in-progress
+ticket can still need a reply:
+
+| Waiting On | Shown as | Means |
 |---|---|---|
-| `open` | 🟠 Waiting for admin | The student is waiting for a reply |
-| `answered` | 🔵 Waiting for student | An admin replied; moves back to open if the student writes again |
-| `closed` | ✅ Resolved | Done; reopens automatically if the student writes again |
+| `admin` | 🔴 Needs reply | The student wrote last |
+| `student` | ⏳ Waiting for student | An admin wrote to the student last |
+| blank | — | Closed |
 
-The Support tab also records **Handled By** (last admin), **Admin Replies**,
-**Last Admin Reply At**, **Closed At** and **Closed By**. The **Support Log** has a
-row for every event: ticket opened, student message, admin reply, quick reply
-(which one), invite sent / not sent, payment checked, pass granted / refused,
-closed, reopened — with who did it and the status afterwards.
+The Support tab records, per ticket: **Handled By** (last admin), **Admin Replies**,
+**Last Admin Reply At**, **Closed At / Closed By**, **Waiting On**, **Picked Up By /
+Picked Up At** (the first admin to act), **First Reply At** and **Times Reopened**.
+Old rows are upgraded automatically (`answered` becomes `in_progress`). The
+**Support Log** tab has one row per event — ticket opened, student message,
+picked up, admin reply, quick reply (which one), invite sent / not sent, payment
+checked, pass granted / refused, closed, reopened — with who did it, their role
+and the status afterwards.
+
+**At a glance.** The dashboard's Support page shows Needs reply, Open, In
+progress, Closed and All tickets, then average and median time to first reply
+and to close, today's opened/closed, and the longest-waiting student; the
+📈 Analysis section breaks tickets down by issue type and shows what each admin
+did. In Telegram, `/summary` shows the same numbers with buttons to list each
+queue, and the daily job posts it to the support chat every morning (around
+6:30 AM IST; set `SUPPORT_DAILY_SUMMARY=off` to stop it).
 
 ### Support: the admin handbook
 
@@ -411,7 +434,7 @@ ticket) and on the dashboard's Support page, and both write to the same sheet.
 | 🔍 **Check payment** | The student sent a `pay_…` id (the button appears automatically) | Razorpay's answer: captured / failed / processing, amount, time, and whether it came from this student's checkout |
 | ✅ **Grant pass for this payment** | Check payment shows *captured* but the student has no pass | Asks which group, checks Razorpay again, refuses a payment already used by another student, then gives the pass and sends the invite link |
 | 📜 **History** | You are picking up someone else's ticket | The whole conversation and the recent actions |
-| ✅ **Resolve & close** / 🔓 **Reopen** | It is sorted / it is not | Closing tells the student it is resolved |
+| ✅ **Close ticket** / 🔓 **Reopen** | It is sorted / it is not | Only an admin closes a ticket; closing tells the student it is resolved. Reopening puts it back to In progress |
 
 Typical cases:
 
@@ -427,10 +450,20 @@ Typical cases:
 - **"I was removed"** — 🎟 Pass & payment: expired → 📋 *Pass has expired*;
   valid → 🔗 Send new invite link.
 
-Support chat commands: `/tickets` (everything waiting, each with buttons),
-`/msg 7234356929 text` or `/msg @username text` (message a student first — it
-opens a ticket so their reply is tracked), `/settings` and `/set key value`
-(bot texts, pass name/price/date), `/supporthelp` (this list, in Telegram).
+Support chat commands:
+
+| Command | What it does |
+|---|---|
+| `/summary` (or `/stats`) | Needs reply, open, in progress, waiting for student, closed; today; reply times; longest waiting; open tickets by issue; each admin's last 7 days. Buttons list each queue; 🔄 refreshes it in place |
+| `/tickets` | Tickets needing a reply, longest waiting first, each with its buttons. Also `/tickets open`, `progress`, `student`, `closed` |
+| `/msg 7234356929 text` or `/msg @username text` | Message a student first — it opens a ticket so their reply is tracked |
+| `/settings`, `/set key value` | Bot texts, pass name, price and date |
+| `/supporthelp` | This list, in Telegram |
+
+Student commands (`/start`, `/plans`, `/status`, `/help`, `/cancel`) only answer
+in a private chat with the bot, never in a group. Running `npm run set-webhooks`
+also sets the "/" command menus: student commands in private chats and the admin
+commands above in the support chat.
 
 Anyone in the support chat can do all of this, so keep it to admins. Messages
 sent to students from your own Telegram account are not tracked — use the bot.

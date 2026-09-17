@@ -1622,3 +1622,15 @@
 .pc-code-input { font-family: var(--font-mono); letter-spacing: 0.04em; }
 .pc-row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .pc-row-actions .btn { flex: 0 0 auto; }
+
+/* ---- Support analysis --------------------------------------------------- */
+
+.sp-stat-secondary { margin-top: -6px; }
+.sp-stat-secondary .stat-value { font-size: 1.35rem; }
+.sp-analysis { margin-bottom: 18px; }
+.sp-analysis .panel-body { display: grid; gap: 14px; }
+.sp-analysis-head { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+.sp-analysis-head .hint-text { flex: 1 1 320px; margin: 0; }
+.sp-analysis-head .field-select { width: auto; }
+.sp-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sp-tab-count.alert { background: rgba(240, 82, 82, 0.25); color: #fca5a5; }

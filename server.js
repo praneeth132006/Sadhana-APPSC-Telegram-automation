@@ -123,6 +123,24 @@ const MIME_TYPES = {
 // Rate limiting
 // ---------------------------------------------------------------------------
 
+/**
+ * clientAddress — who a request is from, for rate limiting.
+ *
+ * On Vercel every request reaches the function from the platform's own proxy,
+ * so the socket address is the same for everyone and one busy minute would
+ * lock every visitor out together. Vercel sets x-real-ip / x-forwarded-for
+ * itself and overwrites what a client sends, so they are trusted there — and
+ * only there: anywhere else a client could invent them.
+ */
+function clientAddress(req) {
+  if (process.env.VERCEL) {
+    const real = String(req.headers['x-real-ip'] || '').trim();
+    const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (real || forwarded) return real || forwarded;
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
 /** Per-IP request counters: ip -> { count, resetAt }. */
 const rateBuckets = new Map();
 
@@ -567,8 +585,10 @@ async function deliverAccess(result, plan, telegramId, groupId) {
   const expiry = (result.subscriber && result.subscriber.expiry_date) || '';
   const text =
     '\u2705 <b>Payment received \u2014 you are in.</b>\n\n' +
-    (plan ? plan.emoji + ' <b>' + plan.label + '</b>\n' : '') +
-    (expiry ? 'Access until <b>' + expiry + '</b>\n\n' : '\n') +
+    // The pass name is admin-edited; unescaped, one "<" in it makes Telegram
+    // reject this message and the student who just paid never gets the link.
+    (plan ? plan.emoji + ' <b>' + support.esc(plan.label) + '</b>\n' : '') +
+    (expiry ? 'Access until <b>' + support.esc(expiry) + '</b>\n\n' : '\n') +
     'Tap to request access:\n' + result.inviteLink + '\n\n' +
     '<i>You are approved automatically. The link is tied to this Telegram account \u2014 ' +
     'forwarding it will not let anyone else in.</i>\n\n' +
@@ -1056,7 +1076,8 @@ async function handlePublicRoute(pathname, method, req, res) {
         status: String(link.status || status || ''),
         paid: String(link.status || '').toLowerCase() === 'paid',
         amountPaise: Number(link.amount) || (plan ? plan.amountPaise : null),
-        planLabel: plan ? plan.label : null,
+        // The name the student was shown at checkout, which an admin may have set.
+        planLabel: notes.plan_label || (plan ? plan.label : null),
         planEmoji: plan ? plan.emoji : null,
         recurring: plan ? plan.type === 'recurring' : false,
         groupName: group ? group.displayName : null,
@@ -1220,6 +1241,7 @@ async function handlePublicRoute(pathname, method, req, res) {
         `[cron] sweep across ${summary.groups.length} group(s): ` +
         `reminded ${summary.totals.reminded}, removed ${summary.totals.removed}`
       );
+      summary.supportSummaries = await postDailySupportSummaries();
       sendJSON(res, 200, { success: true, data: summary });
     } catch (err) {
       console.error('[cron] sweep failed:', err.message);
@@ -1274,6 +1296,31 @@ async function handlePublicRoute(pathname, method, req, res) {
   return false;
 }
 
+/**
+ * postDailySupportSummaries — the morning support summary, posted by each
+ * payment bot into its support chat by the daily job. Set
+ * SUPPORT_DAILY_SUMMARY=off to stop it. Never fails the sweep.
+ *
+ * @returns {Promise<Array<{bot: string, posted: boolean, error?: string}>>}
+ */
+async function postDailySupportSummaries() {
+  if (/^(off|false|no|0)$/i.test(String(process.env.SUPPORT_DAILY_SUMMARY || '').trim())) return [];
+  const results = [];
+  for (const payBotEnv of paymentBotEnvs()) {
+    const chat = support.supportChatFor(payBotEnv);
+    if (!chat) continue;
+    try {
+      const app = paymentBotFor(payBotEnv);
+      const posted = await app.postSupportSummary(chat);
+      results.push({ bot: payBotEnv, posted });
+    } catch (err) {
+      console.error(`[cron] support summary for ${payBotEnv} failed: ${err.message}`);
+      results.push({ bot: payBotEnv, posted: false, error: err.message });
+    }
+  }
+  return results;
+}
+
 /** The groups one payment bot sells, in configuration order. */
 function familyOf(groupId) {
   const group = groupRegistry.requireGroup(groupId);
@@ -1310,13 +1357,24 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
 
   if (pathname === '/api/support/tickets' && method === 'GET') {
     const status = str(query.get('status'), 20).toLowerCase();
+    const waitingOn = str(query.get('waitingOn'), 10).toLowerCase();
     const data = await db.listTickets({
-      status: support.TICKET_STATUSES.includes(status) ? status : '',
+      status: status && (support.TICKET_STATUSES.includes(status) || status === 'answered')
+        ? support.normaliseStatus(status) : '',
+      waitingOn: ['admin', 'student'].includes(waitingOn) ? waitingOn : '',
+      sort: str(query.get('sort'), 10) === 'waiting' ? 'waiting' : '',
       search: str(query.get('search'), 120),
       page: str(query.get('page'), 8) || '1',
       pageSize: str(query.get('pageSize'), 4) || '50'
     });
     sendJSON(res, 200, { success: true, data: Object.assign({ context }, data) });
+    return true;
+  }
+
+  if (pathname === '/api/support/stats' && method === 'GET') {
+    const days = str(query.get('days'), 3);
+    const data = await db.getSupportStats({ days: /^\d+$/.test(days) ? days : '30' });
+    sendJSON(res, 200, { success: true, data: Object.assign({ context }, data || {}) });
     return true;
   }
 
@@ -1378,7 +1436,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
     let warning = '';
     try {
       updated = await db.appendTicketMessage(ticketId, {
-        author: `Admin ${actor}`, text, status: 'answered', handledBy: actor
+        author: `Admin ${actor}`, text, handledBy: actor
       });
     } catch (err) {
       // The student already has the message; failing the request now would
@@ -1551,14 +1609,19 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
     return true;
   }
 
+  // Only an admin action closes a ticket, and this route is how the dashboard
+  // does it. "open" and "in_progress" both mean reopen: once an admin has
+  // touched a ticket it is never "not picked up" again.
   if (pathname === '/api/support/status' && method === 'POST') {
     const body = await readJsonBody(req);
     const ticketId = str(body.ticketId, 20);
-    const status = str(body.status, 20).toLowerCase();
-    if (!TICKET_ID_RE.test(ticketId) || !support.TICKET_STATUSES.includes(status)) {
+    const requested = str(body.status, 20).toLowerCase();
+    const status = requested === 'closed' ? 'closed'
+      : (['open', 'in_progress', 'answered', 'reopen'].includes(requested) ? 'in_progress' : '');
+    if (!TICKET_ID_RE.test(ticketId) || !status) {
       sendJSON(res, 400, {
         success: false,
-        error: `ticketId and a status of ${support.TICKET_STATUSES.join(' / ')} are required.`
+        error: 'ticketId and a status of closed (close) or in_progress (reopen) are required.'
       });
       return true;
     }
@@ -1569,23 +1632,31 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
       return true;
     }
 
+    const changed = updated.previous_status !== updated.status;
     let notified = false;
-    if (status === 'closed' && body.notify !== false && paymentBotEnvs().includes(updated.bot)) {
+    const app = paymentBotEnvs().includes(updated.bot) ? paymentBotFor(updated.bot) : null;
+    if (app && changed && status === 'closed' && body.notify !== false) {
       try {
-        const app = paymentBotFor(updated.bot);
         await app.bot.sendMessage(updated.telegram_id,
           `${support.esc(support.replyLine(ticketId))}\n\n` +
-          '✅ This ticket has been marked as resolved. If you still need help, reply to this message ' +
-          'or send /support.',
+          '✅ This ticket has been marked as resolved. If you still need help, just send another message ' +
+          'or /support.',
           { parse_mode: 'HTML' });
         notified = true;
-        await mirrorToSupportChat(app, updated, `✅ Closed from the dashboard by ${support.esc(actor)}`, { closed: true });
       } catch (err) {
         console.warn(`[support] could not tell ${updated.telegram_id} that ${ticketId} closed: ${err.message}`);
       }
     }
+    if (app && changed) {
+      await mirrorToSupportChat(app, updated,
+        (status === 'closed'
+          ? `✅ <b>Closed</b> from the dashboard by ${support.esc(actor)}${notified ? ' — the student was told.' : ''}`
+          : `🔓 <b>Reopened</b> from the dashboard by ${support.esc(actor)}`) +
+        `\nStatus: ${support.statusLine(updated.status, updated.waiting_on)}`,
+        { closed: updated.status === 'closed' });
+    }
 
-    sendJSON(res, 200, { success: true, data: updated, notified });
+    sendJSON(res, 200, { success: true, data: updated, notified, changed });
     return true;
   }
 
@@ -1601,6 +1672,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
         statuses: support.TICKET_STATUSES.map((id) => ({
           id, label: support.STATUS_LABELS[id], meaning: support.STATUS_MEANINGS[id]
         })),
+        waiting: Object.entries(support.WAITING_LABELS).map(([id, label]) => ({ id, label })),
         quickReplies: support.QUICK_REPLIES.map((q) => ({
           id: q.id, key: q.key, button: q.button, closes: Boolean(q.closes), for: q.for
         }))
@@ -2547,8 +2619,12 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
 const server = http.createServer(async (req, res) => {
   applySecurityHeaders(res);
 
-  const clientIp = req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(clientIp)) {
+  // Signed machine-to-machine deliveries are authenticated by their own
+  // secrets, and a 429 to Razorpay or Telegram delays a payment or a reply.
+  const rawPath = String(req.url || '').split('?')[0];
+  const signedDelivery = rawPath === '/api/payments/webhook' ||
+    rawPath.startsWith('/api/telegram/bot/') || rawPath === '/api/cron/sweep';
+  if (!signedDelivery && !checkRateLimit(clientAddress(req))) {
     res.setHeader('Retry-After', '60');
     sendJSON(res, 429, { success: false, error: 'Too many requests — slow down.' });
     return;
@@ -2675,4 +2751,5 @@ if (require.main === module) {
 
 module.exports = server;
 module.exports.createCheckoutForStudent = createCheckoutForStudent;
+module.exports.clientAddress = clientAddress;
 module.exports.handlePaymentEvent = handlePaymentEvent;

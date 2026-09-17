@@ -381,6 +381,26 @@ const membership = require('../src/membership');
 const sheets = require('../src/sheets');
 const paybot = require('../src/paybot');
 
+// No test may reach the real Telegram API. The server reads .env, which holds
+// real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
+// test forgot to stub would post into the live support group. A test that
+// wants Telegram replaces the specific method it needs, which runs instead.
+require('node-telegram-bot-api').prototype._request = async function (method) {
+  throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
+};
+
+// Nor the live Google Sheets or Razorpay: .env points at real ones.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = function guardedFetch(url, ...rest) {
+    const target = String(url && url.url ? url.url : url);
+    if (/^https:\/\/(script\.google(usercontent)?\.com|api\.razorpay\.com|api\.telegram\.org)\//.test(target)) {
+      return Promise.reject(new Error(`Network call to ${target.split('?')[0]} attempted in a test — stub it`));
+    }
+    return realFetch.call(this, url, ...rest);
+  };
+}
+
 const TEST_GROUP = 'appsc_q_en';
 
 /** Runs `fn` with the bound sheets client stubbed to return `row`. */

@@ -161,6 +161,14 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   const allowTicket = support.createThrottle({ limit: 5, windowMs: 10 * 60 * 1000 });
 
+  // Coupon codes are secrets worth guessing; without a limit a script could
+  // try thousands through the bot.
+  const allowCouponCheck = support.createThrottle({ limit: 8, windowMs: 10 * 60 * 1000 });
+
+  // Every free-typed message looks the student's tickets up in the sheet. A
+  // flood of messages must not become a flood of Apps Script calls.
+  const allowFreeText = support.createThrottle({ limit: 20, windowMs: 10 * 60 * 1000 });
+
   /** A ticket untouched for longer than this is not joined by a new message. */
   const ACTIVE_TICKET_DAYS = 7;
 
@@ -299,6 +307,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   async function checkCoupon(code, telegramId, group) {
   const pass = await passFor(group.id);
   if (!pass) return { pass: null, result: { ok: false, reason: 'Nothing is on sale for this group right now.' } };
+  if (!allowCouponCheck(String(telegramId))) {
+    return {
+      pass,
+      result: { ok: false, reason: 'Too many coupon attempts. Please wait a few minutes before trying another code.' }
+    };
+  }
   let coupon;
   try {
     coupon = await sheetFor(primaryGroup().id).getCoupon(pricing.normaliseCode(code), String(telegramId));
@@ -418,7 +432,23 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     while (pending.size) await Promise.allSettled([...pending]);
   }
 
-  bot.onText(/^\/start/, async (msg) => {
+  /**
+   * studentCommand — registers a student command that only answers in a
+   * private chat with the bot.
+   *
+   * The bot is an admin of every paid group and of the support chat, so it
+   * sees commands typed there too. Answering them would post a member's pass
+   * and invite button for the whole group to see (/status), or act on their
+   * subscription in public (/cancel).
+   */
+  function studentCommand(pattern, handler) {
+    bot.onText(pattern, async (msg, match) => {
+      if (!msg || !msg.chat || msg.chat.type !== 'private') return;
+      await handler(msg, match);
+    });
+  }
+
+  studentCommand(/^\/start(?:@\w+)?(?:\s|$)/, async (msg) => {
   const name = msg.from.first_name || 'there';
   const groups = familyGroups();
   const what = groups.length === 1
@@ -444,11 +474,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   await offerGroups(msg.chat.id);
   });
 
-  bot.onText(/^\/plans/, async (msg) => {
+  studentCommand(/^\/plans(?:@\w+)?(?:\s|$)/, async (msg) => {
   await offerGroups(msg.chat.id);
   });
 
-  bot.onText(/^\/status/, async (msg) => {
+  studentCommand(/^\/status(?:@\w+)?(?:\s|$)/, async (msg) => {
   try {
     const held = await findSubscriptions(msg.from.id);
 
@@ -487,7 +517,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
   });
 
-  bot.onText(/^\/help/, async (msg) => {
+  studentCommand(/^\/help(?:@\w+)?(?:\s|$)/, async (msg) => {
   const many = familyGroups().length > 1;
   const steps = [
     many ? 'Send /plans and choose your group.' : 'Send /plans to see the pass.',
@@ -508,7 +538,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   );
   });
 
-  bot.onText(/^\/cancel/, async (msg) => {
+  studentCommand(/^\/cancel(?:@\w+)?(?:\s|$)/, async (msg) => {
   try {
     const held = await findSubscriptions(msg.from.id);
     const renewing = held.filter(({ subscriber }) => subscriber.subscription_id);
@@ -600,6 +630,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   if (data.startsWith('adm:')) {
     await handleAdminCallback(query, data, ack);
+    return;
+  }
+
+  if (data.startsWith('sum:')) {
+    await handleSummaryCallback(query, data, ack);
     return;
   }
 
@@ -910,7 +945,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    *
    * @returns {Promise<boolean>} true when the admins were reached
    */
-  async function notifyAdmins({ ticketId, user, category, text, passes, source, followUp, conversation, status }) {
+  async function notifyAdmins({ ticketId, user, category, text, passes, source, followUp, conversation, status, reopened }) {
   const chat = supportChat();
   if (!chat) return false;
 
@@ -922,14 +957,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   const lines = [];
   if (followUp) {
-    lines.push(`↩️ <b>STUDENT REPLIED</b> · ${esc(displayUser(user))}`);
-    lines.push(`Status: ${support.statusLabel(status || 'open')}`);
+    lines.push(reopened
+      ? `🔁 <b>STUDENT WROTE ON A CLOSED TICKET — REOPENED</b> · ${esc(displayUser(user))}`
+      : `↩️ <b>STUDENT REPLIED</b> · ${esc(displayUser(user))}`);
+    lines.push(`Status: ${support.statusLine(status || 'open', 'admin')}`);
     const earlier = support.earlierConversation(conversation, 1200);
     if (earlier) lines.push('', '📜 <b>Earlier in this ticket</b>', `<blockquote>${esc(earlier)}</blockquote>`);
     lines.push('💬 <b>New message</b>', `<blockquote>${esc(shown)}</blockquote>`);
   } else {
     lines.push(`🆕 <b>NEW TICKET</b> · ${esc(category.emoji)} ${esc(category.label)}`);
-    lines.push(`Status: ${support.statusLabel('open')}`);
+    lines.push(`Status: ${support.statusLine('open', 'admin')}`);
     lines.push(DIVIDER);
     lines.push(`👤 <b>Student:</b> ${esc(displayUser(user))} · <code>${esc(user.id)}</code>`);
     lines.push('🎟 <b>Passes</b>', passLines(passes));
@@ -960,8 +997,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   /**
-   * findActiveTicket — this student's most recent ticket that is still open
-   * or answered and was touched in the last week.
+   * findActiveTicket — the ticket a student's new message belongs to: their
+   * most recent one that is not closed, or failing that the most recent one
+   * closed, as long as it was touched in the last week. A closed one reopens
+   * as in progress when the message is added.
    *
    * A student does not use Telegram's reply feature; they just type again.
    * Without this, every such message became a separate ticket and the admin
@@ -975,8 +1014,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     SUPPORT_SETTINGS_WAIT_MS,
     null
   );
-  const tickets = (list && list.tickets) || [];
-  return tickets.find((t) => t.status !== 'closed' && support.isRecent(t.updated_at, ACTIVE_TICKET_DAYS)) || null;
+  const recent = ((list && list.tickets) || []).filter((t) => support.isRecent(t.updated_at, ACTIVE_TICKET_DAYS));
+  return recent.find((t) => support.normaliseStatus(t.status) !== 'closed') || recent[0] || null;
   }
 
   /**
@@ -1040,8 +1079,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     { parse_mode: 'HTML' });
   }
 
-  /** A student adding to a ticket that already exists. */
-  async function followUpTicket(source, ticketId, user) {
+  /**
+   * followUpTicket — a student adding to a ticket that already exists. A
+   * closed one reopens as in progress (the sheet applies that rule).
+   *
+   * @param {{wasClosed?: boolean}} [options] Whether the ticket was closed
+   */
+  async function followUpTicket(source, ticketId, user, options = {}) {
   const text = support.messageText(source);
   if (!text && !support.hasMedia(source)) return;
   if (!allowTicket(String(user.id))) {
@@ -1055,8 +1099,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   try {
     ticket = await sheetFor(primaryGroup().id).appendTicketMessage(ticketId, {
       author: displayUser(user),
-      text: text || '(attachment)',
-      status: 'open'
+      text: text || '(attachment)'
     });
     saved = Boolean(ticket);
   } catch (err) {
@@ -1066,7 +1109,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const delivered = await notifyAdmins({
     ticketId, user, text, source, followUp: true,
     conversation: ticket && ticket.conversation,
-    status: ticket ? ticket.status : 'open'
+    status: ticket ? ticket.status : 'open',
+    reopened: Boolean((ticket && ticket.reopened) || options.wasClosed)
   });
 
   if (!saved && !delivered) {
@@ -1075,7 +1119,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
   await bot.sendMessage(user.id,
-    `${esc(support.receivedLine(ticketId))}\n\nAdded to your ticket. An admin will reply here.\n\n` +
+    `${esc(support.receivedLine(ticketId))}\n\n` +
+    ((ticket && ticket.reopened) || options.wasClosed
+      ? 'Your earlier ticket has been reopened and an admin will reply here.\n\n'
+      : 'Added to your ticket. An admin will reply here.\n\n') +
     '<i>Different problem? Send /support to open a new ticket.</i>',
     { parse_mode: 'HTML' });
   }
@@ -1128,7 +1175,6 @@ function createPaymentBot({ payBotEnv, polling = false }) {
         await sheetFor(primaryGroup().id).appendTicketMessage(ticketId, {
           author: `Admin ${actor || 'unknown'}`,
           text: `Sent a fresh invite link for ${delivered.join(', ')}`,
-          status: 'answered',
           handledBy: actor || 'unknown',
           logAction: 'invite_sent'
         });
@@ -1286,7 +1332,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
     const active = await findActiveTicket(user.id);
     if (active) {
-      await followUpTicket(original, active.ticket_id, user);
+      await followUpTicket(original, active.ticket_id, user, { wasClosed: support.normaliseStatus(active.status) === 'closed' });
     } else {
       await openTicket(original, support.categoryById('other'), user);
     }
@@ -1296,14 +1342,23 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   await ack();
   }
 
-  /** Changes a ticket's status from the support chat and tells whoever needs telling. */
+  /**
+   * setStatusFromChat — an admin closing or reopening a ticket from the
+   * support chat. Only this, the dashboard's close button and the "Resolved"
+   * quick reply ever close a ticket.
+   */
   async function setStatusFromChat(chat, ticket, status, admin, where) {
+  let saved = null;
   try {
-    await sheetFor(primaryGroup().id).setTicketStatus(ticket.ticketId, status, admin);
+    saved = await sheetFor(primaryGroup().id).setTicketStatus(ticket.ticketId, status, admin);
   } catch (err) {
     console.error(`[support] ${payBotEnv}: could not set ${ticket.ticketId} to ${status} — ${err.message}`);
+    await postToAdmins(chat, ticket.ticketId, ticket.telegramId,
+      `⚠️ <b>Not changed</b>: the sheet could not be updated (${esc(err.message)}). Try again.`, { extra: where });
+    return;
   }
-  if (status === 'closed') {
+  const alreadyClosed = status === 'closed' && saved && saved.previous_status === 'closed';
+  if (status === 'closed' && !alreadyClosed) {
     try {
       await bot.sendMessage(ticket.telegramId,
         `${esc(support.replyLine(ticket.ticketId))}\n\n` +
@@ -1314,10 +1369,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       // Blocked the bot; the ticket is closed either way.
     }
   }
+  const heading = alreadyClosed
+    ? `ℹ️ <b>Already closed</b>${saved.closed_by ? ` by ${esc(saved.closed_by)}` : ''} — nothing changed.`
+    : status === 'closed'
+      ? `✅ <b>Closed</b> by ${esc(admin)} — the student was told it is resolved.`
+      : `🔓 <b>Reopened</b> by ${esc(admin)}`;
   await postToAdmins(chat, ticket.ticketId, ticket.telegramId,
-    (status === 'closed' ? `✅ <b>Resolved</b> by ${esc(admin)} — the student was told.`
-      : `🔓 <b>Reopened</b> by ${esc(admin)}`) +
-    `\nStatus: ${support.statusLabel(status)}`,
+    `${heading}\nStatus: ${saved ? support.statusLine(saved.status, saved.waiting_on) : support.statusLabel(status)}`,
     { closed: status === 'closed', extra: where });
   }
 
@@ -1331,7 +1389,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    *
    * @returns {Promise<{delivered: boolean, error?: string}>}
    */
-  async function sendAdminAnswer(ticketId, telegramId, text, admin, { logAction, status = 'answered' } = {}) {
+  async function sendAdminAnswer(ticketId, telegramId, text, admin, { logAction } = {}) {
   try {
     await bot.sendMessage(telegramId,
       `${esc(support.replyLine(ticketId))}\n\n${esc(text)}\n\n` +
@@ -1342,7 +1400,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
   try {
     await sheetFor(primaryGroup().id).appendTicketMessage(ticketId, {
-      author: `Admin ${admin}`, text, status, handledBy: admin, logAction
+      author: `Admin ${admin}`, text, handledBy: admin, logAction
     });
   } catch (err) {
     console.error(`[support] ${payBotEnv}: could not record the answer to ${ticketId} — ${err.message}`);
@@ -1412,17 +1470,20 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       await post(`⚠️ <b>Not delivered</b>: ${esc(outcome.error)}\nThe student may have blocked the bot.`);
       return;
     }
+    let closed = false;
     if (reply.closes) {
       try {
         await sheetFor(primaryGroup().id).setTicketStatus(ticketId, 'closed', admin);
+        closed = true;
       } catch (err) {
         console.error(`[support] ${payBotEnv}: could not close ${ticketId} — ${err.message}`);
       }
     }
     await post(
       `📋 <b>Quick reply sent</b> by ${esc(admin)}: ${esc(reply.button)}\n<blockquote>${esc(text)}</blockquote>\n` +
-      `Status: ${support.statusLabel(reply.closes ? 'closed' : 'answered')}`,
-      { closed: Boolean(reply.closes) });
+      (reply.closes && !closed ? '⚠️ The message was sent but the ticket could not be closed — tap ✅ Close.\n' : '') +
+      `Status: ${closed ? support.statusLabel('closed') : support.statusLine('in_progress', 'student')}`,
+      { closed });
     return;
   }
 
@@ -1452,7 +1513,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     const recent = (found.log || []).slice(-6).map((e) =>
       `• ${esc(e.at)} — ${esc(e.who || e.role)}: ${esc(e.action)}`);
     await post(
-      `📜 <b>History</b> · ${support.statusLabel(found.status)}` +
+      `📜 <b>History</b> · ${support.statusLine(found.status, found.waiting_on)}` +
+      (found.picked_up_by ? ` · picked up by ${esc(found.picked_up_by)}` : '') +
       (found.handled_by ? ` · last handled by ${esc(found.handled_by)}` : '') +
       (found.admin_replies ? ` · ${found.admin_replies} admin repl${found.admin_replies === 1 ? 'y' : 'ies'}` : '') + '\n' +
       `<blockquote>${esc(support.lastChars(found.conversation || found.last_message, 2800))}</blockquote>` +
@@ -1463,7 +1525,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   if (action === 'close' || action === 'reopen') {
     await ack(action === 'close' ? 'Closing…' : 'Reopening…');
-    await setStatusFromChat(chat, ticket, action === 'close' ? 'closed' : 'open', admin, where);
+    await setStatusFromChat(chat, ticket, action === 'close' ? 'closed' : 'in_progress', admin, where);
     return;
   }
 
@@ -1539,6 +1601,47 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   /**
+   * findRecordedPayment — a payment id in one group's sheet, from the payment
+   * log or a member row. Falls back to searching members on a sheet whose
+   * Apps Script predates the findPayment action.
+   *
+   * @returns {Promise<{telegram_id: string}|null>}
+   */
+  async function findRecordedPayment(group, paymentId) {
+  const client = sheetFor(group.id);
+  try {
+    return await client.findPayment(paymentId);
+  } catch (err) {
+    if (!err.staleScript) throw err;
+  }
+  const found = await client.listSubscribers({ search: paymentId, pageSize: 5 });
+  return (found.subscribers || []).find((sub) => sub.payment_id === paymentId) || null;
+  }
+
+  /**
+   * lowestLegitimatePrice — the least anyone could pay for the pass today:
+   * its price after the biggest discount any coupon (active or not) gives,
+   * never below Rs 1. If coupons cannot be read, only Rs 1 is enforced.
+   */
+  async function lowestLegitimatePrice(pass) {
+  if (!pass) return pricing.MIN_PAYABLE_PAISE;
+  let floor = pass.amountPaise;
+  try {
+    const coupons = await sheetFor(primaryGroup().id).listCoupons();
+    for (const coupon of coupons) {
+      const value = Number(coupon.discount_value) || 0;
+      const discount = coupon.discount_type === 'percent'
+        ? Math.round(pass.amountPaise * value / 100)
+        : Math.round(value * 100);
+      floor = Math.min(floor, Math.max(pricing.MIN_PAYABLE_PAISE, pass.amountPaise - discount));
+    }
+  } catch (err) {
+    return pricing.MIN_PAYABLE_PAISE;
+  }
+  return floor;
+  }
+
+  /**
    * grantForPayment — gives a student the pass for a payment Razorpay confirms
    * was captured, when the automatic grant after payment did not happen.
    *
@@ -1560,22 +1663,41 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return { granted: false, html: `⛔ <b>Not granted.</b> This payment was made from another student's checkout (Telegram id <code>${esc(notes.telegram_id)}</code>).` };
   }
 
-  // A payment already on someone else's member row must not buy a second pass.
+  // A payment already recorded anywhere — any group, any bot, the member row
+  // or the payment log — must not buy a second pass. A payment recorded for
+  // this same student in this same group is left to grantAccess, which treats
+  // it as already processed.
   try {
-    for (const g of familyGroups()) {
-      const found = await sheetFor(g.id).listSubscribers({ search: paymentId, pageSize: 5 });
-      const other = (found.subscribers || []).find((sub) =>
-        sub.payment_id === paymentId && String(sub.telegram_id) !== String(telegramId));
-      if (other) {
-        await logEvent(ticketId, admin, 'pass_grant_refused', `${paymentId}: already used by ${other.telegram_id}`);
-        return { granted: false, html: `⛔ <b>Not granted.</b> <code>${esc(paymentId)}</code> is already recorded for Telegram id <code>${esc(other.telegram_id)}</code> in ${esc(g.shortName)}.` };
+    for (const g of groupRegistry.listGroups().filter((x) => x.ready)) {
+      const record = await findRecordedPayment(g, paymentId);
+      if (record && (String(record.telegram_id) !== String(telegramId) || g.id !== group.id)) {
+        await logEvent(ticketId, admin, 'pass_grant_refused',
+          `${paymentId}: already recorded for ${record.telegram_id} in ${g.shortName}`);
+        return {
+          granted: false,
+          html: `⛔ <b>Not granted.</b> <code>${esc(paymentId)}</code> is already recorded for Telegram id ` +
+            `<code>${esc(record.telegram_id)}</code> in ${esc(g.shortName)}.`
+        };
       }
     }
   } catch (err) {
-    return { granted: false, html: `⚠️ Could not check the members sheet, so nothing was granted: ${esc(err.message)}` };
+    return { granted: false, html: `⚠️ Could not check the payment records, so nothing was granted: ${esc(err.message)}` };
   }
 
+  // A captured payment for less than anyone can pay today — a ₹1 test
+  // payment, or one for something else — must not become a full pass.
   const pass = await passFor(group.id);
+  const floor = await lowestLegitimatePrice(pass);
+  if (Number(payment.amount) < floor) {
+    await logEvent(ticketId, admin, 'pass_grant_refused',
+      `${paymentId}: ${rupeesOf(payment.amount)} is below the lowest price ${rupeesOf(floor)}`);
+    return {
+      granted: false,
+      html: `⛔ <b>Not granted.</b> This payment is ${rupeesOf(payment.amount)}, less than the lowest price ` +
+        `anyone can pay for the pass today (${rupeesOf(floor)}, with the best coupon). It is not a payment for this pass.`
+    };
+  }
+
   let result;
   try {
     result = await membership.grantAccess({
@@ -1616,7 +1738,6 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       author: `Admin ${admin}`,
       text: `Granted ${group.shortName} for ${paymentId} (${rupeesOf(payment.amount)})` +
         (delivered ? ' and sent the invite link' : ''),
-      status: 'answered',
       handledBy: admin,
       logAction: result.alreadyProcessed ? 'pass_grant_already_done' : 'pass_granted'
     });
@@ -1680,11 +1801,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // Service messages (a join, a pinned message) carry neither.
   if (!support.messageText(msg) && !support.hasMedia(msg)) return;
 
+  if (!allowFreeText(String(msg.from.id))) return;
+
   // Someone mid-conversation with support just types again. That belongs in
   // the ticket they already have, not in a new one.
   const active = await findActiveTicket(msg.from.id);
   if (active) {
-    await followUpTicket(msg, active.ticket_id, msg.from);
+    await followUpTicket(msg, active.ticket_id, msg.from, { wasClosed: support.normaliseStatus(active.status) === 'closed' });
     return;
   }
 
@@ -1742,6 +1865,174 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   /**
+   * The queues an admin can list from the support chat: the query each sends
+   * and how it is introduced. Keys are also the /tickets argument and the
+   * sum:<key> button data.
+   */
+  const QUEUE_VIEWS = {
+    needs: { title: '🔴 Needs reply — longest waiting first', query: { waitingOn: 'admin', sort: 'waiting' } },
+    open: { title: '🆕 Open — not picked up yet', query: { status: 'open', sort: 'waiting' } },
+    progress: { title: '🟡 In progress', query: { status: 'in_progress' } },
+    student: { title: '⏳ Waiting for the student', query: { waitingOn: 'student' } },
+    closed: { title: '✅ Recently closed', query: { status: 'closed' } }
+  };
+
+  /** "1 h 35 min" from minutes. */
+  function minutesText(minutes) {
+  if (minutes === null || minutes === undefined || Number.isNaN(Number(minutes))) return '—';
+  const m = Math.round(Number(minutes));
+  if (m < 60) return `${m} min`;
+  if (m < 1440) return `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}`;
+  const days = Math.floor(m / 1440);
+  const hours = Math.floor((m % 1440) / 60);
+  return `${days} day${days === 1 ? '' : 's'}${hours ? ` ${hours} h` : ''}`;
+  }
+
+  /**
+   * buildSupportSummary — the support numbers as one message with buttons to
+   * list each queue.
+   *
+   * @returns {Promise<{html: string, keyboard: Object}>}
+   */
+  async function buildSupportSummary() {
+  const family = esc(primaryGroup().label || primaryGroup().shortName);
+  const stats = await sheetFor(primaryGroup().id).getSupportStats({ days: 7 });
+  const c = (stats && stats.counts) || {};
+  const reply = (stats && stats.first_reply_minutes) || {};
+  const oldest = stats && stats.oldest_needs_reply;
+
+  const openByIssue = Object.entries((stats && stats.by_category) || {})
+    .map(([id, row]) => [id, (row.open || 0) + (row.in_progress || 0)])
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, count]) => {
+      const category = support.categoryById(id);
+      return `• ${esc(category.emoji)} ${esc(category.label)}: <b>${count}</b>`;
+    });
+
+  const admins = Object.entries((stats && stats.by_admin) || {})
+    .sort((a, b) => (b[1].replies + b[1].quick_replies) - (a[1].replies + a[1].quick_replies))
+    .slice(0, 8)
+    .map(([who, a]) => `• ${esc(who)}: ${a.replies + a.quick_replies} replies · ${a.closed} closed` +
+      (a.invites_sent ? ` · ${a.invites_sent} invites` : '') +
+      (a.passes_granted ? ` · ${a.passes_granted} passes granted` : ''));
+
+  const lines = [
+    `📊 <b>${family} — support summary</b>`,
+    '',
+    `🔴 Needs reply: <b>${c.needs_reply || 0}</b>` + (stats && stats.not_picked_up ? `  (🆕 ${stats.not_picked_up} not picked up yet)` : ''),
+    `🟡 In progress: ${c.in_progress || 0} · ⏳ Waiting for student: ${c.waiting_student || 0}`,
+    `✅ Closed: ${c.closed || 0} · All tickets: ${c.total || 0}`,
+    '',
+    `📅 Today: ${stats ? stats.opened_today : 0} opened · ${stats ? stats.closed_today : 0} closed`,
+    `⏱ First reply, last 7 days: ${reply.samples ? `average ${minutesText(reply.average)} · median ${minutesText(reply.median)}` : 'no replies yet'}`,
+    oldest
+      ? `⌛ Longest waiting: ${esc(oldest.name)} — <b>${minutesText(oldest.minutes)}</b> (${esc(support.categoryById(oldest.category).label)})`
+      : '⌛ Nobody is waiting for a reply 🎉'
+  ];
+  if (openByIssue.length) lines.push('', '📂 <b>Not closed, by issue</b>', ...openByIssue);
+  if (admins.length) lines.push('', '🧑‍💼 <b>Admins, last 7 days</b>', ...admins);
+  lines.push('', `<i>Updated ${esc(membership.formatIst(new Date()))}</i>`);
+
+  const button = (text, view) => ({ text, callback_data: `sum:${view}` });
+  const keyboard = {
+    inline_keyboard: [
+      [button(`🔴 Needs reply (${c.needs_reply || 0})`, 'needs'), button(`🆕 Open (${c.open || 0})`, 'open')],
+      [button(`🟡 In progress (${c.in_progress || 0})`, 'progress'), button(`⏳ Waiting for student (${c.waiting_student || 0})`, 'student')],
+      [button('✅ Recently closed', 'closed'), button('🔄 Refresh', 'refresh')]
+    ]
+  };
+  return { html: lines.join('\n'), keyboard };
+  }
+
+  /**
+   * postSupportSummary — sends the summary to the support chat, or updates the
+   * summary message in place when refreshing.
+   *
+   * @returns {Promise<boolean>} true when something was posted or updated
+   */
+  async function postSupportSummary(chat, { extra = {}, editMessageId = null } = {}) {
+  let summary;
+  try {
+    summary = await buildSupportSummary();
+  } catch (err) {
+    await bot.sendMessage(chat.chatId, `⚠️ Could not read the support numbers: ${esc(err.message)}`,
+      supportChatOptions(chat, extra));
+    return false;
+  }
+  if (editMessageId) {
+    try {
+      await bot.editMessageText(summary.html, {
+        chat_id: chat.chatId, message_id: editMessageId, parse_mode: 'HTML', reply_markup: summary.keyboard
+      });
+      return true;
+    } catch (err) {
+      // "message is not modified" means nothing changed; anything else, post anew.
+      if (/not modified/i.test(err.message)) return true;
+    }
+  }
+  await bot.sendMessage(chat.chatId, summary.html, supportChatOptions(chat, Object.assign({ reply_markup: summary.keyboard }, extra)));
+  return true;
+  }
+
+  /** Lists one queue: a heading, then one message per ticket with its buttons. */
+  async function postTicketQueue(chat, view, where = {}) {
+  const spec = QUEUE_VIEWS[view] || QUEUE_VIEWS.needs;
+  const reply = (html) => bot.sendMessage(chat.chatId, html, supportChatOptions(chat, where));
+  let list;
+  try {
+    list = await sheetFor(primaryGroup().id).listTickets(Object.assign({ pageSize: 10 }, spec.query));
+  } catch (err) {
+    await reply(`⚠️ Could not read tickets: ${esc(err.message)}`);
+    return;
+  }
+  const tickets = list.tickets || [];
+  const counts = list.counts || {};
+  await reply(
+    `<b>${spec.title}</b> — ${list.total || 0} ticket${list.total === 1 ? '' : 's'}` +
+    (list.total > tickets.length ? ` (showing ${tickets.length})` : '') + '\n' +
+    `🔴 Needs reply ${counts.needs_reply || 0} · 🆕 Open ${counts.open || 0} · 🟡 In progress ${counts.in_progress || 0} · ` +
+    `⏳ Waiting for student ${counts.waiting_student || 0} · ✅ Closed ${counts.closed || 0}` +
+    (tickets.length ? '' : '\n\nNothing here. 🎉'));
+
+  // One message per ticket, each with its own buttons, so any of them can be
+  // acted on straight from the list.
+  for (const t of tickets) {
+    const category = support.categoryById(t.category);
+    await postToAdmins(chat, t.ticket_id, t.telegram_id,
+      `${support.statusLine(t.status, t.waiting_on)} · ${esc(category.emoji)} ${esc(category.label)}\n` +
+      `👤 ${esc(t.username ? '@' + t.username : (t.name || t.telegram_id))} · 🕒 last activity ${esc(t.updated_at)}` +
+      (t.picked_up_by ? ` · picked up by ${esc(t.picked_up_by)}` : ' · not picked up yet') + '\n' +
+      `<blockquote>${esc(String(t.last_message || '').slice(0, 300))}</blockquote>`,
+      { paymentId: support.findPaymentId(t.last_message), closed: support.normaliseStatus(t.status) === 'closed' });
+  }
+  }
+
+  /** Taps on the summary's buttons. */
+  async function handleSummaryCallback(query, data, ack) {
+  const chat = supportChat();
+  const message = query.message;
+  if (!chat || !message || !message.chat || String(message.chat.id) !== chat.chatId) {
+    await ack('This button only works in the support chat.');
+    return;
+  }
+  const view = data.slice(4);
+  if (view === 'refresh') {
+    await ack('Refreshing…');
+    await postSupportSummary(chat, { editMessageId: message.message_id });
+    return;
+  }
+  if (!QUEUE_VIEWS[view]) {
+    await ack();
+    return;
+  }
+  await ack();
+  const where = {};
+  if (message.message_thread_id) where.message_thread_id = message.message_thread_id;
+  await postTicketQueue(chat, view, where);
+  }
+
+  /**
    * handleSupportChatMessage — admins answering from the support chat.
    *
    * Anyone in that chat is treated as an admin, so it must be a private group
@@ -1789,7 +2080,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       }
       try {
         await sheetFor(primaryGroup().id).appendTicketMessage(ticket.ticketId, {
-          author: `Admin ${admin}`, text: text || '(attachment)', status: 'answered', handledBy: admin
+          author: `Admin ${admin}`, text: text || '(attachment)', handledBy: admin
         });
       } catch (err) {
         console.error(`[support] ${payBotEnv}: could not record the answer to ${ticket.ticketId} — ${err.message}`);
@@ -1804,7 +2095,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
 
     await postToAdmins(chat, ticket.ticketId, ticket.telegramId,
-      `✅ <b>Delivered to the student</b> · by ${esc(admin)}\nStatus: ${support.statusLabel('answered')}`,
+      `✅ <b>Delivered to the student</b> · by ${esc(admin)}\nStatus: ${support.statusLine('in_progress', 'student')}`,
       { extra: where });
     return;
   }
@@ -1816,6 +2107,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (command.name === 'msg') {
     const target = command.args.split(/\s+/)[0] || '';
     const text = command.args.slice(target.length).trim();
+    if (text.length > support.MAX_MESSAGE_CHARS) {
+      await reply(`⚠️ That message is ${text.length} characters; the limit is ${support.MAX_MESSAGE_CHARS}.`);
+      return;
+    }
     if (!target || !text) {
       await reply('Usage: <code>/msg 7234356929 your message</code> or <code>/msg @username your message</code>');
       return;
@@ -1853,40 +2148,19 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
     await postToAdmins(chat, ticketId, student.telegramId,
       `📤 <b>Message sent</b> by ${esc(admin)} to ${esc(sub.name || (sub.username ? '@' + sub.username : student.telegramId))}\n` +
-      `<blockquote>${esc(text)}</blockquote>\nStatus: ${support.statusLabel('answered')}`,
+      `<blockquote>${esc(text)}</blockquote>\nStatus: ${support.statusLine('in_progress', 'student')}`,
       { extra: where });
     return;
   }
 
-  if (command.name === 'tickets') {
-    try {
-      const [open, answered] = await Promise.all([
-        sheetFor(primaryGroup().id).listTickets({ status: 'open', pageSize: 10 }),
-        sheetFor(primaryGroup().id).listTickets({ status: 'answered', pageSize: 10 })
-      ]);
-      const counts = open.counts || {};
-      await reply(
-        `<b>${family} — support</b>\n` +
-        `${support.statusLabel('open')}: ${counts.open || 0} · ${support.statusLabel('answered')}: ${counts.answered || 0} · ` +
-        `${support.statusLabel('closed')}: ${counts.closed || 0}`);
+  if (command.name === 'summary' || command.name === 'stats') {
+    await postSupportSummary(chat, { extra: where });
+    return;
+  }
 
-      // One message per ticket, each with its own buttons, so any of them can
-      // be acted on straight from this list.
-      for (const t of [...(open.tickets || []), ...(answered.tickets || [])]) {
-        const category = support.categoryById(t.category);
-        await postToAdmins(chat, t.ticket_id, t.telegram_id,
-          `${support.statusLabel(t.status)} · ${esc(category.emoji)} ${esc(category.label)}\n` +
-          `👤 ${esc(t.username ? '@' + t.username : (t.name || t.telegram_id))} · 🕒 ${esc(t.updated_at)}` +
-          (t.handled_by ? ` · last handled by ${esc(t.handled_by)}` : '') + '\n' +
-          `<blockquote>${esc(String(t.last_message || '').slice(0, 300))}</blockquote>`,
-          { paymentId: support.findPaymentId(t.last_message) });
-      }
-      if (!(open.tickets || []).length && !(answered.tickets || []).length) {
-        await reply('Nothing waiting. 🎉');
-      }
-    } catch (err) {
-      await reply(`⚠️ Could not read tickets: ${esc(err.message)}`);
-    }
+  if (command.name === 'tickets') {
+    const requested = String(command.args || '').split(/\s+/)[0].toLowerCase();
+    await postTicketQueue(chat, QUEUE_VIEWS[requested] ? requested : 'needs', where);
     return;
   }
 
@@ -1935,14 +2209,17 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       '🔍 <b>Check payment</b> — appears when they mention a pay_ id; asks Razorpay\n' +
       '✅ <b>Grant pass for this payment</b> — after a check shows the money arrived but no pass\n' +
       '📜 <b>History</b> — the whole conversation and recent actions\n' +
-      '✅ <b>Resolve & close</b> / 🔓 <b>Reopen</b>\n\n' +
+      '✅ <b>Close ticket</b> / 🔓 <b>Reopen</b> — closing tells the student it is resolved\n\n' +
       'You can also simply reply to any ticket message.\n\n' +
-      '<b>Statuses</b>\n' +
+      '<b>Statuses</b> — only an admin closes a ticket\n' +
       `${support.statusLabel('open')} — ${esc(support.STATUS_MEANINGS.open)}\n` +
-      `${support.statusLabel('answered')} — ${esc(support.STATUS_MEANINGS.answered)}\n` +
-      `${support.statusLabel('closed')} — ${esc(support.STATUS_MEANINGS.closed)}\n\n` +
+      `${support.statusLabel('in_progress')} — ${esc(support.STATUS_MEANINGS.in_progress)}\n` +
+      `${support.statusLabel('closed')} — ${esc(support.STATUS_MEANINGS.closed)}\n` +
+      `${support.WAITING_LABELS.admin} — the student wrote last and is waiting for you\n` +
+      `${support.WAITING_LABELS.student} — you wrote last\n\n` +
       '<b>Commands</b>\n' +
-      '<code>/tickets</code> — everything waiting, with buttons\n' +
+      '<code>/summary</code> — how many tickets need a reply, are open, in progress or closed, with buttons to list each\n' +
+      '<code>/tickets</code> — tickets needing a reply (or <code>/tickets open</code>, <code>progress</code>, <code>student</code>, <code>closed</code>)\n' +
       '<code>/msg 7234356929 text</code> or <code>/msg @username text</code> — message a student first\n' +
       '<code>/settings</code> · <code>/set key value</code> — bot texts\n' +
       'Everything is logged in the sheet\'s Support and Support Log tabs.');
@@ -2025,7 +2302,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return {
     payBotEnv, bot, familyGroups, plansFor, ALLOWED_UPDATES, settle, primaryGroup, settingsCache,
     resendInvites, describeInviteResults, studentSnapshot, suggestFor: support.suggestNextStep,
-    checkPayment, grantForPayment, passFor
+    checkPayment, grantForPayment, passFor, postSupportSummary, supportChat
   };
 
 }

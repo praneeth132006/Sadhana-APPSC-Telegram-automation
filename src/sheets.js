@@ -42,7 +42,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -593,7 +593,7 @@ async function appendTicketMessage(ctx, ticketId, { author, text, status, handle
   return result.data || null;
 }
 
-/** Sets a ticket to open, answered or closed. Resolves null for an unknown ticket. */
+/** Closes (closed) or reopens (in_progress) a ticket. Resolves null for an unknown ticket. */
 async function setTicketStatus(ctx, ticketId, status, handledBy) {
   const result = await request(ctx, 'POST', { action: 'setTicketStatus', ticketId, status, handledBy: handledBy || '' });
   return result.data || null;
@@ -653,6 +653,21 @@ async function listRedemptions(ctx, filters = {}) {
   return result.data || { total: 0, redemptions: [] };
 }
 
+/**
+ * findPayment — where a Razorpay payment id is recorded in this sheet, from the
+ * Payments log or a member row. Resolves null when it is not.
+ */
+async function findPayment(ctx, paymentId) {
+  const result = await request(ctx, 'GET', { action: 'findPayment', paymentId });
+  return result.data || null;
+}
+
+/** Queues, today's numbers, response times and per-admin activity for the Support page. */
+async function getSupportStats(ctx, { days } = {}) {
+  const result = await request(ctx, 'GET', { action: 'getSupportStats', days: days || '' });
+  return result.data || null;
+}
+
 /** One ticket including its whole conversation, or null. */
 async function getTicket(ctx, ticketId) {
   const result = await request(ctx, 'GET', { action: 'getTicket', ticketId });
@@ -710,7 +725,7 @@ const IMPLEMENTATIONS = {
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,
-  upsertCoupon, deleteCoupon, recordRedemption, listRedemptions
+  upsertCoupon, deleteCoupon, recordRedemption, listRedemptions, getSupportStats, findPayment
 };
 
 API_NAMES.forEach((name) => {

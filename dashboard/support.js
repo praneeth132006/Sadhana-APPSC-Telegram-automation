@@ -9,14 +9,27 @@
 // ============================================================================
 
 import {
-  initDashboard, api, el, replaceChildren, emptyState, pill, num, showToast, getSelectedGroup, $
+  initDashboard, api, el, replaceChildren, emptyState, pill, num, showToast, statCard, getSelectedGroup, $
 } from './shared.js';
 
-/** Which tickets the list shows. */
-const filters = { status: 'open', search: '' };
+/** Which tickets the list shows. Starts on the queue that needs work. */
+const filters = { tab: 'needs_reply', search: '' };
+
+/** The list tabs, and the query each one sends. */
+const TABS = [
+  { id: 'needs_reply', label: '🔴 Needs reply', count: 'needs_reply', query: { waitingOn: 'admin', sort: 'waiting' } },
+  { id: 'open', label: '🆕 Open', count: 'open', query: { status: 'open', sort: 'waiting' } },
+  { id: 'in_progress', label: '🟡 In progress', count: 'in_progress', query: { status: 'in_progress' } },
+  { id: 'waiting_student', label: '⏳ Waiting for student', count: 'waiting_student', query: { waitingOn: 'student' } },
+  { id: 'closed', label: '✅ Closed', count: 'closed', query: { status: 'closed' } },
+  { id: 'all', label: 'All', count: 'total', query: {} }
+];
+
+/** Analysis period in days. */
+let statsDays = 30;
 
 /** Loaded once from /api/support/settings. */
-let meta = { categories: [], statuses: [], quickReplies: [], definitions: [], settings: {}, context: null };
+let meta = { categories: [], statuses: [], waiting: [], quickReplies: [], definitions: [], settings: {}, context: null };
 
 /** The ticket open in the workspace. */
 let selectedId = '';
@@ -24,12 +37,14 @@ let selectedId = '';
 /** The newest list, for re-rendering the selection highlight. */
 let lastTickets = [];
 
-const STATUS_TONE = { open: 'warn', answered: 'info', closed: 'ok' };
+const STATUS_TONE = { open: 'warn', in_progress: 'info', closed: 'ok' };
+const WAITING_TONE = { admin: 'danger', student: 'muted' };
 
 const ACTION_WORDS = {
   ticket_opened: 'opened the ticket',
   student_message: 'wrote a message',
   admin_reply: 'replied',
+  picked_up: 'picked up the ticket',
   admin_started_conversation: 'messaged the student first',
   invite_sent: 'sent a new invite link',
   invite_not_sent: 'tried to send an invite link (not sent)',
@@ -39,9 +54,7 @@ const ACTION_WORDS = {
   pass_grant_refused: 'tried to grant a pass (refused)',
   pass_grant_failed: 'tried to grant a pass (failed)',
   closed: 'resolved and closed the ticket',
-  reopened: 'reopened the ticket',
-  status_answered: 'marked it as waiting for the student',
-  status_open: 'marked it as waiting for an admin'
+  reopened: 'reopened the ticket'
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +62,26 @@ const ACTION_WORDS = {
 // ---------------------------------------------------------------------------
 
 function statusInfo(id) {
-  return meta.statuses.find((s) => s.id === id) || { id, label: id || 'unknown', meaning: '' };
+  const status = id === 'answered' ? 'in_progress' : id;
+  return meta.statuses.find((s) => s.id === status) || { id: status, label: status || 'unknown', meaning: '' };
+}
+
+/** The status pill, plus who has to act next unless it is closed. */
+function statusPills(ticket) {
+  const status = statusInfo(ticket.status);
+  const waiting = status.id !== 'closed' && meta.waiting.find((w) => w.id === ticket.waiting_on);
+  return [pill(status.label, STATUS_TONE[status.id]), waiting ? pill(waiting.label, WAITING_TONE[waiting.id]) : null];
+}
+
+/** 95 → "1 h 35 min". */
+function duration(minutes) {
+  if (minutes === null || minutes === undefined || Number.isNaN(Number(minutes))) return '—';
+  const m = Math.round(Number(minutes));
+  if (m < 60) return `${m} min`;
+  if (m < 1440) return `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ''}`;
+  const days = Math.floor(m / 1440);
+  const hours = Math.floor((m % 1440) / 60);
+  return `${days} day${days === 1 ? '' : 's'}${hours ? ` ${hours} h` : ''}`;
 }
 
 function category(id) {
@@ -126,9 +158,12 @@ async function busy(button, label, work) {
 // ---------------------------------------------------------------------------
 
 function renderHowItWorks() {
-  const statuses = meta.statuses.map((s) => el('li', {}, [
-    pill(s.label, STATUS_TONE[s.id]), ' ', el('span', { text: s.meaning })
-  ]));
+  const statuses = [
+    ...meta.statuses.map((s) => el('li', {}, [pill(s.label, STATUS_TONE[s.id]), ' ', el('span', { text: s.meaning })])),
+    el('li', {}, [pill('🔴 Needs reply', 'danger'), ' ', el('span', { text: 'The student wrote last and is waiting for an admin.' })]),
+    el('li', {}, [pill('⏳ Waiting for student', 'muted'), ' ', el('span', { text: 'An admin wrote last.' })]),
+    el('li', {}, [el('strong', { text: 'Only an admin closes a ticket' }), el('span', { text: ' — with Close, the "Resolved" quick reply, or "close after sending".' })])
+  ];
   replaceChildren($('howItWorks'), el('div', { class: 'panel-body sp-howto-body' }, [
     el('div', {}, [
       el('h3', { text: 'What the statuses mean' }),
@@ -137,7 +172,7 @@ function renderHowItWorks() {
     el('div', {}, [
       el('h3', { text: 'How to answer a ticket' }),
       el('ol', { class: 'sp-plain-list' }, [
-        el('li', { text: 'Pick a ticket under "Waiting for you".' }),
+        el('li', { text: 'Start with "Needs reply" — longest waiting first.' }),
         el('li', { text: 'Read "Student\'s access" — it shows their pass, whether they are in the group, and a suggested next step.' }),
         el('li', { text: 'Type a reply, or insert a quick reply, and press Send. Tick "close after sending" when that answer settles it.' }),
         el('li', { text: 'Link problem with a valid pass? Use "Send new invite link". Says they paid? Ask for the payment id, then "Check payment".' })
@@ -181,24 +216,110 @@ function renderNotices(context) {
 }
 
 function renderTabs(counts = {}) {
-  const tabs = [
-    { id: 'open', label: '🟠 Waiting for you', count: counts.open },
-    { id: 'answered', label: '🔵 Waiting for student', count: counts.answered },
-    { id: 'closed', label: '✅ Resolved', count: counts.closed },
-    { id: '', label: 'All', count: counts.total }
-  ];
-  replaceChildren($('statusTabs'), tabs.map((tab) => el('button', {
-    class: 'sp-tab' + (filters.status === tab.id ? ' active' : ''),
+  replaceChildren($('statusTabs'), TABS.map((tab) => el('button', {
+    class: 'sp-tab' + (filters.tab === tab.id ? ' active' : ''),
     role: 'tab',
-    'aria-selected': filters.status === tab.id ? 'true' : 'false',
+    'aria-selected': filters.tab === tab.id ? 'true' : 'false',
     onclick: () => {
-      filters.status = tab.id;
+      filters.tab = tab.id;
       loadTickets();
     }
   }, [
     el('span', { text: tab.label }),
-    el('span', { class: 'sp-tab-count', text: num(tab.count || 0) })
+    el('span', { class: 'sp-tab-count' + (tab.id === 'needs_reply' && counts.needs_reply ? ' alert' : ''), text: num(counts[tab.count] || 0) })
   ])));
+}
+
+// ---------------------------------------------------------------------------
+// At a glance and analysis
+// ---------------------------------------------------------------------------
+
+async function loadStats() {
+  try {
+    const stats = await api('/api/support/stats', { query: { days: statsDays } });
+    renderStats(stats);
+  } catch (err) {
+    replaceChildren($('statGrid'), emptyState('⚠️', 'Could not load the support numbers.', err.message));
+    replaceChildren($('statGridSecondary'));
+  }
+}
+
+function renderStats(stats) {
+  const c = stats.counts || {};
+  const oldest = stats.oldest_needs_reply;
+  replaceChildren($('statGrid'),
+    statCard('Needs reply', num(c.needs_reply || 0), { tone: c.needs_reply ? 'danger' : 'ok', sub: 'student is waiting for an admin' }),
+    statCard('Open', num(c.open || 0), { tone: c.open ? 'warn' : 'ok', sub: 'not picked up by anyone yet' }),
+    statCard('In progress', num(c.in_progress || 0), { tone: 'info', sub: 'an admin is on it' }),
+    statCard('Closed', num(c.closed || 0), { tone: 'ok', sub: 'closed by an admin' }),
+    statCard('All tickets', num(c.total || 0), { tone: 'muted', sub: 'since support started' })
+  );
+  const reply = stats.first_reply_minutes || {};
+  const close = stats.close_hours || {};
+  replaceChildren($('statGridSecondary'),
+    statCard('First reply (average)', duration(reply.average), { tone: 'info', sub: `median ${duration(reply.median)} · ${num(reply.samples || 0)} tickets, last ${stats.period_days} days` }),
+    statCard('Time to close (average)', close.average === null || close.average === undefined ? '—' : duration(close.average * 60),
+      { tone: 'info', sub: `median ${close.median === null || close.median === undefined ? '—' : duration(close.median * 60)} · ${num(close.samples || 0)} closed` }),
+    statCard('Today', `${num(stats.opened_today || 0)} in · ${num(stats.closed_today || 0)} closed`, { tone: 'muted', sub: 'tickets opened and closed today' }),
+    statCard('Longest waiting', oldest ? duration(oldest.minutes) : '—', {
+      tone: oldest && oldest.minutes > 24 * 60 ? 'danger' : oldest ? 'warn' : 'ok',
+      sub: oldest ? `${oldest.name} · ${category(oldest.category).label}` : 'nobody is waiting'
+    })
+  );
+  renderAnalysis(stats);
+}
+
+function renderAnalysis(stats) {
+  const period = el('select', { class: 'field-select', 'aria-label': 'Analysis period' },
+    [7, 30, 90].map((d) => el('option', { value: String(d), text: `Last ${d} days` })));
+  period.value = String(statsDays);
+  period.addEventListener('change', () => {
+    statsDays = Number(period.value);
+    loadStats();
+  });
+
+  const categories = Object.entries(stats.by_category || {}).sort((a, b) => b[1].total - a[1].total);
+  const categoryTable = categories.length
+    ? el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+      el('thead', {}, [el('tr', {}, ['Issue', 'Open', 'In progress', 'Closed', 'Total'].map((h) => el('th', { text: h })))]),
+      el('tbody', {}, categories.map(([id, row]) => el('tr', {}, [
+        el('td', { text: `${category(id).emoji} ${category(id).label}` }),
+        el('td', { class: 'num', text: num(row.open) }),
+        el('td', { class: 'num', text: num(row.in_progress) }),
+        el('td', { class: 'num', text: num(row.closed) }),
+        el('td', { class: 'num', text: num(row.total) })
+      ])))
+    ])])
+    : emptyState('📭', 'No tickets yet.');
+
+  const admins = Object.entries(stats.by_admin || {}).sort((a, b) => (b[1].replies + b[1].quick_replies) - (a[1].replies + a[1].quick_replies));
+  const adminTable = admins.length
+    ? el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+      el('thead', {}, [el('tr', {}, ['Admin', 'Picked up', 'Replies', 'Quick replies', 'Invites sent', 'Payments checked', 'Passes granted', 'Closed', 'Last action'].map((h) => el('th', { text: h })))]),
+      el('tbody', {}, admins.map(([who, a]) => el('tr', {}, [
+        el('td', { class: 'sp-strong', text: who }),
+        el('td', { class: 'num', text: num(a.picked_up) }),
+        el('td', { class: 'num', text: num(a.replies) }),
+        el('td', { class: 'num', text: num(a.quick_replies) }),
+        el('td', { class: 'num', text: num(a.invites_sent) }),
+        el('td', { class: 'num', text: num(a.payments_checked) }),
+        el('td', { class: 'num', text: num(a.passes_granted) }),
+        el('td', { class: 'num', text: num(a.closed) }),
+        el('td', { class: 'muted', text: timeAgo(a.last_action_at), title: a.last_action_at })
+      ])))
+    ])])
+    : emptyState('🧑‍💼', `No admin activity in the last ${stats.period_days} days.`);
+
+  replaceChildren($('analysisBody'),
+    el('div', { class: 'sp-analysis-head' }, [
+      el('p', { class: 'hint-text', text: `${num(stats.opened_in_period || 0)} tickets opened and ${num(stats.closed_in_period || 0)} closed in the last ${stats.period_days} days. Everything here is counted from the Support and Support Log tabs.` }),
+      period
+    ]),
+    el('h3', { class: 'sp-box-title', text: 'By issue type (all tickets)' }),
+    categoryTable,
+    el('h3', { class: 'sp-box-title', text: `By admin (last ${stats.period_days} days)` }),
+    adminTable
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -213,13 +334,13 @@ function ticketCard(t) {
     onclick: () => openTicket(t.ticket_id)
   }, [
     el('div', { class: 'sp-card-top' }, [
-      pill(statusInfo(t.status).label, STATUS_TONE[t.status]),
+      el('div', { class: 'sp-pills' }, statusPills(t)),
       el('span', { class: 'sp-card-time', text: timeAgo(t.updated_at), title: t.updated_at })
     ]),
     el('div', { class: 'sp-card-issue', text: `${cat.emoji} ${cat.label}` }),
     el('div', { class: 'sp-card-student', text: studentName(t) }),
     el('div', { class: 'sp-card-snippet', text: String(t.last_message || '') }),
-    t.handled_by ? el('div', { class: 'sp-card-handler', text: `Last handled by ${t.handled_by}` }) : null
+    el('div', { class: 'sp-card-handler', text: t.picked_up_by ? `Picked up by ${t.picked_up_by}` : 'Not picked up yet' })
   ]);
 }
 
@@ -227,13 +348,14 @@ async function loadTickets() {
   const list = $('ticketList');
   replaceChildren(list, el('div', { class: 'loading-row' }, [el('div', { class: 'spinner' }), el('span', { text: 'Loading tickets…' })]));
   try {
-    const page = await api('/api/support/tickets', { query: { status: filters.status, search: filters.search, pageSize: 100 } });
+    const tab = TABS.find((t) => t.id === filters.tab) || TABS[0];
+    const page = await api('/api/support/tickets', { query: Object.assign({ search: filters.search, pageSize: 100 }, tab.query) });
     renderNotices(page.context);
     renderTabs(page.counts);
     lastTickets = page.tickets || [];
     if (!lastTickets.length) {
-      const empty = filters.status === 'open'
-        ? emptyState('🎉', 'Nobody is waiting for you.', 'New tickets appear here as students raise them.')
+      const empty = filters.tab === 'needs_reply'
+        ? emptyState('🎉', 'Nobody is waiting for a reply.', 'Tickets appear here when a student writes and an admin has not answered yet.')
         : emptyState('🔍', 'No tickets here.', filters.search ? 'Try a different search.' : '');
       replaceChildren(list, empty);
       return;
@@ -272,17 +394,19 @@ async function openTicket(ticketId) {
 
 /** Re-reads the open ticket and the list after an action. */
 async function refreshAfterAction(ticketId) {
-  await Promise.all([openTicket(ticketId), loadTickets()]);
+  await Promise.all([openTicket(ticketId), loadTickets(), loadStats()]);
 }
 
 function renderWorkspace(ticket) {
   const cat = category(ticket.category);
   const status = statusInfo(ticket.status);
 
+  const firstReply = ticket.first_reply_at && parseIst(ticket.created_at) && parseIst(ticket.first_reply_at)
+    ? duration((parseIst(ticket.first_reply_at) - parseIst(ticket.created_at)) / 60000) : '';
   const header = el('div', { class: 'sp-ws-header' }, [
     el('div', { class: 'sp-ws-title-row' }, [
       el('h2', { class: 'sp-ws-title', text: `${cat.emoji} ${cat.label}` }),
-      pill(status.label, STATUS_TONE[ticket.status])
+      el('div', { class: 'sp-pills' }, statusPills(ticket))
     ]),
     el('p', { class: 'sp-ws-meaning', text: status.meaning }),
     el('div', { class: 'sp-ws-facts' }, [
@@ -290,9 +414,12 @@ function renderWorkspace(ticket) {
       el('span', { text: `Telegram id ${ticket.telegram_id}` }),
       el('span', { text: `Ticket ${ticket.ticket_id}` }),
       el('span', { text: `Opened ${timeAgo(ticket.created_at)}`, title: ticket.created_at }),
+      el('span', { text: ticket.picked_up_by ? `Picked up by ${ticket.picked_up_by}` : 'Not picked up yet', title: ticket.picked_up_at || '' }),
+      firstReply ? el('span', { text: `First reply after ${firstReply}` }) : null,
       ticket.handled_by ? el('span', { text: `Last handled by ${ticket.handled_by}` }) : null,
       ticket.admin_replies ? el('span', { text: `${ticket.admin_replies} admin repl${ticket.admin_replies === 1 ? 'y' : 'ies'}` }) : null,
-      ticket.closed_by ? el('span', { text: `Closed by ${ticket.closed_by}` }) : null
+      ticket.times_reopened ? el('span', { text: `Reopened ${ticket.times_reopened}×` }) : null,
+      ticket.closed_by ? el('span', { text: `Closed by ${ticket.closed_by} ${timeAgo(ticket.closed_at)}`, title: ticket.closed_at }) : null
     ])
   ]);
 
@@ -480,13 +607,14 @@ function actionsBox(ticket) {
   }));
 
   const closed = ticket.status === 'closed';
-  const statusButton = el('button', { class: 'btn btn-ghost', text: closed ? '🔓 Reopen' : '✅ Resolve & close' });
+  const statusButton = el('button', { class: 'btn btn-ghost', text: closed ? '🔓 Reopen' : '✅ Close ticket' });
   statusButton.addEventListener('click', () => busy(statusButton, closed ? 'Reopening…' : 'Closing…', async () => {
     try {
       const result = await api('/api/support/status', {
-        method: 'POST', body: { ticketId: ticket.ticket_id, status: closed ? 'open' : 'closed' }
+        method: 'POST', body: { ticketId: ticket.ticket_id, status: closed ? 'in_progress' : 'closed' }
       });
-      showToast('success', closed ? 'Ticket reopened.' : (result.notified ? 'Resolved — the student was told.' : 'Resolved.'));
+      showToast('success', closed ? 'Reopened — it is in progress again.'
+        : (result.notified ? 'Closed — the student was told it is resolved.' : 'Closed.'));
       await refreshAfterAction(ticket.ticket_id);
     } catch (err) {
       showToast('error', err.message, 9000);
@@ -499,8 +627,9 @@ function actionsBox(ticket) {
     actionCard('Check a payment', 'Ask Razorpay about a payment id the student sent. If money arrived but no pass was given, you can grant it.',
       el('div', { class: 'sp-inline-form' }, [paymentInput, check])),
     paymentResult,
-    actionCard(closed ? 'Reopen' : 'Resolve & close',
-      closed ? 'Move it back to "Waiting for admin".' : 'Marks it resolved and tells the student in Telegram.', statusButton)
+    actionCard(closed ? 'Reopen' : 'Close ticket',
+      closed ? 'Moves it back to In progress, needing a reply.'
+        : 'Only an admin can close a ticket. It stays In progress until you do. The student is told it is resolved.', statusButton)
   ]);
 }
 
@@ -650,7 +779,7 @@ async function loadAll() {
   $('refreshBtn').disabled = true;
   try {
     await loadMeta();
-    await loadTickets();
+    await Promise.all([loadTickets(), loadStats()]);
     if (selectedId) await openTicket(selectedId);
     else renderWorkspaceEmpty();
   } catch (err) {

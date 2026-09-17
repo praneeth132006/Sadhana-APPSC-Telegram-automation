@@ -99,22 +99,49 @@ const CATEGORIES = [
 /** Categories offered in the /support menu, in order. */
 const MENU_CATEGORIES = CATEGORIES.filter((c) => !c.hidden);
 
-/** What a ticket status means, in words an admin reads at a glance. */
+/**
+ * Ticket lifecycle. A ticket is `open` until an admin does anything with it,
+ * then `in_progress` until an admin explicitly closes it. Nothing else closes
+ * a ticket. Who has to act next is tracked separately in `waiting_on`, so a
+ * ticket can be in progress and still need a reply.
+ */
+const TICKET_STATUSES = ['open', 'in_progress', 'closed'];
+
 const STATUS_LABELS = {
-  open: '🟠 Waiting for admin',
-  answered: '🔵 Waiting for student',
-  closed: '✅ Resolved'
+  open: '🆕 Open',
+  in_progress: '🟡 In progress',
+  closed: '✅ Closed'
 };
 
 const STATUS_MEANINGS = {
-  open: 'The student is waiting for a reply from an admin.',
-  answered: 'An admin has replied. Waiting for the student — it moves back to "Waiting for admin" if they write again.',
-  closed: 'Resolved. If the student writes again it reopens automatically.'
+  open: 'New — no admin has picked it up yet.',
+  in_progress: 'An admin has replied or acted. It stays in progress until an admin closes it.',
+  closed: 'An admin closed it. If the student writes again it reopens as in progress.'
 };
 
-/** The label for a status, tolerating an unknown one. */
+/** Who has to act next on a ticket that is not closed. */
+const WAITING_LABELS = {
+  admin: '🔴 Needs reply',
+  student: '⏳ Waiting for student'
+};
+
+/** A stored status, with the old "answered" read as in_progress. */
+function normaliseStatus(status) {
+  const value = String(status || '').trim().toLowerCase();
+  if (value === 'answered') return 'in_progress';
+  return TICKET_STATUSES.includes(value) ? value : 'open';
+}
+
+/** The label for a status, tolerating an old or unknown one. */
 function statusLabel(status) {
-  return STATUS_LABELS[status] || String(status || 'unknown');
+  return STATUS_LABELS[normaliseStatus(status)];
+}
+
+/** "🟡 In progress · 🔴 Needs reply", or just "✅ Closed". */
+function statusLine(status, waitingOn) {
+  const normalised = normaliseStatus(status);
+  const waiting = normalised === 'closed' ? '' : WAITING_LABELS[waitingOn];
+  return waiting ? `${STATUS_LABELS[normalised]} · ${waiting}` : STATUS_LABELS[normalised];
 }
 
 /**
@@ -249,8 +276,6 @@ const SETTINGS = [
 ];
 
 const SETTING_KEYS = SETTINGS.map((s) => s.key);
-
-const TICKET_STATUSES = ['open', 'answered', 'closed'];
 
 /** Longest message accepted into a ticket; Telegram's own limit is 4096. */
 const MAX_MESSAGE_CHARS = 3500;
@@ -470,7 +495,7 @@ function adminKeyboard(ticketId, telegramId, { closed = false, paymentId = '' } 
     { text: '📜 History', callback_data: data('h') },
     closed
       ? { text: '🔓 Reopen', callback_data: data('o') }
-      : { text: '✅ Resolve & close', callback_data: data('c') }
+      : { text: '✅ Close ticket', callback_data: data('c') }
   ]);
   return { inline_keyboard: rows };
 }
@@ -718,7 +743,10 @@ module.exports = {
   MENU_CATEGORIES,
   STATUS_LABELS,
   STATUS_MEANINGS,
+  WAITING_LABELS,
+  normaliseStatus,
   statusLabel,
+  statusLine,
   QUICK_REPLIES,
   quickReplyById,
   quickRepliesFor,
