@@ -36,15 +36,18 @@
       <details id="analysisPanel" class="panel sp-analysis">
         <summary class="sp-texts-summary">
           <span>📈 Analysis</span>
-          <span class="hint-text">Tickets by issue type, and what each admin did</span>
+          <span class="hint-text">Tickets by group and issue type, and what each admin did</span>
         </summary>
         <div id="analysisBody" class="panel-body"></div>
       </details>
 
       <div class="sp-toolbar">
         <div id="statusTabs" class="sp-tabs" role="tablist" aria-label="Ticket status"></div>
-        <input id="searchInput" type="search" class="field-input sp-search"
-               placeholder="Search name, @username, Telegram id, ticket id or message" aria-label="Search tickets">
+        <div class="sp-filters">
+          <select id="groupFilter" class="field-select sp-group-filter" aria-label="Filter by group" hidden></select>
+          <input id="searchInput" type="search" class="field-input sp-search"
+                 placeholder="Search name, @username, Telegram id, ticket id or message" aria-label="Search tickets">
+        </div>
       </div>
 
       <div class="sp-layout">

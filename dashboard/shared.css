@@ -1420,6 +1420,8 @@
   text-align: center;
 }
 
+.sp-filters { display: flex; flex-wrap: wrap; gap: 8px; flex: 1 1 280px; justify-content: flex-end; }
+.sp-group-filter { flex: 0 0 auto; width: auto; min-width: 180px; }
 .sp-search { flex: 1 1 280px; max-width: 460px; box-sizing: border-box; }
 
 .sp-layout {
@@ -1468,6 +1470,7 @@
   overflow-wrap: anywhere;
 }
 .sp-card-handler { font-size: 0.72rem; color: var(--text-muted); }
+.sp-card-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
 .sp-workspace { display: grid; gap: 14px; min-width: 0; }
 
@@ -1495,6 +1498,20 @@
 .sp-ws-title { margin: 0; font-size: 1.15rem; }
 .sp-ws-meaning { margin: 6px 0 10px; color: var(--text-secondary); font-size: 0.86rem; }
 .sp-ws-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 0.8rem; color: var(--text-muted); }
+.sp-ws-about {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 6px 14px;
+  align-items: center;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  font-size: 0.86rem;
+}
+.sp-ws-about dt { color: var(--text-muted); }
+.sp-ws-about dd { margin: 0; color: var(--text-primary); display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
+.sp-ws-about .field-select { width: auto; min-width: 180px; padding-top: 4px; padding-bottom: 4px; }
 
 .sp-box { display: grid; gap: 10px; }
 .sp-box-title { margin: 0; font-size: 0.95rem; font-weight: 700; color: var(--text-primary); }
@@ -1506,6 +1523,9 @@
   border-radius: var(--radius-md);
   background: var(--bg-input);
 }
+.sp-pass-row.about { box-shadow: inset 3px 0 0 var(--accent-primary); }
+.sp-pass-row.other { opacity: 0.72; }
+.sp-pass-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .sp-pass-group { font-weight: 700; color: var(--text-primary); font-size: 0.88rem; }
 .sp-pass-state { display: flex; flex-wrap: wrap; gap: 6px; }
 .sp-pass-details { font-size: 0.78rem; color: var(--text-muted); overflow-wrap: anywhere; }
@@ -1587,6 +1607,8 @@
   .sp-layout { grid-template-columns: 1fr; }
   .sp-list { max-height: 420px; }
   .sp-search { max-width: none; }
+  .sp-filters { justify-content: stretch; }
+  .sp-group-filter { flex: 1 1 100%; }
 }
 
 /* ---- Pass & Coupons page ------------------------------------------------ */

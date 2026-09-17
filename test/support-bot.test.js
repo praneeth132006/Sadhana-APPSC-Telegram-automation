@@ -69,6 +69,7 @@ function fakeSheet(overrides = {}) {
     createTicket: record('createTicket', (t) => Object.assign({ status: 'open' }, t)),
     appendTicketMessage: record('appendTicketMessage', (id) => ({ ticket_id: id })),
     setTicketStatus: record('setTicketStatus', (id, status) => ({ ticket_id: id, status })),
+    setTicketGroup: record('setTicketGroup', (id, group) => ({ ticket_id: id, group })),
     listTickets: record('listTickets', { total: 0, tickets: [], counts: { open: 0 } }),
     getSubscriber: record('getSubscriber', { status: 'active', expiry_date: '30-11-2099', plan_label: 'Target 2026 Pass', total_paid: 199, payment_id: 'pay_OLDPAYMENT0001' }),
     getTicket: record('getTicket', null),
@@ -200,13 +201,16 @@ test('replying to the prompt opens a ticket in the sheet and in the admin chat',
   const [toAdmins] = messages(SUPPORT_CHAT);
   assert.deepEqual(support.parseTicketHeader(toAdmins.args[1]), { ticketId: ticket.ticket_id, telegramId: '42' });
   const card = toAdmins.args[1];
-  assert.match(card, /NEW TICKET<\/b> · 💳 Paid, but no invite link/);
-  assert.match(card, /Status: 🆕 Open · 🔴 Needs reply/);
-  assert.match(card, /UPSC Prelims<\/b>: ✅ valid until 30-11-2099 · <b>NOT in the group<\/b>/,
+  assert.match(card, /New ticket<\/b>\n<b>Status:<\/b> 🆕 Open · 🔴 Needs reply/);
+  assert.match(card, /<b>Issue:<\/b> 💳 Paid, but no invite link/);
+  assert.match(card, /<b>Group:<\/b> UPSC Prelims/, 'a bot with one group files every ticket under it');
+  assert.match(card, /✅ <b>UPSC Prelims<\/b>\n\s+Valid until 30-11-2099 · <b>not in the group<\/b>/,
     'admins should see the pass and that the student is not in the group');
-  assert.match(card, /paid ₹199 · pay_OLDPAYMENT0001/);
+  assert.match(card, /₹199 · <code>pay_OLDPAYMENT0001<\/code>/);
   assert.match(card, /pay_ABC123/);
-  assert.match(card, /Suggested:<\/b> Pass is valid but they are not in UPSC Prelims → tap "🔗 Send new invite link"/);
+  assert.match(card, /Next step:<\/b> Pass is valid but they are not in UPSC Prelims → tap "🔗 Send new invite link"/);
+  assert.match(card, /^🎫 <code>T-/, 'ids are code-formatted so Telegram does not link them as phone numbers');
+  assert.equal(ticket.group, 'upsc');
 
   const [confirmation] = messages(STUDENT.id);
   assert.equal(support.parseReplyLine(confirmation.args[1]), ticket.ticket_id);
@@ -294,8 +298,8 @@ test('replying to an admin answer adds to the ticket and shows admins what came 
   const [toAdmins] = messages(SUPPORT_CHAT);
   const text = toAdmins.args[1];
   assert.ok(support.parseTicketHeader(text));
-  assert.match(text, /STUDENT REPLIED/);
-  assert.match(text, /Status: 🟡 In progress · 🔴 Needs reply/);
+  assert.match(text, /Student replied<\/b>/);
+  assert.match(text, /Status:<\/b> 🟡 In progress · 🔴 Needs reply/);
   assert.match(text, /Earlier in this ticket[\s\S]*Paid but no link[\s\S]*Admin @ravi_admin:\nTry again now/);
   assert.equal((text.match(/Still not working/g) || []).length, 1, 'the new message should not also appear in the history');
   assert.ok(toAdmins.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:42'),
@@ -328,7 +332,7 @@ test('a recently closed ticket is reopened when the student types again; a stale
   await reopen.deliver(privateMessage('it broke again'));
   assert.equal(recentlyClosed.calls.find((c) => c.name === 'appendTicketMessage').args[0], 'T-260917-AAAA');
   assert.match(reopen.messages(STUDENT.id)[0].args[1], /earlier ticket has been reopened/);
-  assert.match(reopen.messages(SUPPORT_CHAT)[0].args[1], /CLOSED TICKET — REOPENED[\s\S]*Status: 🟡 In progress · 🔴 Needs reply/);
+  assert.match(reopen.messages(SUPPORT_CHAT)[0].args[1], /Reopened — the student wrote on a closed ticket[\s\S]*Status:<\/b> 🟡 In progress · 🔴 Needs reply/);
 
   const stale = fakeSheet({
     listTickets: { total: 1, tickets: [{ ticket_id: 'T-260801-BBBB', status: 'open', updated_at: '01-08-2020, 10:00:00 AM IST' }] }
@@ -565,9 +569,9 @@ test('/tickets lists the tickets that need a reply, longest waiting first, each 
   assert.deepEqual(query, { pageSize: 10, waitingOn: 'admin', sort: 'waiting' });
 
   const posts = messages(SUPPORT_CHAT);
-  assert.match(posts[0].args[1], /Needs reply — longest waiting first<\/b> — 2 tickets\n🔴 Needs reply 2 · 🆕 Open 1 · 🟡 In progress 2 · ⏳ Waiting for student 1 · ✅ Closed 3/);
+  assert.match(posts[0].args[1], /Needs reply — longest waiting first<\/b> — 2 tickets\n\n🔴 Needs reply: <b>2<\/b>\n🆕 Open: 1\n🟡 In progress: 2\n⏳ Waiting for student: 1\n✅ Closed: 3/);
   assert.equal(posts.length, 3, 'a heading plus one post per ticket');
-  assert.match(posts[1].args[1], /^🎫 T-260917-AB2C · user 42\n🆕 Open · 🔴 Needs reply[\s\S]*not picked up yet[\s\S]*link broken/);
+  assert.match(posts[1].args[1], /^🎫 <code>T-260917-AB2C<\/code> · user <code>42<\/code>\n🆕 Open · 🔴 Needs reply[\s\S]*not picked up yet[\s\S]*link broken/);
   assert.match(posts[2].args[1], /🟡 In progress · 🔴 Needs reply[\s\S]*picked up by @sita/);
   assert.ok(posts[1].args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:c:T-260917-AB2C:42'));
 });
@@ -601,9 +605,7 @@ test('/summary shows the queues, today, reply time, longest waiting, issues and 
   const [post] = messages(SUPPORT_CHAT);
   const text = post.args[1];
   assert.match(text, /support summary/);
-  assert.match(text, /🔴 Needs reply: <b>2<\/b>  \(🆕 1 not picked up yet\)/);
-  assert.match(text, /🟡 In progress: 3 · ⏳ Waiting for student: 2/);
-  assert.match(text, /✅ Closed: 12 · All tickets: 16/);
+  assert.match(text, /🔴 Needs reply: <b>2<\/b>\n🆕 Open \(not picked up\): 1\n🟡 In progress: 3\n⏳ Waiting for student: 2\n✅ Closed: 12\n📁 All tickets: 16/);
   assert.match(text, /Today: 4 opened · 2 closed/);
   assert.match(text, /average 1 h 35 min · median 40 min/);
   assert.match(text, /Longest waiting: Asha — <b>3 h 5 min<\/b>/);
@@ -795,8 +797,8 @@ test('✍️ Reply asks for an answer that is then delivered like any other repl
 test('🎟 Pass status shows every group the student holds', async () => {
   const { deliver, messages } = makeBot();
   await deliver(adminTap('adm:p:T-260917-AB2C:42'));
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Pass & payment<\/b>[\s\S]*valid until 30-11-2099 · <b>NOT in the group/);
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Suggested:<\/b> Pass is valid but they are not in/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Pass & payment<\/b>[\s\S]*Valid until 30-11-2099 · <b>not in the group/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Next step:<\/b> Pass is valid but they are not in/);
 });
 
 test('📜 Full history posts the whole conversation, or explains when it is missing', async () => {
@@ -805,7 +807,7 @@ test('📜 Full history posts the whole conversation, or explains when it is mis
     conversation: '[17-09-2026, 10:12:03 AM IST] Asha:\nfirst <message>'
   } }) });
   await found.deliver(adminTap('adm:h:T-260917-AB2C:42'));
-  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /History<\/b> · 🟡 In progress[\s\S]*first &lt;message&gt;/);
+  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /History<\/b>\n<b>Status:<\/b> 🟡 In progress[\s\S]*first &lt;message&gt;/);
 
   const missing = makeBot({ sheet: fakeSheet({ getTicket: null }) });
   await missing.deliver(adminTap('adm:h:T-260917-AB2C:42'));
@@ -983,7 +985,7 @@ test('a student already in the group gets a different suggestion than one outsid
     text: support.promptLine(support.categoryById('invite')) };
   const inside = makeBot({ memberStatus: 'member' });
   await inside.deliver(privateMessage('cannot see posts', { reply_to_message: prompt }));
-  assert.match(inside.messages(SUPPORT_CHAT)[0].args[1], /in the group[\s\S]*already in the group → ask what exactly they see/);
+  assert.match(inside.messages(SUPPORT_CHAT)[0].args[1], /in the group[\s\S]*already in UPSC Prelims → ask what exactly they see/);
 });
 
 test('a ticket that mentions a payment id gets a Check payment button', async () => {
@@ -1257,4 +1259,185 @@ test('/statusx is not mistaken for /status', async () => {
   const { deliver } = makeBot({ sheet });
   await deliver(privateMessage('/statusx'));
   assert.equal(sheet.calls.filter((c) => c.name === 'getSubscriber').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Bots that sell two groups: which group a ticket is about
+// ---------------------------------------------------------------------------
+
+const NEWS_ENV = {
+  SHEET_URL_APPSC_NEWS_EN: 'https://script.google.com/macros/s/test-en/exec',
+  SHEET_TOKEN_APPSC_NEWS_EN: 'token-en',
+  TELEGRAM_GROUP_APPSC_NEWS_EN: '-1001111111111',
+  SHEET_URL_APPSC_NEWS_TE: 'https://script.google.com/macros/s/test-te/exec',
+  SHEET_TOKEN_APPSC_NEWS_TE: 'token-te',
+  TELEGRAM_GROUP_APPSC_NEWS_TE: '-1002222222222',
+  TELEGRAM_PAYBOT_NEWS: '456:TEST',
+  SUPPORT_CHAT_NEWS: SUPPORT_CHAT
+};
+
+/**
+ * A bot for the two newspaper groups. `sheetsById` gives each group its own
+ * sheet; tickets live in the first (English) one.
+ */
+async function withNewsBot(sheetsById, fn, { memberStatus = 'member' } = {}) {
+  const saved = {};
+  Object.keys(NEWS_ENV).forEach((key) => { saved[key] = process.env[key]; process.env[key] = NEWS_ENV[key]; });
+  const originalForGroup = sheets.forGroup;
+  sheets.forGroup = (id) => sheetsById[id] || fakeSheet();
+  try {
+    const app = createPaymentBot({ payBotEnv: 'TELEGRAM_PAYBOT_NEWS', polling: false });
+    const sent = [];
+    let nextId = 5000;
+    const record = (method) => async (...args) => {
+      sent.push({ method, args });
+      return { message_id: nextId++, chat: { id: args[0] } };
+    };
+    ['sendMessage', 'copyMessage', 'answerCallbackQuery', 'editMessageReplyMarkup', 'editMessageText', 'deleteMessage']
+      .forEach((method) => { app.bot[method] = record(method); });
+    app.bot.getMe = async () => NEWS_BOT;
+    app.bot.getChatMember = async () => ({ status: memberStatus });
+    const deliver = async (update) => {
+      app.bot.processUpdate(Object.assign({ update_id: nextId++ }, update));
+      await app.settle();
+    };
+    const messages = (chatId) => sent.filter((s) => s.method === 'sendMessage' && String(s.args[0]) === String(chatId));
+    await fn({ app, sent, deliver, messages });
+  } finally {
+    sheets.forGroup = originalForGroup;
+    Object.keys(saved).forEach((key) => {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    });
+  }
+}
+
+const NEWS_BOT = { id: 456, is_bot: true, first_name: 'News bot', username: 'news_pay_bot' };
+const PASS = { status: 'active', expiry_date: '30-11-2099, 11:59:59 PM IST', plan_label: 'Target 2026 Pass', total_paid: 199, payment_id: 'pay_ENGLISHPASS001' };
+
+test('with two groups, "I still need help" asks which group, and the prompt carries it', async () => {
+  const en = fakeSheet();
+  await withNewsBot({ appsc_news_en: en, appsc_news_te: fakeSheet() }, async ({ deliver, messages }) => {
+    await deliver(tap('sup:ask:payment'));
+    const [choice] = messages(STUDENT.id);
+    assert.match(choice.args[1], /Which group is this about/);
+    const buttons = choice.args[2].reply_markup.inline_keyboard.flat();
+    assert.deepEqual(buttons.map((b) => b.text), ['Newspaper · English', 'Newspaper · Telugu', 'Both / not sure']);
+    assert.deepEqual(buttons.map((b) => b.callback_data), ['sup:grp:payment:0', 'sup:grp:payment:1', 'sup:grp:payment:x']);
+
+    await deliver(tap('sup:grp:payment:1'));
+    const prompt = messages(STUDENT.id).at(-1);
+    assert.equal(support.parsePrompt(prompt.args[1]).id, 'payment');
+    assert.equal(support.parsePromptGroup(prompt.args[1]), 'Newspaper · Telugu');
+  });
+});
+
+test('a ticket about a chosen group is stored with it, and admins see which pass is the ticket\'s', async () => {
+  const en = fakeSheet({ getSubscriber: PASS });
+  const te = fakeSheet({ getSubscriber: Object.assign({}, PASS, { payment_id: 'pay_TELUGUPASS0001' }) });
+  await withNewsBot({ appsc_news_en: en, appsc_news_te: te }, async ({ deliver, messages }) => {
+    const prompt = { message_id: 700, from: NEWS_BOT, chat: { id: STUDENT.id, type: 'private' },
+      text: support.promptLine(support.categoryById('invite'), 'Newspaper · Telugu') };
+    await deliver(privateMessage('cannot see the posts', { reply_to_message: prompt }));
+
+    const created = en.calls.find((c) => c.name === 'createTicket').args[0];
+    assert.equal(created.group, 'appsc_news_te');
+    assert.ok(!en.calls.some((c) => c.name === 'setTicketGroup'), 'a chosen group needs no second write');
+
+    const card = messages(SUPPORT_CHAT)[0].args[1];
+    assert.match(card, /<b>Group:<\/b> Newspaper · Telugu\n/);
+    assert.match(card, /<b>Newspaper · Telugu<\/b> · 📌 <i>this ticket<\/i>/);
+    assert.ok(!/<b>Newspaper · English<\/b> · 📌/.test(card), 'only the ticket\'s group is marked');
+    assert.match(card, /Next step:<\/b> Pass is valid and they are already in Newspaper · Telugu →/);
+
+    const confirmation = messages(STUDENT.id).at(-1).args[1];
+    assert.match(confirmation, /<b>Group:<\/b> Newspaper · Telugu/);
+  });
+});
+
+test('a ticket with no group chosen is filed under the only group the student holds a pass in', async () => {
+  const en = fakeSheet({ getSubscriber: null });
+  const te = fakeSheet({ getSubscriber: PASS });
+  await withNewsBot({ appsc_news_en: en, appsc_news_te: te }, async ({ deliver, messages }) => {
+    const prompt = { message_id: 701, from: NEWS_BOT, chat: { id: STUDENT.id, type: 'private' },
+      text: support.promptLine(support.categoryById('invite')) };
+    await deliver(privateMessage('link does not open', { reply_to_message: prompt }));
+
+    assert.equal(en.calls.find((c) => c.name === 'createTicket').args[0].group, '');
+    const set = en.calls.find((c) => c.name === 'setTicketGroup');
+    assert.ok(set, 'the guessed group should be recorded');
+    assert.equal(set.args[1], 'appsc_news_te');
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /<b>Group:<\/b> Newspaper · Telugu <i>\(not chosen — their only pass\)<\/i>/);
+  });
+});
+
+test('a group whose sheet cannot be read says so instead of "no pass", and the next step says to retry', async () => {
+  const en = fakeSheet({ getSubscriber: () => { throw new Error('Google Sheets request timed out after 30s'); } });
+  const te = fakeSheet({ getSubscriber: null });
+  await withNewsBot({ appsc_news_en: en, appsc_news_te: te }, async ({ deliver, messages }) => {
+    const prompt = { message_id: 702, from: NEWS_BOT, chat: { id: STUDENT.id, type: 'private' },
+      text: support.promptLine(support.categoryById('payment'), 'Newspaper · English') };
+    await deliver(privateMessage('paid yesterday', { reply_to_message: prompt }));
+    const card = messages(SUPPORT_CHAT)[0].args[1];
+    assert.match(card, /⚠️ <b>Newspaper · English<\/b>[\s\S]*took too long to answer/);
+    assert.match(card, /➖ <b>Newspaper · Telugu<\/b>\n\s+No pass/);
+    assert.match(card, /Next step:<\/b> Could not read Newspaper · English just now/);
+  });
+});
+
+test('/find pay_… shows Razorpay, which group recorded it, and the student\'s tickets with their buttons', async () => {
+  const en = fakeSheet({
+    listTickets: { total: 1, tickets: [{ ticket_id: 'T-260917-AB2C', telegram_id: '42', status: 'open', waiting_on: 'admin',
+      category: 'payment', group: 'appsc_news_te', updated_at: '17-09-2026, 06:48:00 PM IST' }], counts: {} }
+  });
+  const te = fakeSheet({ findPayment: { telegram_id: '42' } });
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900, method: 'upi',
+    created_at: 1789000000, notes: { telegram_id: '42' } }, async () => {
+    await withNewsBot({ appsc_news_en: en, appsc_news_te: te }, async ({ deliver, messages }) => {
+      await deliver(supportChatMessage('/find pay_TZ8ciB8Yng8WE3'));
+      const [post] = messages(SUPPORT_CHAT);
+      const text = post.args[1];
+      assert.match(text, /captured — the money was received/);
+      assert.match(text, /Belongs to:<\/b> the checkout of Telegram id <code>42<\/code>/);
+      assert.match(text, /Recorded in <b>Newspaper · Telugu<\/b> for Telegram id <code>42<\/code>/);
+      assert.match(text, /<code>T-260917-AB2C<\/code> · 🆕 Open · 🔴 Needs reply\n\s+Paid, but no invite link · Newspaper · Telugu/);
+      const buttons = post.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+      assert.ok(buttons.includes('adm:g:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'), 'a captured payment offers Grant');
+      assert.ok(buttons.includes('adm:r:T-260917-AB2C:42'));
+
+      // Pasting the id without a command does the same.
+      await deliver(supportChatMessage('student says pay_TZ8ciB8Yng8WE3 is theirs'));
+      assert.match(messages(SUPPORT_CHAT).at(-1).args[1], /Recorded in <b>Newspaper · Telugu/);
+    });
+  });
+});
+
+test('/find warns when a captured payment is recorded nowhere', async () => {
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900, created_at: 1789000000, notes: {} }, async () => {
+    const { deliver, messages } = makeBot();
+    await deliver(supportChatMessage('/find pay_TZ8ciB8Yng8WE3'));
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /Not recorded in any group/);
+  });
+});
+
+test('/find with no argument explains itself; a ticket id posts that ticket', async () => {
+  const sheet = fakeSheet({ getTicket: { ticket_id: 'T-260917-AB2C', telegram_id: '42', status: 'in_progress',
+    waiting_on: 'student', category: 'coupon', last_message: 'code SAVE50 fails', updated_at: 'x', conversation: '' } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(supportChatMessage('/find'));
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Usage/);
+  await deliver(supportChatMessage('/find t-260917-ab2c'));
+  const card = messages(SUPPORT_CHAT)[1];
+  assert.deepEqual(support.parseTicketHeader(card.args[1]), { ticketId: 'T-260917-AB2C', telegramId: '42' });
+  assert.match(card.args[1], /Coupon code not working[\s\S]*code SAVE50 fails/);
+});
+
+test('every ticket post has a Summary button that posts the summary', async () => {
+  const sheet = fakeSheet({ getSupportStats: SAMPLE_STATS });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(adminTap('adm:p:T-260917-AB2C:42'));
+  const buttons = messages(SUPPORT_CHAT)[0].args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(buttons.includes('sum:show'));
+  await deliver(adminTap('sum:show'));
+  assert.match(messages(SUPPORT_CHAT).at(-1).args[1], /support summary/);
 });

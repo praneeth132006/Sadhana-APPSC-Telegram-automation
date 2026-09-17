@@ -39,6 +39,10 @@ test('a support prompt names its category, and an unknown label falls back to ot
   assert.equal(support.parsePrompt(support.promptLine(payment) + '\n\nDescribe the problem').id, 'payment');
   assert.equal(support.parsePrompt('📨 Support request · Not a real category').id, 'other');
   assert.equal(support.parsePrompt('some other message'), null);
+  const withGroup = support.promptLine(payment, 'Newspaper · Telugu');
+  assert.equal(support.parsePrompt(withGroup).id, 'payment');
+  assert.equal(support.parsePromptGroup(withGroup + '\n\nDescribe'), 'Newspaper · Telugu');
+  assert.equal(support.parsePromptGroup(support.promptLine(payment)), '');
 });
 
 test('replies to the confirmation and to an admin answer both find the ticket', () => {

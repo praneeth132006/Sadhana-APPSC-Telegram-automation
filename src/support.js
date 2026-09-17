@@ -415,15 +415,31 @@ const TICKET_ID_PATTERN = 'T-\\d{6}-[A-Z0-9]{4}';
 // Each is the FIRST line of a message the bot sends, matched with ^ so text a
 // student typed further down can never pass for one.
 
-/** First line of the "describe your problem" prompt. */
-function promptLine(category) {
-  return `📨 Support request · ${category.label}`;
+/**
+ * First line of the "describe your problem" prompt. The group, when the
+ * student named one, follows an em dash — no category label contains one,
+ * while group names do contain " · ".
+ */
+function promptLine(category, groupName = '') {
+  return `📨 Support request · ${category.label}${groupName ? ` — ${groupName}` : ''}`;
 }
+
+const PROMPT_PATTERN = /^📨 Support request · (.+?)(?: — (.+))?$/m;
 
 /** The category a reply to a support prompt belongs to, or null. */
 function parsePrompt(text) {
-  const match = String(text || '').match(/^📨 Support request · (.+)/);
+  const match = firstLine(text).match(PROMPT_PATTERN);
   return match ? categoryByLabel(match[1]) : null;
+}
+
+/** The group name on a support prompt, or '' when the student did not pick one. */
+function parsePromptGroup(text) {
+  const match = firstLine(text).match(PROMPT_PATTERN);
+  return match && match[2] ? match[2].trim() : '';
+}
+
+function firstLine(text) {
+  return String(text || '').split('\n')[0];
 }
 
 /** First line of every ticket message in the admin support chat. */
@@ -431,9 +447,20 @@ function ticketHeader(ticketId, telegramId) {
   return `🎫 ${ticketId} · user ${telegramId}`;
 }
 
+/**
+ * The same first line as HTML. The code tags keep Telegram from turning the
+ * id into a phone-number link; the text, which is what gets parsed, is
+ * unchanged.
+ */
+function ticketHeaderHtml(ticketId, telegramId) {
+  return `🎫 <code>${esc(ticketId)}</code> · user <code>${esc(telegramId)}</code>`;
+}
+
 /** { ticketId, telegramId } from a ticket message in the support chat, or null. */
 function parseTicketHeader(text) {
-  const match = String(text || '').match(new RegExp(`^🎫 (${TICKET_ID_PATTERN}) · user (\\d+)`));
+  // A message's text never has tags; the HTML the bot sent does, and reads the same.
+  const plain = firstLine(text).replace(/<\/?code>/g, '');
+  const match = plain.match(new RegExp(`^🎫 (${TICKET_ID_PATTERN}) · user (\\d+)`));
   return match ? { ticketId: match[1], telegramId: match[2] } : null;
 }
 
@@ -446,6 +473,20 @@ function replyLine(ticketId) {
 function parseReplyLine(text) {
   const match = String(text || '').match(new RegExp(`^(?:💬 Support reply|📨 Ticket received) · (${TICKET_ID_PATTERN})`));
   return match ? match[1] : null;
+}
+
+/** An admin's words as the student reads them, from Telegram or the dashboard. */
+function studentReplyHtml(ticketId, text) {
+  return `${esc(replyLine(ticketId))}\n\n${esc(text)}\n\n` +
+    '<i>— Support Team</i>\n<i>To reply, just send a message here.</i>';
+}
+
+/** What a student is told when an admin closes their ticket. */
+function resolvedHtml(ticketId) {
+  return `${esc(replyLine(ticketId))}\n\n` +
+    '✅ <b>Your ticket has been marked as resolved.</b>\n\n' +
+    'If you still need help, just send a message here and we will pick it up again. ' +
+    'For a different problem, send /support.';
 }
 
 /** First line of the confirmation a student gets after raising a ticket. */
@@ -493,9 +534,10 @@ function adminKeyboard(ticketId, telegramId, { closed = false, paymentId = '' } 
   if (paymentId) rows.push([{ text: `🔍 Check payment ${paymentId}`, callback_data: data('k', paymentId) }]);
   rows.push([
     { text: '📜 History', callback_data: data('h') },
+    { text: '📊 Summary', callback_data: 'sum:show' },
     closed
       ? { text: '🔓 Reopen', callback_data: data('o') }
-      : { text: '✅ Close ticket', callback_data: data('c') }
+      : { text: '✅ Close', callback_data: data('c') }
   ]);
   return { inline_keyboard: rows };
 }
@@ -543,11 +585,22 @@ function parseAdminCallback(data) {
  * issue type and what the student actually holds.
  *
  * @param {string} category
- * @param {Array<{group: Object, eligible: boolean, subscriber: Object|null, inGroup: string, reason: string}>} passes
+ * @param {Array<{group: Object, eligible: boolean, subscriber: Object|null, inGroup: string, reason: string, error?: boolean}>} passes
  *   inGroup is 'yes' | 'no' | 'unknown'
+ * @param {string} [groupId] The group the ticket is about; only its pass is
+ *   considered when the student holds one there or it could not be read
  * @returns {string} Plain text
  */
-function suggestNextStep(category, passes = []) {
+function suggestNextStep(category, passes = [], groupId = '') {
+  const about = groupId ? passes.filter((p) => p.group.id === groupId) : [];
+  if (about.length && (about[0].subscriber || about[0].error)) passes = about;
+
+  const unreadable = passes.filter((p) => p.error);
+  if (unreadable.length && !passes.some((p) => p.subscriber)) {
+    return `Could not read ${unreadable.map((p) => p.group.shortName).join(', ')} just now → ` +
+      'tap "🎟 Pass & payment" to check again before replying.';
+  }
+
   const valid = passes.filter((p) => p.eligible);
   const outside = valid.filter((p) => p.inGroup === 'no');
   const expired = passes.filter((p) => p.subscriber && !p.eligible);
@@ -557,7 +610,8 @@ function suggestNextStep(category, passes = []) {
       'tap "🔗 Send new invite link".';
   }
   if (valid.length && valid.every((p) => p.inGroup === 'yes')) {
-    return 'Pass is valid and they are already in the group → ask what exactly they see (✍️ Write reply).';
+    return `Pass is valid and they are already in ${valid.map((p) => p.group.shortName).join(', ')} → ` +
+      'ask what exactly they see (✍️ Write reply).';
   }
   if (valid.length) {
     return 'Pass is valid → "🔗 Send new invite link" is safe to send.';
@@ -574,6 +628,32 @@ function suggestNextStep(category, passes = []) {
       '"📎 Ask for payment proof"), then 🔍 check it.';
   }
   return 'No pass on record → reply to find out more.';
+}
+
+/**
+ * inferTicketGroup — the group a ticket is most likely about when the student
+ * did not say: the only group they hold a pass in. '' when that is not clear.
+ */
+function inferTicketGroup(passes = []) {
+  const held = passes.filter((p) => p.subscriber);
+  return held.length === 1 ? held[0].group.id : '';
+}
+
+/** "06-10-2026, 12:25:53 AM IST" → "06-10-2026"; anything else unchanged. */
+function shortDate(stamp) {
+  const text = String(stamp || '').trim();
+  const match = text.match(/^(\d{2}-\d{2}-\d{4}),/);
+  return match ? match[1] : text;
+}
+
+/** What kind of attachment a message carries, for a one-line description. */
+function mediaKind(message) {
+  if (!message) return '';
+  if (message.photo) return 'photo';
+  if (message.video || message.video_note || message.animation) return 'video';
+  if (message.voice || message.audio) return 'voice message';
+  if (message.document) return 'file';
+  return '';
 }
 
 /** Where each "[time] who:" entry of a stored conversation starts. */
@@ -767,11 +847,19 @@ module.exports = {
   newTicketId,
   promptLine,
   parsePrompt,
+  parsePromptGroup,
   ticketHeader,
+  ticketHeaderHtml,
+  inferTicketGroup,
+  shortDate,
+  mediaKind,
   parseTicketHeader,
   replyLine,
   parseReplyLine,
   receivedLine,
+  studentReplyHtml,
+  resolvedHtml,
+  TICKET_ID_PATTERN,
   adminKeyboard,
   parseAdminCallback,
   earlierConversation,

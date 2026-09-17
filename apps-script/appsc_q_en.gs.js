@@ -10,7 +10,7 @@
 // Group id : appsc_q_en
 // Subjects : 16
 //            Ancient India, Medieval India, Modern India, AP History, Physical Geography, Indian Geography, AP Geography, Indian Economy, AP Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Indian Society, Disaster Management
-// Built    : 2026-09-17T12:47:40.489Z
+// Built    : 2026-09-17T13:40:42.417Z
 // ==========================================================================
 
 // ============================================================================
@@ -127,7 +127,7 @@ var RESERVED_SHEETS = [
 var SUPPORT_SHEET = 'Support';
 
 /**
- * Support ticket columns (A..U). Columns after L were added over time; a tab
+ * Support ticket columns (A..V). Columns after L were added over time; a tab
  * created before them is upgraded the first time it is opened (see
  * supportSheet), and its existing rows are filled in.
  */
@@ -152,7 +152,8 @@ var SUPPORT_HEADERS = [
   'Picked Up By',       // R  First admin to act on it (open → in_progress)
   'Picked Up At',       // S
   'First Reply At',     // T  First message an admin sent the student
-  'Times Reopened'      // U
+  'Times Reopened',     // U
+  'Group'               // V  Group id the ticket is about; blank when the student did not say
 ];
 
 /** Status values, in lifecycle order. "answered" is the old name for in_progress. */
@@ -724,6 +725,16 @@ function doPost(e) {
       return jsonResponse({
         success: true,
         data: setTicketStatus(payload.ticketId, payload.status, payload.handledBy)
+      });
+    }
+
+    if (action === 'setTicketGroup') {
+      if (!payload.ticketId) {
+        return jsonResponse({ success: false, error: 'Missing ticketId' });
+      }
+      return jsonResponse({
+        success: true,
+        data: setTicketGroup(payload.ticketId, payload.group, payload.handledBy)
       });
     }
 
@@ -2522,7 +2533,7 @@ function setupSubscriptionSheets() {
 // ============================================================================
 
 /** Column widths for the Support tab. */
-var SUPPORT_WIDTHS = [150, 170, 170, 120, 140, 170, 130, 110, 190, 320, 480, 180, 90, 170, 170, 180, 100, 180, 170, 170, 90];
+var SUPPORT_WIDTHS = [150, 170, 170, 120, 140, 170, 130, 110, 190, 320, 480, 180, 90, 170, 170, 180, 100, 180, 170, 170, 90, 150];
 
 /** Returns the Support tab, creating it — or upgrading an older one — as needed. */
 function supportSheet() {
@@ -2655,6 +2666,7 @@ function rowToTicket(row, rowNumber) {
     picked_up_at: String(row[18] || '').trim(),
     first_reply_at: String(row[19] || '').trim(),
     times_reopened: Number(row[20]) || 0,
+    group: String(row[21] || '').trim(),
     row_number: rowNumber
   };
 }
@@ -2711,7 +2723,7 @@ function writeSupportLog(ticketId, telegramId, who, role, action, details, statu
 var COL = {
   updatedAt: 3, status: 8, lastMessage: 10, conversation: 11, handledBy: 12, adminReplies: 13,
   lastAdminReplyAt: 14, closedAt: 15, closedBy: 16, waitingOn: 17, pickedUpBy: 18, pickedUpAt: 19,
-  firstReplyAt: 20, timesReopened: 21
+  firstReplyAt: 20, timesReopened: 21, group: 22
 };
 
 /**
@@ -2745,7 +2757,7 @@ function reopen(sheet, rowNumber, ticket, who, role, reason) {
  * admin starts (/msg) is already in_progress and waiting on the student.
  * The id is minted by the bot, so a retried delivery returns the existing row.
  *
- * @param {Object} data ticket_id, telegram_id, username, name, category, bot, message, [opened_by]
+ * @param {Object} data ticket_id, telegram_id, username, name, category, bot, message, [opened_by], [group]
  * @returns {Object} The stored ticket
  */
 function createTicket(data) {
@@ -2780,7 +2792,8 @@ function createTicket(data) {
       safeCell(openedBy),
       openedBy ? now : '',
       openedBy ? now : '',
-      0
+      0,
+      safeCell(String(data.group || ''))
     ];
     sheet.appendRow(row);
     var rowNumber = sheet.getLastRow();
@@ -2931,6 +2944,29 @@ function logTicketEvent(ticketId, who, role, action, details) {
   });
 }
 
+/**
+ * setTicketGroup — records which group a ticket is about, when the student
+ * did not say or picked the wrong one. The bot checks the id is one of its
+ * groups before calling this.
+ *
+ * @returns {Object|null} The ticket, or null when it does not exist
+ */
+function setTicketGroup(ticketId, group, handledBy) {
+  return withScriptLock(function () {
+    var sheet = supportSheet();
+    var rowNumber = findTicketRow(sheet, ticketId);
+    if (rowNumber === -1) return null;
+    var ticket = readTicketRow(sheet, rowNumber);
+    var value = String(group || '').replace(/[^a-z0-9_]/gi, '').slice(0, 40);
+    if (value === ticket.group) return ticket;
+    sheet.getRange(rowNumber, COL.group).setValue(value);
+    sheet.getRange(rowNumber, COL.updatedAt).setValue(istNow());
+    writeSupportLog(ticketId, ticket.telegram_id, handledBy || '', 'admin', 'group_changed',
+      (ticket.group || 'not specified') + ' → ' + (value || 'not specified'), ticket.status);
+    return readTicketRow(sheet, rowNumber);
+  });
+}
+
 /** Support Log rows for one ticket, oldest first, at most the newest 200. */
 function ticketLog(ticketId) {
   var ss = book();
@@ -2986,6 +3022,7 @@ function listTickets(params) {
   var waitingFilter = String(params.waitingOn || '').trim().toLowerCase();
   var search = String(params.search || '').trim().toLowerCase();
   var telegramId = String(params.telegramId || '').trim();
+  var groupFilter = String(params.group || '').trim();
   var page = clampInt(params.page, 1, 1, 100000);
   var pageSize = clampInt(params.pageSize, 50, 1, 200);
 
@@ -3001,9 +3038,10 @@ function listTickets(params) {
     if (statusFilter && ticket.status !== statusFilter) continue;
     if (waitingFilter && ticket.waiting_on !== waitingFilter) continue;
     if (telegramId && ticket.telegram_id !== telegramId) continue;
+    if (groupFilter && ticket.group !== groupFilter) continue;
     if (search) {
       var haystack = (ticket.ticket_id + ' ' + ticket.telegram_id + ' ' + ticket.username + ' ' +
-        ticket.name + ' ' + ticket.last_message).toLowerCase();
+        ticket.name + ' ' + ticket.group + ' ' + ticket.last_message).toLowerCase();
       if (haystack.indexOf(search) === -1) continue;
     }
     // The list never carries whole threads; getTicket does.
@@ -3069,6 +3107,7 @@ function getSupportStats(params) {
     oldest_needs_reply: null,
     not_picked_up: 0,
     by_category: {},
+    by_group: {},
     by_admin: {}
   };
 
@@ -3093,6 +3132,14 @@ function getSupportStats(params) {
       stats.by_category[category][t.status]++;
       stats.by_category[category].total++;
 
+      var groupKey = t.group || 'unspecified';
+      if (!stats.by_group[groupKey]) {
+        stats.by_group[groupKey] = { open: 0, in_progress: 0, closed: 0, needs_reply: 0, total: 0 };
+      }
+      stats.by_group[groupKey][t.status]++;
+      stats.by_group[groupKey].total++;
+      if (t.waiting_on === 'admin') stats.by_group[groupKey].needs_reply++;
+
       if (t.waiting_on === 'admin') {
         stats.counts.needs_reply++;
         var waitingSince = parseIstDate(t.updated_at);
@@ -3101,6 +3148,7 @@ function getSupportStats(params) {
             ticket_id: t.ticket_id,
             name: t.name || (t.username ? '@' + t.username : t.telegram_id),
             category: category,
+            group: t.group,
             since: t.updated_at,
             since_ms: waitingSince.getTime(),
             minutes: Math.max(0, Math.round((now - waitingSince.getTime()) / 60000))

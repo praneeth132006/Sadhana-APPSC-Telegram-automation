@@ -779,6 +779,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return name || String(user.id);
   }
 
+  /** One of this bot's groups by id, or null. */
+  function groupById(groupId) {
+  return groupId ? familyGroups().find((g) => g.id === groupId) || null : null;
+  }
+
   /** The line students see when tickets are switched off or cannot be raised. */
   function contactLine(settings) {
   return settings.support_contact ? `\n\nYou can also reach us at ${esc(settings.support_contact)}.` : '';
@@ -817,8 +822,28 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     });
   }
 
+  /**
+   * Asks which group a problem is about, when this bot sells more than one.
+   * A student can hold passes for both, and "which group" decides what an
+   * admin checks.
+   */
+  async function sendGroupChoice(chatId, category) {
+  const groups = familyGroups();
+  await bot.sendMessage(chatId,
+    `${esc(category.emoji)} <b>${esc(category.label)}</b>\n\nWhich group is this about?`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          ...groups.map((group, index) => ([{ text: group.shortName, callback_data: `sup:grp:${category.id}:${index}` }])),
+          [{ text: 'Both / not sure', callback_data: `sup:grp:${category.id}:x` }]
+        ]
+      }
+    });
+  }
+
   /** Asks the student to describe the problem, as a message they reply to. */
-  async function sendSupportPrompt(chatId, category) {
+  async function sendSupportPrompt(chatId, category, groupName = '') {
   const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
   if (!support.ticketsEnabled(settings)) {
     await bot.sendMessage(chatId,
@@ -827,9 +852,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
   await bot.sendMessage(chatId,
-    `${esc(support.promptLine(category))}\n\n` +
-    'Describe the problem in one message. If it is about a payment, include the payment ID or ' +
-    'attach a screenshot.\n\n<i>Reply to this message.</i>',
+    `${esc(support.promptLine(category, groupName))}\n\n` +
+    'Please describe the problem in one message.\n' +
+    (['payment', 'payment_failed'].includes(category.id)
+      ? 'Include your payment ID (it starts with <code>pay_</code>) or attach a screenshot of the payment.\n'
+      : 'A screenshot helps if something looks wrong.\n') +
+    '\n<i>Reply to this message.</i>',
     {
       parse_mode: 'HTML',
       reply_markup: { force_reply: true, input_field_placeholder: 'Describe your issue' }
@@ -892,31 +920,52 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return passes;
   }
 
-  /** A student's passes, one bullet per group, for the support chat. */
-  function passLines(passes) {
-  if (!passes || !passes.length) return '• No groups found for this bot';
-  return passes.map((p) => {
-    const name = esc(p.group.shortName);
-    if (p.error) return `• <b>${name}</b>: ⚠️ ${esc(p.reason)}`;
-    if (!p.subscriber) return `• <b>${name}</b>: no pass on record`;
+  /** A sheet error in words an admin can act on. */
+  function readableError(reason) {
+  const text = String(reason || '');
+  if (/timed out/i.test(text)) return 'could not check — the sheet took too long to answer. Tap 🎟 Pass & payment to retry.';
+  return `could not check — ${text.replace(/^could not read the sheet \((.*)\)$/, '$1')}`;
+  }
+
+  /**
+   * A student's passes, one block per group, for the support chat. The group
+   * the ticket is about is marked, so a student in both groups is not
+   * confused with the other one.
+   */
+  function passLines(passes, groupId = '') {
+  if (!passes || !passes.length) return 'No groups found for this bot.';
+  const ordered = passes.slice().sort((a, b) => Number(b.group.id === groupId) - Number(a.group.id === groupId));
+  return ordered.map((p) => {
+    const marker = groupId && p.group.id === groupId && passes.length > 1 ? ' · 📌 <i>this ticket</i>' : '';
+    const name = `<b>${esc(p.group.shortName)}</b>${marker}`;
+    if (p.error) return `⚠️ ${name}\n      ${esc(readableError(p.reason))}`;
+    if (!p.subscriber) return `➖ ${name}\n      No pass`;
     const sub = p.subscriber;
-    const state = p.eligible ? `✅ valid until ${esc(sub.expiry_date)}` : `⛔ ${esc(p.reason)}`;
     const where = p.inGroup === 'yes' ? 'in the group'
-      : p.inGroup === 'no' ? '<b>NOT in the group</b>' : 'group membership unknown';
-    const details = [
+      : p.inGroup === 'no' ? '<b>not in the group</b>' : 'membership unknown';
+    const state = p.eligible
+      ? `Valid until ${esc(support.shortDate(sub.expiry_date))} · ${where}`
+      : `<b>Not valid</b> — ${esc(p.reason)} · ${where}`;
+    const paid = [
       sub.plan_label || sub.plan,
-      sub.total_paid ? `paid ₹${sub.total_paid}` : '',
-      sub.payment_id ? sub.payment_id : '',
-      sub.last_payment_at ? `last payment ${sub.last_payment_at}` : ''
-    ].filter(Boolean).map(esc).join(' · ');
-    return `• <b>${name}</b>: ${state} · ${where}` + (details ? `\n   ${details}` : '');
+      sub.total_paid ? `₹${sub.total_paid}` + (sub.last_payment_at ? ` on ${support.shortDate(sub.last_payment_at)}` : '') : ''
+    ].filter(Boolean).map(esc);
+    if (sub.payment_id) paid.push(`<code>${esc(sub.payment_id)}</code>`);
+    return `${p.eligible ? '✅' : '⛔'} ${name}\n      ${state}` + (paid.length ? `\n      ${paid.join(' · ')}` : '');
   }).join('\n');
+  }
+
+  /** "Newspaper · English", or why there is no group. */
+  function groupLine(groupId, how) {
+  const group = groupById(groupId);
+  if (group) return esc(group.shortName) + (how === 'guessed' ? ' <i>(not chosen — their only pass)</i>' : '');
+  return familyGroups().length > 1 ? '<i>Not specified</i>' : '—';
   }
 
   /** Posts one message about a ticket into the support chat, with the admin buttons. */
   async function postToAdmins(chat, ticketId, telegramId, html, { closed = false, paymentId = '', extra = {} } = {}) {
   return bot.sendMessage(chat.chatId,
-    `${support.ticketHeader(ticketId, telegramId)}\n${html}`,
+    `${support.ticketHeaderHtml(ticketId, telegramId)}\n${html}`,
     supportChatOptions(chat, Object.assign({
       reply_markup: support.adminKeyboard(ticketId, telegramId, { closed, paymentId })
     }, extra)));
@@ -936,43 +985,49 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
   }
 
-  const DIVIDER = '━━━━━━━━━━━━━━';
-
   /**
    * notifyAdmins — posts a new ticket, or a student's reply to one, into the
-   * support chat as a complete case file: who, what they hold, what they
-   * wrote, what to do next, and buttons to do it.
+   * support chat as a complete case file: who, which group, what they hold,
+   * what they wrote, what to do next, and buttons to do it.
    *
    * @returns {Promise<boolean>} true when the admins were reached
    */
-  async function notifyAdmins({ ticketId, user, category, text, passes, source, followUp, conversation, status, reopened }) {
+  async function notifyAdmins({ ticketId, user, category, groupId, groupHow, text, passes, source, followUp, conversation, status, reopened }) {
   const chat = supportChat();
   if (!chat) return false;
 
   // Telegram refuses anything over 4096 characters, and a refused post is a
   // ticket nobody sees. The full text is always in the sheet and 📜 History.
-  const body = String(text || '(attachment below)');
-  const shown = body.length > 2000 ? body.slice(0, 2000) + '… (cut short — tap 📜 History)' : body;
+  const kind = support.mediaKind(source);
+  const body = String(text || '');
+  const shown = body.length > 1800 ? body.slice(0, 1800) + '… (cut short — tap 📜 History)' : body;
   const paymentId = support.findPaymentId(body) || support.findPaymentId(conversation);
+  const message = [
+    shown ? `<blockquote>${esc(shown)}</blockquote>` : '',
+    kind ? `📎 <i>Sent a ${esc(kind)} — it is posted just below.</i>` : ''
+  ].filter(Boolean).join('\n') || '<i>(empty message)</i>';
 
   const lines = [];
   if (followUp) {
-    lines.push(reopened
-      ? `🔁 <b>STUDENT WROTE ON A CLOSED TICKET — REOPENED</b> · ${esc(displayUser(user))}`
-      : `↩️ <b>STUDENT REPLIED</b> · ${esc(displayUser(user))}`);
-    lines.push(`Status: ${support.statusLine(status || 'open', 'admin')}`);
+    lines.push((reopened ? '🔁 <b>Reopened — the student wrote on a closed ticket</b>' : '↩️ <b>Student replied</b>'));
+    lines.push(`<b>Status:</b> ${support.statusLine(status || 'open', 'admin')}`);
+    lines.push('');
+    lines.push(`<b>Student:</b> ${esc(displayUser(user))}`);
+    if (category) lines.push(`<b>Issue:</b> ${esc(category.emoji)} ${esc(category.label)}`);
+    if (familyGroups().length > 1) lines.push(`<b>Group:</b> ${groupLine(groupId)}`);
+    lines.push('', '💬 <b>New message</b>', message);
     const earlier = support.earlierConversation(conversation, 1200);
-    if (earlier) lines.push('', '📜 <b>Earlier in this ticket</b>', `<blockquote>${esc(earlier)}</blockquote>`);
-    lines.push('💬 <b>New message</b>', `<blockquote>${esc(shown)}</blockquote>`);
+    if (earlier) lines.push('', '📜 <b>Earlier in this ticket</b>', `<blockquote expandable>${esc(earlier)}</blockquote>`);
   } else {
-    lines.push(`🆕 <b>NEW TICKET</b> · ${esc(category.emoji)} ${esc(category.label)}`);
-    lines.push(`Status: ${support.statusLine('open', 'admin')}`);
-    lines.push(DIVIDER);
-    lines.push(`👤 <b>Student:</b> ${esc(displayUser(user))} · <code>${esc(user.id)}</code>`);
-    lines.push('🎟 <b>Passes</b>', passLines(passes));
-    lines.push(DIVIDER);
-    lines.push('💬 <b>What they wrote</b>', `<blockquote>${esc(shown)}</blockquote>`);
-    lines.push(`🧭 <b>Suggested:</b> ${esc(support.suggestNextStep(category.id, passes))}`);
+    lines.push('🆕 <b>New ticket</b>');
+    lines.push(`<b>Status:</b> ${support.statusLine('open', 'admin')}`);
+    lines.push('');
+    lines.push(`<b>Student:</b> ${esc(displayUser(user))}`);
+    lines.push(`<b>Issue:</b> ${esc(category.emoji)} ${esc(category.label)}`);
+    lines.push(`<b>Group:</b> ${groupLine(groupId, groupHow)}`);
+    lines.push('', '💬 <b>Message</b>', message);
+    lines.push('', '🎟 <b>Access</b>', passLines(passes, groupId));
+    lines.push('', `🧭 <b>Next step:</b> ${esc(support.suggestNextStep(category.id, passes, groupId))}`);
   }
 
   try {
@@ -984,8 +1039,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   if (source && support.hasMedia(source)) {
     try {
-      const caption = `${support.ticketHeader(ticketId, user.id)}\n${support.messageText(source)}`.slice(0, 1000);
-      const options = supportChatOptions(chat, { caption });
+      const caption = `${support.ticketHeader(ticketId, user.id)}\n📎 From ${displayUser(user)}` +
+        (support.messageText(source) ? `:\n${support.messageText(source)}` : '');
+      const options = supportChatOptions(chat, { caption: caption.slice(0, 1000) });
       delete options.parse_mode;
       delete options.disable_web_page_preview;
       await bot.copyMessage(chat.chatId, source.chat.id, source.message_id, options);
@@ -1024,7 +1080,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * The sheet and the support chat are written independently, so either one
    * being down still leaves the ticket somewhere an admin will see it.
    */
-  async function openTicket(source, category, user) {
+  async function openTicket(source, category, user, groupName = '') {
   const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
   if (!support.ticketsEnabled(settings)) {
     await bot.sendMessage(user.id,
@@ -1046,6 +1102,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   const ticketId = support.newTicketId();
+  const groups = familyGroups();
+  // The group the student picked, or the only one this bot sells.
+  const chosen = groups.length === 1 ? groups[0] : groups.find((g) => g.shortName === groupName) || null;
   const [saved, passes] = await Promise.all([
     Promise.resolve().then(() => sheetFor(primaryGroup().id).createTicket({
       ticket_id: ticketId,
@@ -1054,7 +1113,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       name: [user.first_name, user.last_name].filter(Boolean).join(' '),
       category: category.id,
       bot: payBotEnv,
-      message: text || '(attachment)'
+      message: text || `(${support.mediaKind(source) || 'attachment'})`,
+      group: chosen ? chosen.id : ''
     })).then(() => true, (err) => {
       console.error(`[support] ${payBotEnv}: could not record ticket ${ticketId} — ${err.message}`);
       return false;
@@ -1062,7 +1122,21 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     studentSnapshot(user.id)
   ]);
 
-  const delivered = await notifyAdmins({ ticketId, user, category, text, passes, source });
+  // Not chosen: when they hold a pass in only one group, that is almost
+  // certainly the one, and it is recorded so the dashboard can say so.
+  let groupId = chosen ? chosen.id : '';
+  let groupHow = chosen ? 'chosen' : '';
+  if (!chosen) {
+    groupId = support.inferTicketGroup(passes);
+    if (groupId) {
+      groupHow = 'guessed';
+      if (saved) {
+        await attempt(() => sheetFor(primaryGroup().id).setTicketGroup(ticketId, groupId, ''), SUPPORT_SETTINGS_WAIT_MS, null);
+      }
+    }
+  }
+
+  const delivered = await notifyAdmins({ ticketId, user, category, groupId, groupHow, text, passes, source });
 
   if (!saved && !delivered) {
     await bot.sendMessage(user.id,
@@ -1071,11 +1145,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
 
+  const aboutGroup = groupById(groupId);
   await bot.sendMessage(user.id,
     `${esc(support.receivedLine(ticketId))}\n\n` +
-    `Thanks — an admin will reply <b>${esc(settings.support_response_time)}</b>, right here in this chat.\n` +
-    `Support hours: ${esc(settings.support_hours)}\n\n` +
-    '<i>To add more details, just send another message.</i>',
+    '✅ <b>Your ticket has been created.</b>\n\n' +
+    `<b>Issue:</b> ${esc(category.label)}\n` +
+    (groups.length > 1 && groupHow === 'chosen' && aboutGroup ? `<b>Group:</b> ${esc(aboutGroup.shortName)}\n` : '') +
+    '<b>Status:</b> Open — waiting for our team\n\n' +
+    `Our team will reply <b>${esc(settings.support_response_time)}</b>, right here in this chat.\n` +
+    `<b>Support hours:</b> ${esc(settings.support_hours)}\n\n` +
+    '<i>Need to add something? Just send another message and it will be added to this ticket.</i>',
     { parse_mode: 'HTML' });
   }
 
@@ -1099,7 +1178,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   try {
     ticket = await sheetFor(primaryGroup().id).appendTicketMessage(ticketId, {
       author: displayUser(user),
-      text: text || '(attachment)'
+      text: text || `(${support.mediaKind(source) || 'attachment'})`
     });
     saved = Boolean(ticket);
   } catch (err) {
@@ -1108,6 +1187,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   const delivered = await notifyAdmins({
     ticketId, user, text, source, followUp: true,
+    category: ticket && ticket.category ? support.categoryById(ticket.category) : null,
+    groupId: ticket ? ticket.group : '',
     conversation: ticket && ticket.conversation,
     status: ticket ? ticket.status : 'open',
     reopened: Boolean((ticket && ticket.reopened) || options.wasClosed)
@@ -1121,8 +1202,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   await bot.sendMessage(user.id,
     `${esc(support.receivedLine(ticketId))}\n\n` +
     ((ticket && ticket.reopened) || options.wasClosed
-      ? 'Your earlier ticket has been reopened and an admin will reply here.\n\n'
-      : 'Added to your ticket. An admin will reply here.\n\n') +
+      ? '🔁 <b>Your earlier ticket has been reopened.</b> Our team will reply here.\n\n'
+      : '✅ <b>Added to your ticket.</b> Our team will reply here.\n\n') +
     '<i>Different problem? Send /support to open a new ticket.</i>',
     { parse_mode: 'HTML' });
   }
@@ -1245,20 +1326,25 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }[payment.status] || esc(payment.status);
 
   const notes = payment.notes || {};
-  const owner = notes.telegram_id
-    ? (String(notes.telegram_id) === String(telegramId)
-      ? '✅ made from this student\'s checkout'
-      : `⚠️ made from the checkout of Telegram id <code>${esc(notes.telegram_id)}</code>, not this student`)
-    : 'no Telegram id on the payment itself — compare the time and amount with what the student says';
+  let owner;
+  if (!notes.telegram_id) {
+    owner = 'no Telegram id on the payment itself — compare the time and amount with what the student says';
+  } else if (!telegramId) {
+    owner = `the checkout of Telegram id <code>${esc(notes.telegram_id)}</code>`;
+  } else if (String(notes.telegram_id) === String(telegramId)) {
+    owner = '✅ made from this student\'s checkout';
+  } else {
+    owner = `⚠️ made from the checkout of Telegram id <code>${esc(notes.telegram_id)}</code>, not this student`;
+  }
 
   const lines = [
-    `🔍 <b>Payment <code>${esc(payment.id || paymentId)}</code></b>`,
-    `Status: ${meaning}`,
-    `Amount: <b>${rupeesOf(payment.amount)}</b>${payment.method ? ` · ${esc(payment.method)}` : ''}`,
-    `Made at: ${esc(istFromUnix(payment.created_at))}`,
-    payment.description ? `For: ${esc(payment.description)}` : '',
-    `Belongs to: ${owner}`,
-    payment.error_description ? `Bank said: ${esc(payment.error_description)}` : ''
+    `🔍 <b>Payment <code>${esc(payment.id || paymentId)}</code></b>\n`,
+    `<b>Status:</b> ${meaning}`,
+    `<b>Amount:</b> ${rupeesOf(payment.amount)}${payment.method ? ` · ${esc(payment.method)}` : ''}`,
+    `<b>Made at:</b> ${esc(istFromUnix(payment.created_at))}`,
+    payment.description ? `<b>For:</b> ${esc(payment.description)}` : '',
+    `<b>Belongs to:</b> ${owner}`,
+    payment.error_description ? `<b>Bank said:</b> ${esc(payment.error_description)}` : ''
   ].filter(Boolean);
 
   return { found: true, payment, captured: payment.status === 'captured', html: lines.join('\n') };
@@ -1294,7 +1380,18 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   if (action === 'ask') {
     await ack();
-    await sendSupportPrompt(user.id, support.categoryById(arg));
+    const category = support.categoryById(arg);
+    if (familyGroups().length > 1) await sendGroupChoice(user.id, category);
+    else await sendSupportPrompt(user.id, category);
+    return;
+  }
+
+  // sup:grp:<category>:<group index | x>
+  if (action === 'grp') {
+    await ack();
+    const index = data.split(':')[3];
+    const group = /^\d+$/.test(index) ? familyGroups()[Number(index)] : null;
+    await sendSupportPrompt(user.id, support.categoryById(arg), group ? group.shortName : '');
     return;
   }
 
@@ -1360,11 +1457,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const alreadyClosed = status === 'closed' && saved && saved.previous_status === 'closed';
   if (status === 'closed' && !alreadyClosed) {
     try {
-      await bot.sendMessage(ticket.telegramId,
-        `${esc(support.replyLine(ticket.ticketId))}\n\n` +
-        '✅ This ticket has been marked as resolved. If you still need help, just send another message ' +
-        'or /support.',
-        { parse_mode: 'HTML' });
+      await bot.sendMessage(ticket.telegramId, support.resolvedHtml(ticket.ticketId), { parse_mode: 'HTML' });
     } catch (err) {
       // Blocked the bot; the ticket is closed either way.
     }
@@ -1391,10 +1484,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    */
   async function sendAdminAnswer(ticketId, telegramId, text, admin, { logAction } = {}) {
   try {
-    await bot.sendMessage(telegramId,
-      `${esc(support.replyLine(ticketId))}\n\n${esc(text)}\n\n` +
-      '<i>You can reply here, or just send another message.</i>',
-      { parse_mode: 'HTML' });
+    await bot.sendMessage(telegramId, support.studentReplyHtml(ticketId, text), { parse_mode: 'HTML' });
   } catch (err) {
     return { delivered: false, error: err.message };
   }
@@ -1435,7 +1525,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (action === 'reply') {
     await ack();
     await bot.sendMessage(chat.chatId,
-      `${support.ticketHeader(ticketId, telegramId)}\n` +
+      `${support.ticketHeaderHtml(ticketId, telegramId)}\n` +
       `✍️ ${esc(admin)}, type your answer as a <b>reply to this message</b>. It goes straight to the student.`,
       supportChatOptions(chat, Object.assign({
         reply_markup: { force_reply: true, input_field_placeholder: `Answer for ${ticketId}` }
@@ -1452,7 +1542,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       return `<b>${esc(reply.button)}</b>\n<i>${esc(text.length > 110 ? text.slice(0, 110) + '…' : text)}</i>`;
     });
     await bot.sendMessage(chat.chatId,
-      `${support.ticketHeader(ticketId, telegramId)}\n📋 <b>Quick replies</b> — tap one to send it to the student now:\n\n` +
+      `${support.ticketHeaderHtml(ticketId, telegramId)}\n📋 <b>Quick replies</b> — tap one to send it to the student now:\n\n` +
       preview.join('\n\n'),
       supportChatOptions(chat, Object.assign({
         reply_markup: support.quickReplyKeyboard(ticketId, telegramId, category)
@@ -1497,9 +1587,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (action === 'passes') {
     await ack('Checking…');
     const [passes, found] = await Promise.all([studentSnapshot(telegramId), readTicket(ticketId)]);
+    const groupId = found ? found.group : '';
     await post(
-      `🎟 <b>Pass & payment</b>\n${passLines(passes)}\n\n` +
-      `🧭 <b>Suggested:</b> ${esc(support.suggestNextStep(found ? found.category : 'other', passes))}`);
+      `🎟 <b>Pass & payment</b> · checked just now\n\n${passLines(passes, groupId)}\n\n` +
+      `🧭 <b>Next step:</b> ${esc(support.suggestNextStep(found ? found.category : 'other', passes, groupId))}`);
     return;
   }
 
@@ -1511,14 +1602,23 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       return;
     }
     const recent = (found.log || []).slice(-6).map((e) =>
-      `• ${esc(e.at)} — ${esc(e.who || e.role)}: ${esc(e.action)}`);
+      `• ${esc(e.at)} — ${esc(e.who || e.role)}: ${esc(String(e.action).replace(/_/g, ' '))}`);
+    const category = support.categoryById(found.category);
+    const facts = [
+      found.picked_up_by ? `picked up by ${esc(found.picked_up_by)}` : 'not picked up yet',
+      found.handled_by ? `last handled by ${esc(found.handled_by)}` : '',
+      found.admin_replies ? `${found.admin_replies} admin repl${found.admin_replies === 1 ? 'y' : 'ies'}` : ''
+    ].filter(Boolean).join(' · ');
     await post(
-      `📜 <b>History</b> · ${support.statusLine(found.status, found.waiting_on)}` +
-      (found.picked_up_by ? ` · picked up by ${esc(found.picked_up_by)}` : '') +
-      (found.handled_by ? ` · last handled by ${esc(found.handled_by)}` : '') +
-      (found.admin_replies ? ` · ${found.admin_replies} admin repl${found.admin_replies === 1 ? 'y' : 'ies'}` : '') + '\n' +
-      `<blockquote>${esc(support.lastChars(found.conversation || found.last_message, 2800))}</blockquote>` +
-      (recent.length ? `\n<b>Recent actions</b>\n${recent.join('\n')}` : ''),
+      `📜 <b>History</b>\n` +
+      `<b>Status:</b> ${support.statusLine(found.status, found.waiting_on)}\n` +
+      `<b>Issue:</b> ${esc(category.emoji)} ${esc(category.label)}\n` +
+      (familyGroups().length > 1 ? `<b>Group:</b> ${groupLine(found.group)}\n` : '') +
+      `<b>Opened:</b> ${esc(found.created_at || '—')}\n` +
+      `<i>${facts}</i>\n\n` +
+      '💬 <b>Conversation</b>\n' +
+      `<blockquote expandable>${esc(support.lastChars(found.conversation || found.last_message, 2600))}</blockquote>` +
+      (recent.length ? `\n\n🧾 <b>Recent actions</b>\n${recent.join('\n')}` : ''),
       { closed: found.status === 'closed', paymentId: support.findPaymentId(found.conversation) });
     return;
   }
@@ -1556,7 +1656,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       }]);
     }
     await bot.sendMessage(chat.chatId,
-      `${support.ticketHeader(ticketId, telegramId)}\n${result.html}${followUp}`,
+      `${support.ticketHeaderHtml(ticketId, telegramId)}\n${result.html}${followUp}`,
       supportChatOptions(chat, Object.assign({ reply_markup: keyboard }, where)));
     return;
   }
@@ -1565,7 +1665,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     await ack();
     const pass = await passFor(primaryGroup().id);
     await bot.sendMessage(chat.chatId,
-      `${support.ticketHeader(ticketId, telegramId)}\n` +
+      `${support.ticketHeaderHtml(ticketId, telegramId)}\n` +
       `✅ <b>Grant a pass for <code>${esc(paymentId)}</code>?</b>\n\n` +
       `The student gets <b>${esc(pass ? pass.label : 'the pass')}</b>` +
       (pass && pass.validUntil ? ` until <b>${esc(pass.validUntil)}</b>` : '') +
@@ -1788,7 +1888,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
     const category = support.parsePrompt(repliedText);
     if (category) {
-      await openTicket(msg, category, msg.from);
+      await openTicket(msg, category, msg.from, support.parsePromptGroup(repliedText));
       return;
     }
     const ticketId = support.parseReplyLine(repliedText);
@@ -1910,6 +2010,15 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       return `• ${esc(category.emoji)} ${esc(category.label)}: <b>${count}</b>`;
     });
 
+  const groups = familyGroups();
+  const byGroup = (stats && stats.by_group) || {};
+  const groupRows = groups.length > 1
+    ? [...groups.map((g) => [g.shortName, byGroup[g.id]]), ['Not specified', byGroup.unspecified]]
+      .filter(([, row]) => row && row.open + row.in_progress > 0)
+      .map(([name, row]) => `• ${esc(name)}: <b>${row.open + row.in_progress}</b> not closed` +
+        (row.needs_reply ? ` · 🔴 ${row.needs_reply} need a reply` : ''))
+    : [];
+
   const admins = Object.entries((stats && stats.by_admin) || {})
     .sort((a, b) => (b[1].replies + b[1].quick_replies) - (a[1].replies + a[1].quick_replies))
     .slice(0, 8)
@@ -1917,19 +2026,27 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       (a.invites_sent ? ` · ${a.invites_sent} invites` : '') +
       (a.passes_granted ? ` · ${a.passes_granted} passes granted` : ''));
 
+  const oldestGroup = oldest && groupById(oldest.group);
   const lines = [
     `📊 <b>${family} — support summary</b>`,
     '',
-    `🔴 Needs reply: <b>${c.needs_reply || 0}</b>` + (stats && stats.not_picked_up ? `  (🆕 ${stats.not_picked_up} not picked up yet)` : ''),
-    `🟡 In progress: ${c.in_progress || 0} · ⏳ Waiting for student: ${c.waiting_student || 0}`,
-    `✅ Closed: ${c.closed || 0} · All tickets: ${c.total || 0}`,
+    '<b>Tickets</b>',
+    `🔴 Needs reply: <b>${c.needs_reply || 0}</b>`,
+    `🆕 Open (not picked up): ${c.open || 0}`,
+    `🟡 In progress: ${c.in_progress || 0}`,
+    `⏳ Waiting for student: ${c.waiting_student || 0}`,
+    `✅ Closed: ${c.closed || 0}`,
+    `📁 All tickets: ${c.total || 0}`,
     '',
+    '<b>Activity</b>',
     `📅 Today: ${stats ? stats.opened_today : 0} opened · ${stats ? stats.closed_today : 0} closed`,
-    `⏱ First reply, last 7 days: ${reply.samples ? `average ${minutesText(reply.average)} · median ${minutesText(reply.median)}` : 'no replies yet'}`,
+    `⏱ First reply (7 days): ${reply.samples ? `average ${minutesText(reply.average)} · median ${minutesText(reply.median)}` : 'no replies yet'}`,
     oldest
-      ? `⌛ Longest waiting: ${esc(oldest.name)} — <b>${minutesText(oldest.minutes)}</b> (${esc(support.categoryById(oldest.category).label)})`
+      ? `⌛ Longest waiting: ${esc(oldest.name)} — <b>${minutesText(oldest.minutes)}</b> (${esc(support.categoryById(oldest.category).label)}` +
+        (oldestGroup && groups.length > 1 ? ` · ${esc(oldestGroup.shortName)}` : '') + ')'
       : '⌛ Nobody is waiting for a reply 🎉'
   ];
+  if (groupRows.length) lines.push('', '👥 <b>Not closed, by group</b>', ...groupRows);
   if (openByIssue.length) lines.push('', '📂 <b>Not closed, by issue</b>', ...openByIssue);
   if (admins.length) lines.push('', '🧑‍💼 <b>Admins, last 7 days</b>', ...admins);
   lines.push('', `<i>Updated ${esc(membership.formatIst(new Date()))}</i>`);
@@ -1975,6 +2092,18 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return true;
   }
 
+  /** A ticket from the sheet as a short card (status, issue, group, student, last message). */
+  function ticketCardHtml(t) {
+  const category = support.categoryById(t.category);
+  const who = [t.name, t.username ? '@' + t.username : ''].filter(Boolean).join(' · ') || t.telegram_id;
+  return `${support.statusLine(t.status, t.waiting_on)}\n\n` +
+    `<b>Student:</b> ${esc(who)}\n` +
+    `<b>Issue:</b> ${esc(category.emoji)} ${esc(category.label)}\n` +
+    (familyGroups().length > 1 ? `<b>Group:</b> ${groupLine(t.group)}\n` : '') +
+    `<b>Last activity:</b> ${esc(t.updated_at)} · ${t.picked_up_by ? `picked up by ${esc(t.picked_up_by)}` : 'not picked up yet'}\n` +
+    `<blockquote>${esc(String(t.last_message || '').slice(0, 300))}</blockquote>`;
+  }
+
   /** Lists one queue: a heading, then one message per ticket with its buttons. */
   async function postTicketQueue(chat, view, where = {}) {
   const spec = QUEUE_VIEWS[view] || QUEUE_VIEWS.needs;
@@ -1990,20 +2119,18 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const counts = list.counts || {};
   await reply(
     `<b>${spec.title}</b> — ${list.total || 0} ticket${list.total === 1 ? '' : 's'}` +
-    (list.total > tickets.length ? ` (showing ${tickets.length})` : '') + '\n' +
-    `🔴 Needs reply ${counts.needs_reply || 0} · 🆕 Open ${counts.open || 0} · 🟡 In progress ${counts.in_progress || 0} · ` +
-    `⏳ Waiting for student ${counts.waiting_student || 0} · ✅ Closed ${counts.closed || 0}` +
+    (list.total > tickets.length ? ` (showing ${tickets.length})` : '') + '\n\n' +
+    `🔴 Needs reply: <b>${counts.needs_reply || 0}</b>\n` +
+    `🆕 Open: ${counts.open || 0}\n` +
+    `🟡 In progress: ${counts.in_progress || 0}\n` +
+    `⏳ Waiting for student: ${counts.waiting_student || 0}\n` +
+    `✅ Closed: ${counts.closed || 0}` +
     (tickets.length ? '' : '\n\nNothing here. 🎉'));
 
   // One message per ticket, each with its own buttons, so any of them can be
   // acted on straight from the list.
   for (const t of tickets) {
-    const category = support.categoryById(t.category);
-    await postToAdmins(chat, t.ticket_id, t.telegram_id,
-      `${support.statusLine(t.status, t.waiting_on)} · ${esc(category.emoji)} ${esc(category.label)}\n` +
-      `👤 ${esc(t.username ? '@' + t.username : (t.name || t.telegram_id))} · 🕒 last activity ${esc(t.updated_at)}` +
-      (t.picked_up_by ? ` · picked up by ${esc(t.picked_up_by)}` : ' · not picked up yet') + '\n' +
-      `<blockquote>${esc(String(t.last_message || '').slice(0, 300))}</blockquote>`,
+    await postToAdmins(chat, t.ticket_id, t.telegram_id, ticketCardHtml(t),
       { paymentId: support.findPaymentId(t.last_message), closed: support.normaliseStatus(t.status) === 'closed' });
   }
   }
@@ -2017,6 +2144,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
   const view = data.slice(4);
+  if (view === 'show') {
+    await ack('Counting tickets…');
+    const where = {};
+    if (message.message_thread_id) where.message_thread_id = message.message_thread_id;
+    await postSupportSummary(chat, { extra: where });
+    return;
+  }
   if (view === 'refresh') {
     await ack('Refreshing…');
     await postSupportSummary(chat, { editMessageId: message.message_id });
@@ -2030,6 +2164,129 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const where = {};
   if (message.message_thread_id) where.message_thread_id = message.message_thread_id;
   await postTicketQueue(chat, view, where);
+  }
+
+  /** The newest tickets a student has, newest first, or [] when they cannot be read. */
+  async function ticketsOf(telegramId, pageSize = 5) {
+  const list = await attempt(
+    () => sheetFor(primaryGroup().id).listTickets({ telegramId: String(telegramId), pageSize }),
+    SUPPORT_SETTINGS_WAIT_MS, null);
+  return (list && list.tickets) || [];
+  }
+
+  /** Short lines for a student's tickets. */
+  function ticketListLines(tickets) {
+  return tickets.map((t) => {
+    const category = support.categoryById(t.category);
+    const group = groupById(t.group);
+    return `• <code>${esc(t.ticket_id)}</code> · ${support.statusLine(t.status, t.waiting_on)}\n` +
+      `   ${esc(category.label)}${group && familyGroups().length > 1 ? ` · ${esc(group.shortName)}` : ''} · ${esc(support.shortDate(t.updated_at))}`;
+  });
+  }
+
+  /**
+   * findPaymentForAdmins — /find pay_… in the support chat: what Razorpay
+   * says, which group's records hold it and for whom, and that student's
+   * tickets. The buttons of their newest ticket come with it, so an admin can
+   * grant or reply without searching further.
+   */
+  async function findPaymentForAdmins(chat, paymentId, where) {
+  const result = await checkPayment(paymentId, null);
+  const payerId = result.payment && result.payment.notes && result.payment.notes.telegram_id
+    ? String(result.payment.notes.telegram_id) : '';
+
+  const recorded = [];
+  let recordsUnreadable = false;
+  for (const group of familyGroups()) {
+    try {
+      const record = await within(findRecordedPayment(group, paymentId), SUPPORT_SETTINGS_WAIT_MS, undefined);
+      if (record === undefined) recordsUnreadable = true;
+      else if (record) recorded.push({ group, telegramId: String(record.telegram_id || '') });
+    } catch (err) {
+      recordsUnreadable = true;
+    }
+  }
+
+  const lines = [result.html, '', '📒 <b>Our records</b>'];
+  if (recorded.length) {
+    recorded.forEach((r) => lines.push(`✅ Recorded in <b>${esc(r.group.shortName)}</b> for Telegram id <code>${esc(r.telegramId)}</code>`));
+  } else if (recordsUnreadable) {
+    lines.push('⚠️ Could not read every group\'s records just now — try again in a minute.');
+  } else {
+    lines.push(result.captured
+      ? '⚠️ <b>Not recorded in any group.</b> The money arrived but no pass was given — open the student\'s ticket and tap "✅ Grant pass for this payment".'
+      : 'Not recorded in any group.');
+  }
+
+  const studentId = payerId || (recorded[0] && recorded[0].telegramId) || '';
+  let latest = null;
+  if (studentId) {
+    const tickets = await ticketsOf(studentId, 3);
+    latest = tickets[0] || null;
+    lines.push('', `🎫 <b>Tickets from <code>${esc(studentId)}</code></b>`);
+    lines.push(tickets.length ? ticketListLines(tickets).join('\n') : 'None.');
+    if (latest) lines.push('', `<i>Buttons below act on ${esc(latest.ticket_id)}.</i>`);
+  }
+
+  const options = supportChatOptions(chat, where);
+  if (latest) {
+    const keyboard = support.adminKeyboard(latest.ticket_id, studentId,
+      { paymentId, closed: support.normaliseStatus(latest.status) === 'closed' });
+    if (result.captured) {
+      keyboard.inline_keyboard.splice(2, 0, [{
+        text: '✅ Grant pass for this payment',
+        callback_data: `adm:g:${latest.ticket_id}:${studentId}:${paymentId}`
+      }]);
+    }
+    options.reply_markup = keyboard;
+  }
+  await bot.sendMessage(chat.chatId, lines.join('\n'), options);
+  }
+
+  /** /find T-… — the ticket as a card with its buttons. */
+  async function findTicketForAdmins(chat, ticketId, where) {
+  const found = await readTicket(ticketId);
+  if (!found) {
+    await bot.sendMessage(chat.chatId, `⚠️ No ticket <code>${esc(ticketId)}</code> in this bot's sheet.`,
+      supportChatOptions(chat, where));
+    return;
+  }
+  await postToAdmins(chat, found.ticket_id, found.telegram_id, ticketCardHtml(found), {
+    extra: where,
+    paymentId: support.findPaymentId(found.conversation),
+    closed: support.normaliseStatus(found.status) === 'closed'
+  });
+  }
+
+  /** /find 7234356929 or @username — the student's passes and tickets. */
+  async function findStudentForAdmins(chat, target, where) {
+  const student = await findStudent(target);
+  if (!student) {
+    await bot.sendMessage(chat.chatId,
+      `⚠️ No student found for <code>${esc(target)}</code>. Use a Telegram id, a pay_ id, a ticket id, ` +
+      'or the @username of someone who has bought a pass.', supportChatOptions(chat, where));
+    return;
+  }
+  const [passes, tickets] = await Promise.all([studentSnapshot(student.telegramId), ticketsOf(student.telegramId, 5)]);
+  const sub = student.subscriber || {};
+  const who = [sub.name, sub.username ? '@' + sub.username : ''].filter(Boolean).join(' · ');
+  const latest = tickets[0];
+  const lines = [
+    `👤 <b>Student</b> <code>${esc(student.telegramId)}</code>${who ? ` · ${esc(who)}` : ''}`,
+    '',
+    '🎟 <b>Access</b>',
+    passLines(passes, latest ? latest.group : ''),
+    '',
+    '🎫 <b>Tickets</b>',
+    tickets.length ? ticketListLines(tickets).join('\n') : 'None.'
+  ];
+  if (latest) lines.push('', `<i>Buttons below act on ${esc(latest.ticket_id)}.</i>`);
+  const options = supportChatOptions(chat, where);
+  if (latest) {
+    options.reply_markup = support.adminKeyboard(latest.ticket_id, student.telegramId,
+      { closed: support.normaliseStatus(latest.status) === 'closed' });
+  }
+  await bot.sendMessage(chat.chatId, lines.join('\n'), options);
   }
 
   /**
@@ -2100,9 +2357,33 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
 
-  if (!command) return;
+  // A payment id pasted into the chat is looked up straight away.
+  if (!command) {
+    const pasted = support.findPaymentId(support.messageText(msg));
+    if (pasted) await findPaymentForAdmins(chat, pasted, where);
+    return;
+  }
   const family = esc(primaryGroup().label || primaryGroup().shortName);
   const reply = (html) => bot.sendMessage(chat.chatId, html, supportChatOptions(chat, where));
+
+  if (command.name === 'find') {
+    const target = command.args.split(/\s+/)[0] || '';
+    const paymentId = support.findPaymentId(target);
+    const ticketId = (target.match(new RegExp(`^${support.TICKET_ID_PATTERN}$`, 'i')) || [])[0];
+    if (paymentId) {
+      await findPaymentForAdmins(chat, paymentId, where);
+    } else if (ticketId) {
+      await findTicketForAdmins(chat, ticketId.toUpperCase(), where);
+    } else if (target) {
+      await findStudentForAdmins(chat, target, where);
+    } else {
+      await reply('Usage:\n<code>/find pay_XXXXXXXXXXXXXX</code> — a payment\n' +
+        '<code>/find 7234356929</code> or <code>/find @username</code> — a student\n' +
+        '<code>/find T-260917-AB2C</code> — a ticket\n\n' +
+        '<i>Tip: pasting a pay_ id into this chat looks it up too.</i>');
+    }
+    return;
+  }
 
   if (command.name === 'msg') {
     const target = command.args.split(/\s+/)[0] || '';
@@ -2123,9 +2404,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
     const ticketId = support.newTicketId();
     try {
-      await bot.sendMessage(student.telegramId,
-        `${esc(support.replyLine(ticketId))}\n\n${esc(text)}\n\n<i>You can reply here, or just send another message.</i>`,
-        { parse_mode: 'HTML' });
+      await bot.sendMessage(student.telegramId, support.studentReplyHtml(ticketId, text), { parse_mode: 'HTML' });
     } catch (err) {
       await reply(`⚠️ <b>Not delivered</b> to <code>${esc(student.telegramId)}</code>: ${esc(err.message)}\n` +
         'They may never have started this bot, or have blocked it.');
@@ -2199,8 +2478,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (command.name === 'supporthelp') {
     await reply(
       `<b>${family} — how to handle support</b>\n\n` +
-      'Every ticket arrives here with the student\'s passes, whether they are in the group, what they wrote, ' +
-      'and a 🧭 suggestion. Buttons underneath:\n\n' +
+      'Every ticket arrives here with the issue, <b>which group it is about</b>, the student\'s passes in each group ' +
+      '(📌 marks the ticket\'s group), what they wrote, and a 🧭 next step. Buttons underneath:\n\n' +
       '✍️ <b>Write reply</b> — type your own answer\n' +
       '📋 <b>Quick replies</b> — ready answers (payment not received, send proof, still processing, pass expired, ' +
       'link sent, resolved)\n' +
@@ -2209,6 +2488,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       '🔍 <b>Check payment</b> — appears when they mention a pay_ id; asks Razorpay\n' +
       '✅ <b>Grant pass for this payment</b> — after a check shows the money arrived but no pass\n' +
       '📜 <b>History</b> — the whole conversation and recent actions\n' +
+      '📊 <b>Summary</b> — how many tickets need a reply, are open, in progress or closed\n' +
       '✅ <b>Close ticket</b> / 🔓 <b>Reopen</b> — closing tells the student it is resolved\n\n' +
       'You can also simply reply to any ticket message.\n\n' +
       '<b>Statuses</b> — only an admin closes a ticket\n' +
@@ -2220,6 +2500,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       '<b>Commands</b>\n' +
       '<code>/summary</code> — how many tickets need a reply, are open, in progress or closed, with buttons to list each\n' +
       '<code>/tickets</code> — tickets needing a reply (or <code>/tickets open</code>, <code>progress</code>, <code>student</code>, <code>closed</code>)\n' +
+      '<code>/find pay_…</code> — look up a payment: Razorpay status, which group recorded it, the student\'s tickets. ' +
+      'Pasting a pay_ id into this chat does the same.\n' +
+      '<code>/find 7234356929</code>, <code>/find @username</code>, <code>/find T-…</code> — a student or a ticket\n' +
       '<code>/msg 7234356929 text</code> or <code>/msg @username text</code> — message a student first\n' +
       '<code>/settings</code> · <code>/set key value</code> — bot texts\n' +
       'Everything is logged in the sheet\'s Support and Support Log tabs.');
