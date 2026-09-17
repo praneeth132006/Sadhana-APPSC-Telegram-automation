@@ -203,6 +203,41 @@ async function createSingleUseInvite(groupId, telegramId) {
 }
 
 /**
+ * resendInvite — a fresh invite for someone who already holds an active pass.
+ *
+ * For the student who paid and says the link never arrived, expired, or was
+ * used up. Nothing is extended and nothing is charged: only the invite changes.
+ * The join request it produces is still checked against the pass, so a link
+ * sent to the wrong person lets nobody in.
+ *
+ * @param {string} groupId
+ * @param {string|number} telegramId
+ * @returns {Promise<{sent: boolean, inviteLink?: string, reason?: string, subscriber: Object|null}>}
+ *   sent is false, with the reason, when the student could not use an invite
+ */
+async function resendInvite(groupId, telegramId) {
+  const ctx = contextFor(groupId);
+  // The same test the join request will apply, so a link is never sent that
+  // would only be declined when it is used.
+  const verdict = await isEligible(groupId, telegramId);
+  const subscriber = verdict.subscriber;
+  if (!verdict.ok) return { sent: false, reason: verdict.reason, subscriber };
+
+  const inviteLink = await createSingleUseInvite(groupId, telegramId);
+  try {
+    await ctx.sheet.upsertSubscriber({
+      telegram_id: String(telegramId),
+      invite_link: inviteLink,
+      is_payment: false
+    }, 'invite.resent');
+  } catch (err) {
+    // The link works whether or not the sheet remembers it.
+    console.error(`[membership] ${groupId}: could not record the resent invite for ${telegramId}: ${err.message}`);
+  }
+  return { sent: true, inviteLink, subscriber };
+}
+
+/**
  * grantAccess — the single path from a verified payment to group membership.
  *
  * Idempotent by design: Razorpay retries webhooks, and a duplicate delivery
@@ -519,6 +554,7 @@ module.exports = {
   formatIst,
   parseIst,
   createSingleUseInvite,
+  resendInvite,
   grantAccess,
   removeMember,
   markExpired,

@@ -1353,6 +1353,44 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, db
     return true;
   }
 
+  if (pathname === '/api/support/resend-invite' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    if (!TICKET_ID_RE.test(ticketId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticketId is required.' });
+      return true;
+    }
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found in this group's sheet.` });
+      return true;
+    }
+    const app = supportBotFor(res, ticket);
+    if (!app) return true;
+
+    const results = await app.resendInvites(ticket.telegram_id, { ticketId, actor });
+    await mirrorToSupportChat(app, ticket,
+      `🔗 <b>Resend invite</b> from the dashboard · by ${support.esc(actor)}\n\n` +
+      app.describeInviteResults(results));
+
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        results: results.map((r) => ({
+          group: r.group.shortName,
+          sent: r.sent,
+          delivered: r.delivered,
+          status: r.status,
+          reason: r.reason || '',
+          error: r.error || '',
+          // Only when the student could not be messaged, so an admin can pass it on.
+          inviteLink: r.sent && !r.delivered ? r.inviteLink : ''
+        }))
+      }
+    });
+    return true;
+  }
+
   if (pathname === '/api/support/status' && method === 'POST') {
     const body = await readJsonBody(req);
     const ticketId = str(body.ticketId, 20);
@@ -1381,7 +1419,7 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, db
           'or send /support.',
           { parse_mode: 'HTML' });
         notified = true;
-        await mirrorToSupportChat(app, updated, `✅ Closed from the dashboard by ${support.esc(actor)}`);
+        await mirrorToSupportChat(app, updated, `✅ Closed from the dashboard by ${support.esc(actor)}`, { closed: true });
       } catch (err) {
         console.warn(`[support] could not tell ${updated.telegram_id} that ${ticketId} closed: ${err.message}`);
       }
@@ -1450,10 +1488,16 @@ function supportBotFor(res, ticket) {
 }
 
 /** Keeps the admin support chat in step with what happened on the dashboard. */
-async function mirrorToSupportChat(app, ticket, html) {
+async function mirrorToSupportChat(app, ticket, html, { closed = false } = {}) {
   const chat = support.supportChatFor(ticket.bot);
   if (!chat) return;
-  const options = { parse_mode: 'HTML', disable_web_page_preview: true };
+  // The same buttons as a ticket raised in Telegram, so an admin can carry on
+  // from the chat whichever side the last action came from.
+  const options = {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: support.adminKeyboard(ticket.ticket_id, ticket.telegram_id, { closed })
+  };
   if (chat.threadId) options.message_thread_id = chat.threadId;
   try {
     await app.bot.sendMessage(chat.chatId,

@@ -347,11 +347,25 @@ then raise a ticket (text or a screenshot). Each ticket is:
   student's current pass status, and
 - listed on the dashboard's **🆘 Support** page.
 
-Admins answer either by **replying to the ticket message in the support chat**
-or from the **Support** page. The student's reply to an answer goes back into
-the same ticket. In the support chat, reply `/close` or `/reopen` to a ticket;
-`/tickets` lists open ones, `/settings` shows the bot texts and
-`/set key value` changes one. `/supporthelp` lists these.
+A student does not need to use Telegram's reply feature: anything they send
+while they have an open ticket (touched in the last 7 days) is added to that
+ticket. Every message about a ticket in the support chat shows the earlier
+conversation, so there is no scrolling back to find context.
+
+Every ticket post in the support chat has buttons, so no commands are needed:
+
+| Button | What it does |
+|---|---|
+| ✍️ Reply | Asks for your answer and sends it to the student (replying to any ticket message works too) |
+| 🔗 Resend invite | Sends the student a fresh invite link for each group where their pass is active and unexpired. If they have no valid pass, says why and sends nothing |
+| 🎟 Pass status | What the student holds in each group, and until when |
+| 📜 Full history | The whole conversation |
+| ✅ Close ticket / 🔓 Reopen | Closing also tells the student it is resolved |
+
+The **Support** page on the dashboard has the same Reply, Resend invite and Close
+actions. In the chat, `/tickets` posts everything waiting (each with its
+buttons), `/settings` shows the bot texts, `/set key value` changes one, and
+`/supporthelp` explains all of this.
 
 The texts students see — support hours, response time, a fallback contact, an
 extra `/start` note, and the instant answer for each issue — live in the sheet's

@@ -28,6 +28,12 @@ const BOT = { id: 123, is_bot: true, first_name: 'Pay bot', username: 'upsc_pay_
 const sheets = require('../src/sheets');
 const support = require('../src/support');
 const { createPaymentBot } = require('../src/botapp');
+const membership = require('../src/membership');
+
+// botapp loads .env when required, which may name a real support chat. These
+// tests decide the support chat themselves.
+delete process.env.SUPPORT_CHAT_ID;
+delete process.env.SUPPORT_THREAD_ID;
 
 /** A recorder standing in for one group's sheet. */
 function fakeSheet(overrides = {}) {
@@ -230,8 +236,13 @@ test('nothing is answered in the paid group, even though the bot sees every mess
   assert.equal(sent.length, 0);
 });
 
-test('replying to an admin answer adds to the ticket and reopens it', async () => {
-  const { deliver, sheet, messages } = makeBot();
+test('replying to an admin answer adds to the ticket and shows admins what came before', async () => {
+  const conversation =
+    '[17-09-2026, 10:12:03 AM IST] Asha (@asha):\nPaid but no link\n\n' +
+    '[17-09-2026, 11:40:10 AM IST] Admin @ravi_admin:\nTry again now\n\n' +
+    '[17-09-2026, 11:50:00 AM IST] Asha (@asha):\nStill not working';
+  const sheet = fakeSheet({ appendTicketMessage: (id) => ({ ticket_id: id, status: 'open', conversation }) });
+  const { deliver, messages } = makeBot({ sheet });
   const answer = { message_id: 902, from: BOT, chat: { id: STUDENT.id, type: 'private' },
     text: support.replyLine('T-260917-AB2C') + '\n\nTry again now' };
 
@@ -243,8 +254,51 @@ test('replying to an admin answer adds to the ticket and reopens it', async () =
   assert.equal(appended.args[1].text, 'Still not working');
 
   const [toAdmins] = messages(SUPPORT_CHAT);
-  assert.match(toAdmins.args[1], /Follow-up from the student/);
-  assert.ok(support.parseTicketHeader(toAdmins.args[1]));
+  const text = toAdmins.args[1];
+  assert.ok(support.parseTicketHeader(text));
+  assert.match(text, /Student replied/);
+  assert.match(text, /Earlier in this ticket[\s\S]*Paid but no link[\s\S]*Admin @ravi_admin:\nTry again now/);
+  assert.equal((text.match(/Still not working/g) || []).length, 1, 'the new message should not also appear in the history');
+  assert.ok(toAdmins.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:42'),
+    'every ticket post needs the admin buttons');
+});
+
+test('a student who just types again goes into their open ticket, not a new one', async () => {
+  const sheet = fakeSheet({
+    listTickets: { total: 1, tickets: [{ ticket_id: 'T-260917-AB2C', status: 'answered', updated_at: '' }] }
+  });
+  const { deliver, messages } = makeBot({ sheet });
+
+  await deliver(privateMessage('still no link'));
+
+  assert.equal(sheet.calls.filter((c) => c.name === 'createTicket').length, 0);
+  const lookup = sheet.calls.find((c) => c.name === 'listTickets');
+  assert.equal(lookup.args[0].telegramId, '42');
+  const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
+  assert.equal(appended.args[0], 'T-260917-AB2C');
+  assert.match(messages(STUDENT.id)[0].args[1], /Added to your ticket/);
+  assert.equal(messages(SUPPORT_CHAT).length, 1);
+});
+
+test('a closed or stale ticket is not reused; the student is offered a new one', async () => {
+  const sheet = fakeSheet({
+    listTickets: { total: 2, tickets: [
+      { ticket_id: 'T-260917-AAAA', status: 'closed', updated_at: '' },
+      { ticket_id: 'T-260801-BBBB', status: 'open', updated_at: '01-08-2020, 10:00:00 AM IST' }
+    ] }
+  });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(privateMessage('new problem'));
+
+  assert.equal(sheet.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
+  assert.match(messages(STUDENT.id)[0].args[1], /send this message to our support team/);
+});
+
+test('if the sheet cannot say whether a ticket is open, the student is still offered support', async () => {
+  const sheet = fakeSheet({ listTickets: () => { throw new Error('Unknown GET action: listTickets'); } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(privateMessage('hello'));
+  assert.match(messages(STUDENT.id)[0].args[1], /send this message to our support team/);
 });
 
 test('a reply to a message some other bot sent is not treated as a ticket', async () => {
@@ -438,17 +492,188 @@ test('ordinary chatter in the support chat is ignored', async () => {
   assert.equal(sent.length, 0);
 });
 
-test('/tickets lists open tickets from the sheet', async () => {
+test('/tickets posts each waiting ticket with its own buttons', async () => {
   const sheet = fakeSheet({
-    listTickets: {
-      total: 1, counts: { open: 1, answered: 2, closed: 3 },
-      tickets: [{ ticket_id: 'T-260917-AB2C', username: 'asha', category: 'invite', last_message: 'link broken' }]
-    }
+    listTickets: (filters) => filters.status === 'open'
+      ? { total: 1, counts: { open: 1, answered: 1, closed: 3 },
+        tickets: [{ ticket_id: 'T-260917-AB2C', telegram_id: '42', username: 'asha', category: 'invite', status: 'open', last_message: 'link broken' }] }
+      : { total: 1, counts: { open: 1, answered: 1, closed: 3 },
+        tickets: [{ ticket_id: 'T-260916-ZZ99', telegram_id: '43', name: 'Ravi', category: 'payment', status: 'answered', last_message: 'thanks' }] }
   });
   const { deliver, messages } = makeBot({ sheet });
   await deliver(supportChatMessage('/tickets'));
 
-  const [list] = messages(SUPPORT_CHAT);
-  assert.match(list.args[1], /Open 1 · Answered 2 · Closed 3/);
-  assert.match(list.args[1], /T-260917-AB2C[\s\S]*@asha[\s\S]*Invite link not working[\s\S]*link broken/);
+  const posts = messages(SUPPORT_CHAT);
+  assert.match(posts[0].args[1], /Open 1 · 🔵 Answered 1 · ✅ Closed 3/);
+  assert.equal(posts.length, 3, 'a summary plus one post per waiting ticket');
+  assert.match(posts[1].args[1], /^🎫 T-260917-AB2C · user 42[\s\S]*Invite link not working[\s\S]*link broken/);
+  assert.ok(posts[1].args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:c:T-260917-AB2C:42'));
+  assert.match(posts[2].args[1], /^🎫 T-260916-ZZ99 · user 43/);
+});
+
+// ---------------------------------------------------------------------------
+// Admin buttons
+// ---------------------------------------------------------------------------
+
+function adminTap(data, { chatId = SUPPORT_CHAT, from = ADMIN } = {}) {
+  return {
+    callback_query: {
+      id: 'cb' + messageSeq++, from, data,
+      message: { message_id: 960, from: BOT, chat: { id: Number(chatId), type: 'supergroup' },
+        text: support.ticketHeader('T-260917-AB2C', STUDENT.id) }
+    }
+  };
+}
+
+/** Replaces membership.resendInvite for one test. */
+async function withResendInvite(impl, fn) {
+  const original = membership.resendInvite;
+  membership.resendInvite = impl;
+  try {
+    return await fn();
+  } finally {
+    membership.resendInvite = original;
+  }
+}
+
+test('🔗 Resend invite sends the student a fresh link and records it on the ticket', async () => {
+  await withResendInvite(async (groupId, telegramId) => ({
+    sent: true, inviteLink: 'https://t.me/+fresh', subscriber: { status: 'active', expiry_date: '30-11-2026' }
+  }), async () => {
+    const { deliver, sheet, messages, sent } = makeBot();
+    await deliver(adminTap('adm:i:T-260917-AB2C:42'));
+
+    const [toStudent] = messages(STUDENT.id);
+    assert.match(toStudent.args[1], /new invite link/);
+    assert.equal(toStudent.args[2].reply_markup.inline_keyboard[0][0].url, 'https://t.me/+fresh');
+
+    const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
+    assert.equal(appended.args[0], 'T-260917-AB2C');
+    assert.match(appended.args[1].text, /Sent a fresh invite link/);
+    assert.equal(appended.args[1].handledBy, '@ravi_admin');
+
+    const [report] = messages(SUPPORT_CHAT);
+    assert.match(report.args[1], /✅ .*new invite link sent to the student/);
+    assert.equal(report.args[2].reply_to_message_id, 960, 'the report should thread under the ticket');
+    assert.match(sent.find((s) => s.method === 'answerCallbackQuery').args[1].text, /fresh invite/);
+  });
+});
+
+test('🔗 Resend invite refuses a student without an active pass and says why', async () => {
+  await withResendInvite(async () => ({ sent: false, reason: 'subscription has expired', subscriber: { status: 'active', expiry_date: '01-09-2026' } }), async () => {
+    const { deliver, sheet, messages } = makeBot();
+    await deliver(adminTap('adm:i:T-260917-AB2C:42'));
+
+    assert.equal(messages(STUDENT.id).length, 0, 'no link may be sent without an active pass');
+    assert.equal(sheet.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /no invite sent — subscription has expired[\s\S]*needs an active pass/);
+  });
+});
+
+test('🔗 Resend invite gives the admin the link when the student has blocked the bot', async () => {
+  await withResendInvite(async () => ({ sent: true, inviteLink: 'https://t.me/+manual', subscriber: { status: 'active' } }), async () => {
+    const { app, deliver, messages } = makeBot();
+    const send = app.bot.sendMessage;
+    app.bot.sendMessage = async (chatId, ...rest) => {
+      if (String(chatId) === String(STUDENT.id)) throw new Error('Forbidden: bot was blocked by the user');
+      return send(chatId, ...rest);
+    };
+    await deliver(adminTap('adm:i:T-260917-AB2C:42'));
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /could not be messaged[\s\S]*https:\/\/t\.me\/\+manual/);
+  });
+});
+
+test('admin buttons do nothing outside the support chat', async () => {
+  let called = false;
+  await withResendInvite(async () => { called = true; return { sent: false, subscriber: null }; }, async () => {
+    const { deliver, sent, sheet } = makeBot();
+    await deliver(adminTap('adm:i:T-260917-AB2C:42', { chatId: STUDENT.id, from: STUDENT }));
+    await deliver(adminTap('adm:c:T-260917-AB2C:42', { chatId: '-1009999999999', from: STUDENT }));
+
+    assert.equal(called, false);
+    assert.equal(sheet.calls.filter((c) => c.name === 'setTicketStatus').length, 0);
+    assert.equal(sent.filter((s) => s.method === 'sendMessage').length, 0);
+    assert.match(sent.find((s) => s.method === 'answerCallbackQuery').args[1].text, /only works in the support chat/);
+  });
+});
+
+test('a malformed admin button is ignored', async () => {
+  const { deliver, sent } = makeBot();
+  await deliver(adminTap('adm:i:not-a-ticket:42'));
+  await deliver(adminTap('adm:z:T-260917-AB2C:42'));
+  assert.equal(sent.filter((s) => s.method === 'sendMessage').length, 0);
+});
+
+test('✍️ Reply asks for an answer that is then delivered like any other reply', async () => {
+  const { deliver, messages, sheet } = makeBot();
+  await deliver(adminTap('adm:r:T-260917-AB2C:42'));
+
+  const [prompt] = messages(SUPPORT_CHAT);
+  assert.equal(prompt.args[2].reply_markup.force_reply, true);
+  assert.deepEqual(support.parseTicketHeader(prompt.args[1]), { ticketId: 'T-260917-AB2C', telegramId: '42' });
+
+  await deliver(supportChatMessage('Your pass is active, try the new link', {
+    reply_to_message: { message_id: 970, from: BOT, chat: { id: Number(SUPPORT_CHAT) }, text: prompt.args[1] }
+  }));
+  assert.match(messages(STUDENT.id)[0].args[1], /Your pass is active, try the new link/);
+  assert.equal(sheet.calls.find((c) => c.name === 'appendTicketMessage').args[1].status, 'answered');
+});
+
+test('🎟 Pass status shows every group the student holds', async () => {
+  const { deliver, messages } = makeBot();
+  await deliver(adminTap('adm:p:T-260917-AB2C:42'));
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Pass status[\s\S]*active<\/b> until 30-11-2026/);
+});
+
+test('📜 Full history posts the whole conversation, or explains when it is missing', async () => {
+  const found = makeBot({ sheet: fakeSheet({ getTicket: {
+    ticket_id: 'T-260917-AB2C', status: 'answered', handled_by: '@ravi_admin',
+    conversation: '[17-09-2026, 10:12:03 AM IST] Asha:\nfirst <message>'
+  } }) });
+  await found.deliver(adminTap('adm:h:T-260917-AB2C:42'));
+  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /Full history[\s\S]*answered[\s\S]*first &lt;message&gt;/);
+
+  const missing = makeBot({ sheet: fakeSheet({ getTicket: null }) });
+  await missing.deliver(adminTap('adm:h:T-260917-AB2C:42'));
+  assert.match(missing.messages(SUPPORT_CHAT)[0].args[1], /not in the sheet/);
+});
+
+test('✅ Close from a button closes the ticket, tells the student, and offers Reopen', async () => {
+  const { deliver, sheet, messages } = makeBot();
+  await deliver(adminTap('adm:c:T-260917-AB2C:42'));
+
+  assert.deepEqual(sheet.calls.find((c) => c.name === 'setTicketStatus').args, ['T-260917-AB2C', 'closed', '@ravi_admin']);
+  assert.match(messages(STUDENT.id)[0].args[1], /marked as resolved/);
+  const [report] = messages(SUPPORT_CHAT);
+  const buttons = report.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(buttons.includes('adm:o:T-260917-AB2C:42'), 'a closed ticket should offer Reopen');
+  assert.ok(!buttons.includes('adm:c:T-260917-AB2C:42'));
+});
+
+test('/invite replied to a ticket does the same as the button', async () => {
+  let asked = null;
+  await withResendInvite(async (groupId, telegramId) => { asked = String(telegramId); return { sent: false, subscriber: null }; }, async () => {
+    const { deliver, messages } = makeBot();
+    await deliver(supportChatMessage('/invite', { reply_to_message: ticketMessage() }));
+    assert.equal(asked, '42');
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /no pass on record/);
+  });
+});
+
+test('a long message with a long history still fits in one Telegram message', async () => {
+  const long = 'x'.repeat(3400);
+  const conversation =
+    `[17-09-2026, 10:12:03 AM IST] Asha (@asha):\n${'y'.repeat(3000)}\n\n` +
+    `[17-09-2026, 11:50:00 AM IST] Asha (@asha):\n${long}`;
+  const sheet = fakeSheet({
+    listTickets: { total: 1, tickets: [{ ticket_id: 'T-260917-AB2C', status: 'open', updated_at: '' }] },
+    appendTicketMessage: (id) => ({ ticket_id: id, status: 'open', conversation })
+  });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(privateMessage(long));
+
+  const [post] = messages(SUPPORT_CHAT);
+  const visible = post.args[1].replace(/<[^>]+>/g, '').replace(/&lt;|&gt;|&amp;/g, '_');
+  assert.ok(visible.length <= 4096, `post is ${visible.length} characters`);
+  assert.match(post.args[1], /Full history/);
 });

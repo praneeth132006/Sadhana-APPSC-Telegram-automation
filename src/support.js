@@ -258,6 +258,96 @@ function receivedLine(ticketId) {
   return `📨 Ticket received · ${ticketId}`;
 }
 
+// ---- Admin buttons ---------------------------------------------------------
+// Every ticket post in the support chat carries these, so nothing needs a
+// command. The data is adm:<action>:<ticketId>:<telegramId> — about 30 bytes,
+// well inside Telegram's 64.
+
+const ADMIN_ACTIONS = {
+  r: 'reply',
+  i: 'invite',
+  p: 'passes',
+  h: 'history',
+  c: 'close',
+  o: 'reopen'
+};
+
+/** Buttons under a ticket in the support chat. */
+function adminKeyboard(ticketId, telegramId, { closed = false } = {}) {
+  const data = (code) => `adm:${code}:${ticketId}:${telegramId}`;
+  return {
+    inline_keyboard: [
+      [
+        { text: '✍️ Reply', callback_data: data('r') },
+        { text: '🔗 Resend invite', callback_data: data('i') }
+      ],
+      [
+        { text: '🎟 Pass status', callback_data: data('p') },
+        { text: '📜 Full history', callback_data: data('h') }
+      ],
+      [closed
+        ? { text: '🔓 Reopen', callback_data: data('o') }
+        : { text: '✅ Close ticket', callback_data: data('c') }]
+    ]
+  };
+}
+
+/** { action, ticketId, telegramId } from an admin button, or null. */
+function parseAdminCallback(data) {
+  const match = String(data || '').match(new RegExp(`^adm:([a-z]):(${TICKET_ID_PATTERN}):(\\d+)$`));
+  if (!match || !ADMIN_ACTIONS[match[1]]) return null;
+  return { action: ADMIN_ACTIONS[match[1]], ticketId: match[2], telegramId: match[3] };
+}
+
+/** Where each "[time] who:" entry of a stored conversation starts. */
+const ENTRY_START = /(?:^|\n\n)(?=\[[^\]\n]{6,40}\] [^\n]*:\n)/g;
+
+/**
+ * earlierConversation — the thread before its newest message, trimmed to the
+ * most recent `maxChars`, starting on a whole entry.
+ *
+ * @param {string} conversation The Conversation cell of a ticket
+ * @param {number} [maxChars]
+ * @returns {string} '' when there is nothing before the newest message
+ */
+function earlierConversation(conversation, maxChars = 1500) {
+  const text = String(conversation || '');
+  const starts = [];
+  let match;
+  ENTRY_START.lastIndex = 0;
+  while ((match = ENTRY_START.exec(text)) !== null) {
+    starts.push(match.index + (match[0].startsWith('\n\n') ? 2 : 0));
+    if (match[0] === '') ENTRY_START.lastIndex++;
+  }
+  if (starts.length < 2) return '';
+
+  const before = text.slice(0, starts[starts.length - 1]).trimEnd();
+  return lastChars(before, maxChars);
+}
+
+/** The newest `maxChars` of a thread, cut at an entry boundary when one is near. */
+function lastChars(text, maxChars = 3500) {
+  const value = String(text || '');
+  if (value.length <= maxChars) return value;
+  const tail = value.slice(value.length - maxChars);
+  const boundary = tail.search(/\n\n\[/);
+  return '…\n' + (boundary !== -1 && boundary < maxChars / 2 ? tail.slice(boundary + 2) : tail);
+}
+
+/**
+ * isRecent — whether an IST stamp from the sheet is within `days` of now.
+ * An unreadable stamp counts as recent, so a formatting quirk never splits a
+ * conversation into a second ticket.
+ */
+function isRecent(stamp, days, now = Date.now()) {
+  const match = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{4}),\s*(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)/i);
+  if (!match) return true;
+  let hour = parseInt(match[4], 10) % 12;
+  if (match[7].toUpperCase() === 'PM') hour += 12;
+  const at = Date.UTC(+match[3], +match[2] - 1, +match[1], hour, +match[5], +match[6]) - (5 * 60 + 30) * 60 * 1000;
+  return now - at <= days * 24 * 60 * 60 * 1000;
+}
+
 /**
  * supportChatFor — where a family's tickets are sent.
  *
@@ -391,6 +481,11 @@ module.exports = {
   replyLine,
   parseReplyLine,
   receivedLine,
+  adminKeyboard,
+  parseAdminCallback,
+  earlierConversation,
+  lastChars,
+  isRecent,
   supportChatFor,
   botIdFromToken,
   parseCommand,

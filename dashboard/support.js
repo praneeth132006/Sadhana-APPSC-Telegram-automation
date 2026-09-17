@@ -235,7 +235,41 @@ function renderTicket(ticket) {
     }
   });
 
+  const inviteBtn = el('button', {
+    class: 'btn btn-ghost',
+    text: '🔗 Resend invite link',
+    title: 'Send the student a fresh invite for every group where their pass is active',
+    onclick: async (e) => {
+      const button = e.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Sending…';
+      try {
+        const { results } = await api('/api/support/resend-invite', {
+          method: 'POST', body: { ticketId: ticket.ticket_id }
+        });
+        const delivered = results.filter((r) => r.delivered).map((r) => r.group);
+        const undelivered = results.filter((r) => r.sent && !r.delivered);
+        if (delivered.length) {
+          showToast('success', `Fresh invite sent for ${delivered.join(', ')}.`, 7000);
+        }
+        undelivered.forEach((r) => showToast('warn',
+          `${r.group}: link created but the student could not be messaged (${r.error}). ` +
+          `Send it yourself: ${r.inviteLink}`, 20000));
+        if (!results.some((r) => r.sent)) {
+          const why = results.map((r) => `${r.group}: ${r.reason || r.error || r.status}`).join(' · ');
+          showToast('warn', `No invite sent — the student has no active pass. ${why}`, 12000);
+        }
+        await Promise.all([openTicket(ticket.ticket_id), loadTickets()]);
+      } catch (err) {
+        showToast('error', err.message, 9000);
+        button.disabled = false;
+        button.textContent = '🔗 Resend invite link';
+      }
+    }
+  });
+
   const actions = el('div', { class: 'support-actions' }, [
+    inviteBtn,
     ticket.status !== 'closed' ? statusBtn('Close ticket', 'closed', 'btn-ghost') : statusBtn('Reopen', 'open', 'btn-ghost'),
     ticket.status === 'open' ? statusBtn('Mark answered', 'answered', 'btn-ghost') : null,
     el('button', {

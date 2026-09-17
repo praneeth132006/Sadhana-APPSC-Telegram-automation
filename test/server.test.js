@@ -1861,3 +1861,57 @@ test('the Support page is served and linked from the navigation', async () => {
   const shared = await call('/shared.js');
   assert.match(shared.text, /href: 'support\.html'/);
 });
+
+// ---- Resending an invite from the dashboard --------------------------------
+
+test('POST /api/support/resend-invite sends through the ticket\'s bot and reports each group', async () => {
+  const savedChat = process.env.SUPPORT_CHAT_ID;
+  const originalResend = membership.resendInvite;
+  const asked = [];
+  membership.resendInvite = async (groupId, telegramId) => {
+    asked.push({ groupId, telegramId: String(telegramId) });
+    return groupId === 'appsc_news_en'
+      ? { sent: true, inviteLink: 'https://t.me/+fresh', subscriber: { status: 'active' } }
+      : { sent: false, reason: 'no subscription on record', subscriber: null };
+  };
+  process.env.SUPPORT_CHAT_ID = '-1007777777777';
+  try {
+    await withRecordedBot(async (sends) => {
+      assert.equal((await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'nope' } })).status, 400);
+      assert.equal((await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'T-260917-ZZZZ' } })).status, 404);
+
+      calls.length = 0;
+      const res = await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'T-260917-AB2C' } });
+      assert.equal(res.status, 200, res.json && res.json.error);
+
+      assert.ok(asked.every((a) => a.telegramId === '4242'), 'the invite must be for the ticket\'s student');
+      const byGroup = Object.fromEntries(res.json.data.results.map((r) => [r.group, r]));
+      const sentEntry = res.json.data.results.find((r) => r.sent);
+      assert.ok(sentEntry && sentEntry.delivered, 'the active group should report a delivered invite');
+      assert.equal(sentEntry.inviteLink, '', 'a delivered link is not echoed back to the browser');
+      assert.ok(Object.values(byGroup).some((r) => !r.sent && r.reason === 'no subscription on record'));
+
+      const toStudent = sends.find((s) => s.chatId === '4242');
+      assert.equal(toStudent.options.reply_markup.inline_keyboard[0][0].url, 'https://t.me/+fresh');
+
+      const mirrored = sends.find((s) => s.chatId === '-1007777777777');
+      assert.ok(mirrored, 'the support chat should hear about it');
+      assert.match(mirrored.text, /Resend invite<\/b> from the dashboard · by Test Curator/);
+      assert.ok(mirrored.options.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:4242'),
+        'a mirrored post carries the admin buttons');
+
+      const appended = calls.find((c) => c.name === 'appendTicketMessage');
+      assert.ok(appended, 'the resend should be recorded on the ticket');
+      assert.match(appended.args[1].text, /Sent a fresh invite link/);
+    });
+  } finally {
+    membership.resendInvite = originalResend;
+    if (savedChat === undefined) delete process.env.SUPPORT_CHAT_ID;
+    else process.env.SUPPORT_CHAT_ID = savedChat;
+  }
+});
+
+test('POST /api/support/resend-invite requires sign-in', async () => {
+  const res = await call(`/api/support/resend-invite?group=${TEST_GROUP}`, { method: 'POST', body: { ticketId: 'T-260917-AB2C' } });
+  assert.equal(res.status, 401);
+});

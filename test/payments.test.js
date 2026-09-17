@@ -1058,3 +1058,65 @@ test('a pass for one group does not admit its sibling', async () => {
     sheets.forGroup = original;
   }
 });
+
+// ===========================================================================
+// Resending an invite from support
+// ===========================================================================
+// For the student who paid and never got in. It must never become a way to
+// hand an invite to someone without a live pass.
+
+test('resendInvite makes a fresh link for an active member and records it', async () => {
+  const originalInvite = paybot.createJoinRequestInvite;
+  const originalForGroup = sheets.forGroup;
+  const invited = [];
+  const written = [];
+  paybot.createJoinRequestInvite = async (env, chatId, telegramId) => {
+    invited.push({ env, chatId, telegramId: String(telegramId) });
+    return 'https://t.me/+fresh-one';
+  };
+  sheets.forGroup = (groupId) => Object.assign({}, originalForGroup(groupId), {
+    getSubscriber: async () => ({ telegram_id: '555', status: 'active', expiry_date: '30-11-2099' }),
+    upsertSubscriber: async (data, event) => { written.push({ data, event }); return data; }
+  });
+  try {
+    const result = await membership.resendInvite(TEST_GROUP, 555);
+    assert.equal(result.sent, true);
+    assert.equal(result.inviteLink, 'https://t.me/+fresh-one');
+    assert.equal(invited.length, 1);
+    assert.equal(invited[0].env, 'TELEGRAM_PAYBOT_SADHANA', 'the invite must come from this group\'s own bot');
+
+    assert.equal(written.length, 1);
+    assert.deepEqual(written[0].data, { telegram_id: '555', invite_link: 'https://t.me/+fresh-one', is_payment: false });
+    assert.equal(written[0].event, 'invite.resent');
+    assert.equal(written[0].data.status, undefined, 'a resend must not change the pass itself');
+    assert.equal(written[0].data.expiry_date, undefined);
+  } finally {
+    paybot.createJoinRequestInvite = originalInvite;
+    sheets.forGroup = originalForGroup;
+  }
+});
+
+test('resendInvite refuses anyone without an active pass', async () => {
+  const originalInvite = paybot.createJoinRequestInvite;
+  let invited = 0;
+  paybot.createJoinRequestInvite = async () => { invited++; return 'https://t.me/+nope'; };
+  try {
+    const refused = [
+      null,
+      { status: 'expired', expiry_date: '30-11-2099' },
+      { status: 'removed', expiry_date: '30-11-2099' },
+      { status: 'pending', expiry_date: '30-11-2099' },
+      // Marked active but already past expiry: the join request would decline it.
+      { status: 'active', expiry_date: '01-01-2020' },
+      { status: 'active', expiry_date: '' }
+    ];
+    for (const row of refused) {
+      const result = await withSubscriber(row, () => membership.resendInvite(TEST_GROUP, 555));
+      assert.equal(result.sent, false, `sent an invite for ${JSON.stringify(row)}`);
+      assert.ok(result.reason, 'a refusal must say why');
+    }
+    assert.equal(invited, 0);
+  } finally {
+    paybot.createJoinRequestInvite = originalInvite;
+  }
+});
