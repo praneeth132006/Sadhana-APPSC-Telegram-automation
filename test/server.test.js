@@ -91,6 +91,8 @@ stub(sheets, 'getUnpostedQuestions', [
 stub(sheets, 'markAsPosted', 1);
 stub(sheets, 'claimQuestions', { claimed: [2], skipped: [] });
 stub(sheets, 'releaseQuestions', 1);
+stub(sheets, 'recoverStaleClaims', { recovered: [], held: 0 });
+stub(sheets, 'holdQuestions', 1);
 stub(sheets, 'listPosted', []);
 stub(sheets, 'unpostQuestions', 0);
 
@@ -714,9 +716,59 @@ test('a send with no answer keeps the claim rather than risking a duplicate', as
     assert.equal(calls.filter((c) => c.name === 'releaseQuestions').length, 0,
       'a row that may have been delivered was handed back for re-sending');
     assert.deepEqual(res.json.strandedRows, [2]);
-    assert.match(res.json.results[0].error, /held as "Sending"/);
+    assert.match(res.json.results[0].error, /held for checking/);
+    const held = calls.find((c) => c.name === 'holdQuestions');
+    assert.ok(held, 'a row that may be in the channel must be held, not left as a plain claim');
+    assert.deepEqual(held.args[1], [2]);
+    assert.match(held.args[2], /No answer from Telegram/);
   } finally {
     telegram.sendQuizPoll = originalSend;
+  }
+});
+
+test('rows left claimed by an interrupted run are put back before posting', async () => {
+  const original = clientStubs.recoverStaleClaims;
+  clientStubs.recoverStaleClaims = async (subject, minutes) => {
+    calls.push({ name: 'recoverStaleClaims', args: [subject, minutes] });
+    return { recovered: [{ row: 7, question_id: 'POL-7', status: 'Approved' }], held: 0 };
+  };
+
+  try {
+    calls.length = 0;
+    const res = await authed('/api/telegram/post', { method: 'POST', body: { subject: 'Polity', count: 1 } });
+
+    const recovery = calls.find((c) => c.name === 'recoverStaleClaims');
+    assert.ok(recovery, 'abandoned claims were never looked for');
+    assert.equal(recovery.args[0], 'Polity');
+    assert.ok(Number(recovery.args[1]) >= 10, 'a claim must be well clear of a running batch before it is taken back');
+
+    // And it happens before the queue is read, or the recovered rows could not
+    // be part of this run.
+    const names = calls.map((c) => c.name);
+    assert.ok(names.indexOf('recoverStaleClaims') < names.indexOf('getUnpostedQuestions'));
+
+    assert.deepEqual(res.json.recoveredRows, [7]);
+    assert.match(res.json.message, /put back in the queue/);
+  } finally {
+    clientStubs.recoverStaleClaims = original;
+  }
+});
+
+test('a sheet whose Apps Script cannot recover claims still posts', async () => {
+  const original = clientStubs.recoverStaleClaims;
+  clientStubs.recoverStaleClaims = async () => {
+    const err = new Error('This sheet\'s Apps Script does not know the "recoverStaleClaims" action');
+    err.staleScript = true;
+    throw err;
+  };
+
+  try {
+    const res = await authed('/api/telegram/post', { method: 'POST', body: { subject: 'Polity', count: 1 } });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.postedCount, 1, 'an out-of-date sheet must not stop posting');
+    assert.deepEqual(res.json.recoveredRows, []);
+  } finally {
+    clientStubs.recoverStaleClaims = original;
   }
 });
 
@@ -930,7 +982,7 @@ test('a question posted but not marked stays claimed, and says so', async () => 
     assert.equal(res.json.postedCount, 0);
     assert.equal(res.json.results[0].ok, false);
     assert.match(res.json.results[0].error, /Posted to Telegram, but the sheet did not record it/);
-    assert.match(res.json.results[0].error, /Row 2 is held as "Sending"/);
+    assert.match(res.json.results[0].error, /Row 2 is held for checking/);
     assert.deepEqual(res.json.strandedRows, [2]);
     assert.equal(released, 0, 'a live poll was handed back for re-sending');
   } finally {

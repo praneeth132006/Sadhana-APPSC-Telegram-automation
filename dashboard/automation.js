@@ -298,7 +298,12 @@ async function postNow() {
       onBatch: (result, info) => {
         postedSoFar = info.postedSoFar;
         if (batches > 1) log('postLog', `Batch ${info.batch}:`, 'muted');
-        (result.results || []).forEach((r) => {
+        if ((result.recoveredRows || []).length) {
+        log('postLog',
+          `♻️ ${result.recoveredRows.length} question(s) left behind by an interrupted run were put back in the queue.`,
+          'muted');
+      }
+      (result.results || []).forEach((r) => {
           log('postLog',
             (r.ok ? '✅ ' : '❌ ') + (r.questionId || '') + ' — ' + (r.ok ? r.preview : r.error),
             r.ok ? 'ok' : 'fail');

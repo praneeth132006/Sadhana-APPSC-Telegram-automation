@@ -1437,6 +1437,67 @@ test('releasing a claim makes the question available again', () => {
   assert.equal(script.fetchUnpostedQuestions('Polity', 10, true).length, 1);
 });
 
+test('a claim remembers the status it interrupted', () => {
+  const { script, sheet, map } = sheetWithQuestions(1);
+  sheet.getRange(2, script.colNum(map, 'Status')).setValue('Scheduled');
+
+  script.claimQuestionRows('Polity', [2]);
+  assert.match(String(sheet.values[1][map['Posted']]), /^SENDING \| .* \| Scheduled$/);
+});
+
+test('rows a killed run left claimed are put back in the queue, with their status', () => {
+  // The bug: a run that stopped half way — a serverless timeout, a closed
+  // laptop — left its unsent questions marked Sending for ever. They were not
+  // posted, and they could never be posted again either.
+  const { script, sheet, map } = sheetWithQuestions(3);
+  sheet.getRange(3, script.colNum(map, 'Status')).setValue('Scheduled');
+  script.claimQuestionRows('Polity', [2, 3]);
+  assert.equal(script.fetchUnpostedQuestions('Polity', 10, true).length, 1);
+
+  // Nothing is taken back from a run that may still be going.
+  assert.equal(script.recoverStaleClaims('Polity', 15).recovered.length, 0);
+
+  // Age the claims by rewriting their stamps two hours back.
+  const postedCol = script.colNum(map, 'Posted');
+  [2, 3].forEach((row) => {
+    const parts = String(sheet.values[row - 1][map['Posted']]).split('|');
+    sheet.getRange(row, postedCol).setValue('SENDING | 01-01-2020, 10:00:00 AM IST |' + parts[2]);
+  });
+
+  const result = script.recoverStaleClaims('Polity', 15);
+  assert.deepEqual(Array.from(result.recovered, (r) => r.row), [2, 3]);
+  assert.deepEqual(Array.from(result.recovered, (r) => r.status), ['Approved', 'Scheduled'],
+    'each row goes back to the status it had, not a guessed one');
+  assert.equal(sheet.values[1][map['Posted']], 'NO');
+  assert.equal(script.fetchUnpostedQuestions('Polity', 10, true).length, 3,
+    'all three are postable again');
+});
+
+test('a row held for checking is never handed back automatically', () => {
+  // It may be in the channel: posting it again would double-post it.
+  const { script, sheet, map } = sheetWithQuestions(1);
+  script.claimQuestionRows('Polity', [2]);
+  assert.equal(script.holdQuestionRows('Polity', [2], 'No answer from Telegram'), 1);
+
+  assert.match(String(sheet.values[1][map['Posted']]), /^CHECK \|/);
+  assert.equal(sheet.values[1][map['Status']], 'Sending');
+  assert.match(String(sheet.values[1][map['Review Notes']]), /No answer from Telegram/);
+
+  const result = script.recoverStaleClaims('Polity', 0);
+  assert.equal(result.recovered.length, 0, 'a held row was handed back');
+  assert.equal(result.held, 1);
+  assert.equal(script.fetchUnpostedQuestions('Polity', 10, true).length, 0, 'a held row is not eligible');
+});
+
+test('holding never touches a row that reached Posted', () => {
+  const { script, sheet, map } = sheetWithQuestions(1);
+  script.claimQuestionRows('Polity', [2]);
+  script.markRowsAsPostedInSheet('Polity', [2], '903', '6', {});
+
+  assert.equal(script.holdQuestionRows('Polity', [2], 'late failure'), 0);
+  assert.equal(sheet.values[1][map['Posted']], 'YES');
+});
+
 test('releasing never clears a row that reached Posted in the meantime', () => {
   // The race: a slow release arriving after the send actually succeeded would
   // otherwise un-post a live poll and send it a second time.

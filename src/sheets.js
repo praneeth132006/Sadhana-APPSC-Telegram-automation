@@ -42,7 +42,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -393,6 +393,38 @@ async function releaseQuestions(ctx, subject, rowNumbers, status) {
 }
 
 /**
+ * recoverStaleClaims — puts back in the queue rows a killed run left claimed.
+ *
+ * Rows held for checking are never touched; see recoverStaleClaims in the
+ * Apps Script.
+ *
+ * @param {string} subject Subject tab
+ * @param {number} minutes How old a claim must be to count as abandoned
+ * @returns {Promise<{recovered: Array<Object>, held: number}>}
+ */
+async function recoverStaleClaims(ctx, subject, minutes) {
+  const result = await request(ctx, 'POST', { action: 'recoverStaleClaims', subject, minutes });
+  const data = result.data || {};
+  return { recovered: data.recovered || [], held: Number(data.held) || 0 };
+}
+
+/**
+ * holdQuestions — marks rows that need a person: the poll may be in the
+ * channel, but the sheet does not say so. They stay out of the queue and are
+ * never recovered automatically.
+ *
+ * @param {string} subject Subject tab
+ * @param {Array<number>} rowNumbers 1-based sheet rows
+ * @param {string} [note] What happened, for the Review Notes column
+ * @returns {Promise<number>} Rows held
+ */
+async function holdQuestions(ctx, subject, rowNumbers, note) {
+  if (!rowNumbers || !rowNumbers.length) return 0;
+  const result = await request(ctx, 'POST', { action: 'holdQuestions', subject, rowNumbers, note: note || '' });
+  return result.heldCount || 0;
+}
+
+/**
  * markAsPosted — records the full posting trail for a batch of rows.
  *
  * @param {string} subject Subject tab name
@@ -727,6 +759,7 @@ const IMPLEMENTATIONS = {
   ping, readConfig, getSubjects, writeConfig, getUnpostedQuestions, markAsPosted,
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
+  recoverStaleClaims, holdQuestions,
   unpostQuestions, listPosted, bulkStatus, scheduleQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
