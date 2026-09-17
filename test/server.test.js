@@ -1915,3 +1915,238 @@ test('POST /api/support/resend-invite requires sign-in', async () => {
   const res = await call(`/api/support/resend-invite?group=${TEST_GROUP}`, { method: 'POST', body: { ticketId: 'T-260917-AB2C' } });
   assert.equal(res.status, 401);
 });
+
+// ---- The pass and coupons in the payment webhook ---------------------------
+
+test('a paid link grants the promised date and name and counts its coupon once', async () => {
+  paymentCalls.length = 0;
+  calls.length = 0;
+  stub(sheets, 'recordRedemption', { recorded: true, times_used: 1 });
+  const body = JSON.stringify({
+    event: 'payment_link.paid',
+    payload: {
+      payment_link: { entity: { id: 'plink_c', notes: {
+        telegram_id: '4242', telegram_username: 'asha', plan_id: 'exam_pass', group_id: 'appsc_news_en',
+        valid_until: '31-05-2099', plan_label: 'Target APPSC 2026',
+        coupon_code: 'SAVE50', original_amount: '199', discount_amount: '50'
+      } } },
+      payment: { entity: { id: 'pay_coupon1', amount: 14900 } }
+    }
+  });
+
+  const res = await fetch(baseUrl + '/api/payments/webhook', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': signWebhook(body) },
+    body
+  });
+  assert.equal(res.status, 200);
+
+  assert.equal(paymentCalls.length, 1);
+  assert.equal(paymentCalls[0].validUntil, '31-05-2099');
+  assert.equal(paymentCalls[0].planLabel, 'Target APPSC 2026');
+  assert.equal(paymentCalls[0].amountPaise, 14900, 'the amount actually paid is recorded');
+
+  const redemption = calls.find((c) => c.name === 'recordRedemption');
+  assert.ok(redemption, 'the coupon use was not recorded');
+  assert.deepEqual(redemption.args[0], {
+    code: 'SAVE50', telegram_id: '4242', username: 'asha', group: 'Newspaper · English',
+    original_amount: 199, discount: 50, paid_amount: 149, payment_id: 'pay_coupon1'
+  });
+});
+
+test('a coupon tally that cannot be written never blocks the student\'s access', async () => {
+  paymentCalls.length = 0;
+  const original = clientStubs.recordRedemption;
+  clientStubs.recordRedemption = async () => { throw new Error('Unknown POST action: recordRedemption'); };
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    const body = JSON.stringify({
+      event: 'payment_link.paid',
+      payload: {
+        payment_link: { entity: { id: 'plink_d', notes: {
+          telegram_id: '4243', plan_id: 'exam_pass', group_id: 'appsc_news_en', coupon_code: 'SAVE50'
+        } } },
+        payment: { entity: { id: 'pay_coupon2', amount: 14900 } }
+      }
+    });
+    const res = await fetch(baseUrl + '/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': signWebhook(body) },
+      body
+    });
+    assert.equal(res.status, 200, 'a coupon bookkeeping failure must not make Razorpay retry the grant');
+    assert.equal(paymentCalls.length, 1);
+  } finally {
+    clientStubs.recordRedemption = original;
+    console.error = quiet;
+  }
+});
+
+// ===========================================================================
+// Pass & Coupons API
+// ===========================================================================
+
+stub(sheets, 'listCoupons', [
+  { code: 'SAVE50', discount_type: 'flat', discount_value: 50, active: true, expires_on: '', max_uses: null, times_used: 3, one_per_student: true },
+  { code: 'OLD10', discount_type: 'percent', discount_value: 10, active: true, expires_on: '01-01-2020', max_uses: null, times_used: 0, one_per_student: true },
+  { code: 'FULL', discount_type: 'flat', discount_value: 20, active: true, expires_on: '', max_uses: 5, times_used: 5, one_per_student: false },
+  { code: 'PAUSED', discount_type: 'flat', discount_value: 20, active: false, expires_on: '', max_uses: null, times_used: 0, one_per_student: true }
+]);
+stub(sheets, 'listRedemptions', { total: 1, redemptions: [{ code: 'SAVE50', telegram_id: '1', paid_amount: 149 }] });
+stub(sheets, 'getCoupon', (code) => (code === 'SAVE50' ? { code: 'SAVE50', times_used: 3 } : null));
+stub(sheets, 'upsertCoupon', (coupon) => Object.assign({ times_used: 0 }, coupon));
+stub(sheets, 'deleteCoupon', (code) => (code === 'UNUSED1' ? { deleted: true }
+  : code === 'SAVE50' ? { deleted: false, reason: 'This code has been used 3 time(s). Switch it off instead.' }
+    : { deleted: false, reason: 'not found' }));
+stub(sheets, 'logTicketEvent', (id) => ({ ticket_id: id }));
+
+test('the pricing routes require sign-in', async () => {
+  for (const [method, path] of [['GET', '/api/pricing'], ['POST', '/api/pricing/pass'], ['POST', '/api/pricing/coupon'],
+    ['POST', '/api/pricing/coupon/delete'], ['GET', '/api/pricing/redemptions']]) {
+    const res = await call(`${path}?group=${TEST_GROUP}`, { method, body: method === 'POST' ? {} : undefined });
+    assert.equal(res.status, 401, `${method} ${path} answered without sign-in`);
+  }
+});
+
+test('GET /api/pricing shows the pass with admin overrides and each coupon\'s state', async () => {
+  const original = clientStubs.getBotSettings;
+  clientStubs.getBotSettings = async () => ({ pass_name: 'Target APPSC 2026', pass_price: '249', pass_valid_until: '31-05-2099' });
+  try {
+    const res = await authed('/api/pricing');
+    assert.equal(res.status, 200);
+    const { pass, coupons, redemptions, passSettings } = res.json.data;
+    assert.equal(pass.name, 'Target APPSC 2026');
+    assert.equal(pass.price, 249);
+    assert.equal(pass.priceText, '₹249');
+    assert.equal(pass.validUntil, '31-05-2099');
+    assert.equal(pass.defaults.price, 199, 'the built-in default is shown alongside');
+    assert.equal(passSettings.price, '249');
+    assert.deepEqual(coupons.map((c) => [c.code, c.state, c.discountText]), [
+      ['SAVE50', 'live', '₹50 off'], ['OLD10', 'expired', '10% off'], ['FULL', 'used_up', '₹20 off'], ['PAUSED', 'off', '₹20 off']
+    ]);
+    assert.equal(redemptions.total, 1);
+  } finally {
+    clientStubs.getBotSettings = original;
+  }
+});
+
+test('POST /api/pricing/pass validates and saves the pass as settings, with the real actor', async () => {
+  assert.equal((await authed('/api/pricing/pass', { method: 'POST', body: { price: '0' } })).status, 400);
+  assert.equal((await authed('/api/pricing/pass', { method: 'POST', body: { validUntil: '01-01-2020' } })).status, 400);
+
+  calls.length = 0;
+  const res = await authed('/api/pricing/pass', {
+    method: 'POST', body: { name: 'Target Group 2', price: '199', validUntil: '31-05-2099', description: '' }
+  });
+  assert.equal(res.status, 200, res.json && res.json.error);
+  const saved = calls.find((c) => c.name === 'updateBotSettings');
+  assert.deepEqual(saved.args, [
+    { pass_name: 'Target Group 2', pass_price: '199', pass_valid_until: '31-05-2099', pass_description: '' },
+    'Test Curator (curator@example.com)'
+  ]);
+});
+
+test('POST /api/pricing/coupon creates, refuses a duplicate create, and validates', async () => {
+  assert.equal((await authed('/api/pricing/coupon', { method: 'POST', body: { coupon: { code: 'x y', discount_type: 'flat', discount_value: 10 } } })).status, 400);
+  assert.equal((await authed('/api/pricing/coupon', { method: 'POST', body: { coupon: { code: 'BIG', discount_type: 'percent', discount_value: 100 } } })).status, 400);
+
+  const dup = await authed('/api/pricing/coupon', { method: 'POST', body: { mode: 'create', coupon: { code: 'save50', discount_type: 'flat', discount_value: 10 } } });
+  assert.equal(dup.status, 409);
+  assert.match(dup.json.error, /already exists/);
+
+  calls.length = 0;
+  const created = await authed('/api/pricing/coupon', {
+    method: 'POST',
+    body: { mode: 'create', coupon: { code: 'diwali25', discount_type: 'percent', discount_value: '25', expires_on: '10-11-2099', max_uses: '100' } }
+  });
+  assert.equal(created.status, 200, created.json && created.json.error);
+  const upsert = calls.find((c) => c.name === 'upsertCoupon');
+  assert.equal(upsert.args[0].code, 'DIWALI25');
+  assert.equal(upsert.args[0].max_uses, 100);
+  assert.equal(upsert.args[1], 'Test Curator (curator@example.com)');
+  assert.equal(created.json.data.state, 'live');
+  assert.equal(created.json.data.discountText, '25% off');
+
+  // Editing an existing code is allowed.
+  const edited = await authed('/api/pricing/coupon', { method: 'POST', body: { mode: 'edit', coupon: { code: 'SAVE50', discount_type: 'flat', discount_value: 60, active: false } } });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.json.data.state, 'off');
+});
+
+test('POST /api/pricing/coupon/delete deletes an unused code and explains a refusal', async () => {
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'unused1' } })).status, 200);
+  const used = await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'SAVE50' } });
+  assert.equal(used.status, 409);
+  assert.match(used.json.error, /Switch it off/);
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'NOPE99' } })).status, 404);
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: '' } })).status, 400);
+});
+
+// ---- Support: student details, payment check and grant ---------------------
+
+test('GET /api/support/student reports passes and a suggestion for the ticket\'s student', async () => {
+  await withRecordedBot(async () => {
+    const originalEligible = membership.isEligible;
+    const originalMember = TelegramBotClient.prototype.getChatMember;
+    membership.isEligible = async () => ({ ok: true, reason: 'active subscription',
+      subscriber: { status: 'active', plan_label: 'Target 2026', expiry_date: '31-05-2099, 11:59:59 PM IST', total_paid: 199, payment_id: 'pay_OLD000000001' } });
+    TelegramBotClient.prototype.getChatMember = async () => ({ status: 'left' });
+    try {
+      assert.equal((await authed('/api/support/student?ticketId=bad')).status, 400);
+      const res = await authed('/api/support/student?ticketId=T-260917-AB2C');
+      assert.equal(res.status, 200, res.json && res.json.error);
+      const first = res.json.data.passes[0];
+      assert.equal(first.valid, true);
+      assert.equal(first.inGroup, 'no');
+      assert.equal(first.paymentId, 'pay_OLD000000001');
+      assert.match(res.json.data.suggestion, /not in .* → tap "🔗 Send new invite link"/);
+    } finally {
+      membership.isEligible = originalEligible;
+      TelegramBotClient.prototype.getChatMember = originalMember;
+    }
+  });
+});
+
+test('POST /api/support/check-payment asks Razorpay and logs the check', async () => {
+  const razorpayModule = require('../src/razorpay');
+  const original = razorpayModule.getPayment;
+  razorpayModule.getPayment = async (id) => ({ id, status: 'captured', amount: 19900, method: 'upi', created_at: 1789000000, notes: { telegram_id: '4242' } });
+  try {
+    await withRecordedBot(async () => {
+      assert.equal((await authed('/api/support/check-payment', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'notapay' } })).status, 400);
+
+      calls.length = 0;
+      const res = await authed('/api/support/check-payment', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3' } });
+      assert.equal(res.status, 200, res.json && res.json.error);
+      assert.equal(res.json.data.captured, true);
+      assert.equal(res.json.data.payment.amount, '₹199');
+      assert.equal(res.json.data.payment.belongsTo, 'this student');
+      assert.ok(res.json.data.groups.length >= 1);
+      const logged = calls.find((c) => c.name === 'logTicketEvent');
+      assert.equal(logged.args[1].action, 'payment_checked');
+      assert.equal(logged.args[1].who, 'Test Curator (curator@example.com)');
+    });
+  } finally {
+    razorpayModule.getPayment = original;
+  }
+});
+
+test('POST /api/support/grant-pass needs a group from the ticket\'s bot and reports the outcome', async () => {
+  const razorpayModule = require('../src/razorpay');
+  const original = razorpayModule.getPayment;
+  razorpayModule.getPayment = async (id) => ({ id, status: 'failed', amount: 19900 });
+  try {
+    await withRecordedBot(async () => {
+      const noGroup = await authed('/api/support/grant-pass', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3', groupId: 'upsc' } });
+      assert.equal(noGroup.status, 400, 'a group from another bot must be refused');
+
+      const res = await authed('/api/support/grant-pass', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3', groupId: 'appsc_news_en' } });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.data.granted, false);
+      assert.match(res.json.data.message, /Not granted\. Razorpay does not show this payment as captured/);
+    });
+  } finally {
+    razorpayModule.getPayment = original;
+  }
+});

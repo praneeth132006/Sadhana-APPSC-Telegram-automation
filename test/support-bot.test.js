@@ -50,14 +50,18 @@ function fakeSheet(overrides = {}) {
     appendTicketMessage: record('appendTicketMessage', (id) => ({ ticket_id: id })),
     setTicketStatus: record('setTicketStatus', (id, status) => ({ ticket_id: id, status })),
     listTickets: record('listTickets', { total: 0, tickets: [], counts: { open: 0 } }),
-    getSubscriber: record('getSubscriber', { status: 'active', expiry_date: '30-11-2026' })
+    getSubscriber: record('getSubscriber', { status: 'active', expiry_date: '30-11-2099', plan_label: 'Target 2026 Pass', total_paid: 199, payment_id: 'pay_OLDPAYMENT0001' }),
+    getTicket: record('getTicket', null),
+    logTicketEvent: record('logTicketEvent', (id) => ({ ticket_id: id })),
+    listSubscribers: record('listSubscribers', { total: 0, subscribers: [] }),
+    getCoupon: record('getCoupon', null)
   };
   Object.entries(overrides).forEach(([name, result]) => { client[name] = record(name, result); });
   return client;
 }
 
 /** A bot wired to a fake sheet, with every Telegram call recorded. */
-function makeBot({ sheet = fakeSheet(), supportChat = SUPPORT_CHAT } = {}) {
+function makeBot({ sheet = fakeSheet(), supportChat = SUPPORT_CHAT, memberStatus = 'left' } = {}) {
   if (supportChat) process.env.SUPPORT_CHAT_UPSC = supportChat;
   else delete process.env.SUPPORT_CHAT_UPSC;
   sheets.forGroup = () => sheet;
@@ -72,6 +76,10 @@ function makeBot({ sheet = fakeSheet(), supportChat = SUPPORT_CHAT } = {}) {
   ['sendMessage', 'copyMessage', 'answerCallbackQuery', 'editMessageReplyMarkup', 'deleteMessage']
     .forEach((method) => { app.bot[method] = record(method); });
   app.bot.getMe = async () => BOT;
+  app.bot.getChatMember = async (chatId, userId) => {
+    sent.push({ method: 'getChatMember', args: [chatId, userId] });
+    return { status: memberStatus };
+  };
 
   const deliver = async (update) => {
     app.bot.processUpdate(Object.assign({ update_id: nextId++ }, update));
@@ -126,7 +134,8 @@ test('/support shows one button per issue type', async () => {
   const [menu] = messages(STUDENT.id);
   assert.match(menu.args[1], /What do you need help with/);
   const buttons = menu.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
-  assert.deepEqual(buttons, support.CATEGORIES.map((c) => `sup:faq:${c.id}`));
+  assert.deepEqual(buttons, support.MENU_CATEGORIES.map((c) => `sup:faq:${c.id}`));
+  assert.ok(!buttons.includes('sup:faq:renewal'), 'auto-pay is no longer sold, so it is not offered');
 });
 
 test('an issue button answers instantly, with the text admins set in the sheet', async () => {
@@ -167,8 +176,14 @@ test('replying to the prompt opens a ticket in the sheet and in the admin chat',
 
   const [toAdmins] = messages(SUPPORT_CHAT);
   assert.deepEqual(support.parseTicketHeader(toAdmins.args[1]), { ticketId: ticket.ticket_id, telegramId: '42' });
-  assert.match(toAdmins.args[1], /active<\/b> until 30-11-2026/, 'admins should see the student\'s pass');
-  assert.match(toAdmins.args[1], /pay_ABC123/);
+  const card = toAdmins.args[1];
+  assert.match(card, /NEW TICKET<\/b> · 💳 Paid, but no invite link/);
+  assert.match(card, /Status: 🟠 Waiting for admin/);
+  assert.match(card, /UPSC Prelims<\/b>: ✅ valid until 30-11-2099 · <b>NOT in the group<\/b>/,
+    'admins should see the pass and that the student is not in the group');
+  assert.match(card, /paid ₹199 · pay_OLDPAYMENT0001/);
+  assert.match(card, /pay_ABC123/);
+  assert.match(card, /Suggested:<\/b> Pass is valid but they are not in UPSC Prelims → tap "🔗 Send new invite link"/);
 
   const [confirmation] = messages(STUDENT.id);
   assert.equal(support.parseReplyLine(confirmation.args[1]), ticket.ticket_id);
@@ -256,7 +271,8 @@ test('replying to an admin answer adds to the ticket and shows admins what came 
   const [toAdmins] = messages(SUPPORT_CHAT);
   const text = toAdmins.args[1];
   assert.ok(support.parseTicketHeader(text));
-  assert.match(text, /Student replied/);
+  assert.match(text, /STUDENT REPLIED/);
+  assert.match(text, /Status: 🟠 Waiting for admin/);
   assert.match(text, /Earlier in this ticket[\s\S]*Paid but no link[\s\S]*Admin @ravi_admin:\nTry again now/);
   assert.equal((text.match(/Still not working/g) || []).length, 1, 'the new message should not also appear in the history');
   assert.ok(toAdmins.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:42'),
@@ -443,7 +459,7 @@ test('a failed delivery is reported in the admin chat and not recorded as answer
   await deliver(supportChatMessage('hello', { reply_to_message: ticketMessage() }));
 
   assert.equal(sheet.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Not delivered: Forbidden/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Not delivered<\/b>: Forbidden/);
 });
 
 test('/close on a ticket closes it and tells the student', async () => {
@@ -453,7 +469,7 @@ test('/close on a ticket closes it and tells the student', async () => {
   const closed = sheet.calls.find((c) => c.name === 'setTicketStatus');
   assert.deepEqual(closed.args, ['T-260917-AB2C', 'closed', '@ravi_admin']);
   assert.match(messages(STUDENT.id)[0].args[1], /marked as resolved/);
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Closed by @ravi_admin/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Resolved<\/b> by @ravi_admin[\s\S]*Status: ✅ Resolved/);
 });
 
 test('/set changes a setting, and refuses one that does not exist', async () => {
@@ -504,7 +520,7 @@ test('/tickets posts each waiting ticket with its own buttons', async () => {
   await deliver(supportChatMessage('/tickets'));
 
   const posts = messages(SUPPORT_CHAT);
-  assert.match(posts[0].args[1], /Open 1 · 🔵 Answered 1 · ✅ Closed 3/);
+  assert.match(posts[0].args[1], /Waiting for admin: 1 · 🔵 Waiting for student: 1 · ✅ Resolved: 3/);
   assert.equal(posts.length, 3, 'a summary plus one post per waiting ticket');
   assert.match(posts[1].args[1], /^🎫 T-260917-AB2C · user 42[\s\S]*Invite link not working[\s\S]*link broken/);
   assert.ok(posts[1].args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:c:T-260917-AB2C:42'));
@@ -566,7 +582,7 @@ test('🔗 Resend invite refuses a student without an active pass and says why',
 
     assert.equal(messages(STUDENT.id).length, 0, 'no link may be sent without an active pass');
     assert.equal(sheet.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
-    assert.match(messages(SUPPORT_CHAT)[0].args[1], /no invite sent — subscription has expired[\s\S]*needs an active pass/);
+    assert.match(messages(SUPPORT_CHAT)[0].args[1], /no invite sent — subscription has expired[\s\S]*needs a valid pass/);
   });
 });
 
@@ -622,7 +638,8 @@ test('✍️ Reply asks for an answer that is then delivered like any other repl
 test('🎟 Pass status shows every group the student holds', async () => {
   const { deliver, messages } = makeBot();
   await deliver(adminTap('adm:p:T-260917-AB2C:42'));
-  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Pass status[\s\S]*active<\/b> until 30-11-2026/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Pass & payment<\/b>[\s\S]*valid until 30-11-2099 · <b>NOT in the group/);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Suggested:<\/b> Pass is valid but they are not in/);
 });
 
 test('📜 Full history posts the whole conversation, or explains when it is missing', async () => {
@@ -631,11 +648,11 @@ test('📜 Full history posts the whole conversation, or explains when it is mis
     conversation: '[17-09-2026, 10:12:03 AM IST] Asha:\nfirst <message>'
   } }) });
   await found.deliver(adminTap('adm:h:T-260917-AB2C:42'));
-  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /Full history[\s\S]*answered[\s\S]*first &lt;message&gt;/);
+  assert.match(found.messages(SUPPORT_CHAT)[0].args[1], /History<\/b> · 🔵 Waiting for student[\s\S]*first &lt;message&gt;/);
 
   const missing = makeBot({ sheet: fakeSheet({ getTicket: null }) });
   await missing.deliver(adminTap('adm:h:T-260917-AB2C:42'));
-  assert.match(missing.messages(SUPPORT_CHAT)[0].args[1], /not in the sheet/);
+  assert.match(missing.messages(SUPPORT_CHAT)[0].args[1], /could not be read from the sheet/);
 });
 
 test('✅ Close from a button closes the ticket, tells the student, and offers Reopen', async () => {
@@ -675,5 +692,325 @@ test('a long message with a long history still fits in one Telegram message', as
   const [post] = messages(SUPPORT_CHAT);
   const visible = post.args[1].replace(/<[^>]+>/g, '').replace(/&lt;|&gt;|&amp;/g, '_');
   assert.ok(visible.length <= 4096, `post is ${visible.length} characters`);
-  assert.match(post.args[1], /Full history/);
+  assert.match(post.args[1], /cut short — tap 📜 History/);
+});
+
+// ---------------------------------------------------------------------------
+// Buying the pass, with and without a coupon
+// ---------------------------------------------------------------------------
+
+const razorpay = require('../src/razorpay');
+const pricing = require('../src/pricing');
+
+/** Records payment links instead of calling Razorpay. */
+async function withPaymentLinks(fn) {
+  const original = razorpay.createPaymentLink;
+  const links = [];
+  razorpay.createPaymentLink = async (options) => {
+    links.push(options);
+    return { short_url: 'https://rzp.io/l/test', id: 'plink_1' };
+  };
+  try {
+    return await fn(links);
+  } finally {
+    razorpay.createPaymentLink = original;
+  }
+}
+
+function coupon(overrides) {
+  return Object.assign({
+    code: 'SAVE50', discount_type: 'flat', discount_value: 50, active: true, expires_on: '',
+    max_uses: null, times_used: 0, one_per_student: true, used_by_student: 0
+  }, overrides || {});
+}
+
+test('/plans shows the one pass with its name, date and price, and a coupon button', async () => {
+  const sheet = fakeSheet({ getBotSettings: { pass_name: 'Target UPSC Prelims 2026', pass_price: '199', pass_valid_until: '31-05-2099' } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(privateMessage('/plans'));
+
+  const [offer] = messages(STUDENT.id);
+  assert.match(offer.args[1], /Target UPSC Prelims 2026[\s\S]*Valid until <b>31-05-2099[\s\S]*Price: <b>₹199/);
+  const buttons = offer.args[2].reply_markup.inline_keyboard.flat();
+  assert.equal(buttons[0].text, '💳 Pay ₹199');
+  assert.equal(buttons[0].callback_data, 'buy:upsc:exam_pass');
+  assert.equal(buttons[1].callback_data, 'cpn:upsc');
+});
+
+test('a valid coupon shows the discounted price and a pay button that carries the code', async () => {
+  const sheet = fakeSheet({ getCoupon: coupon() });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(tap('cpn:upsc'));
+  const [prompt] = messages(STUDENT.id);
+  assert.equal(prompt.args[2].reply_markup.force_reply, true);
+
+  await deliver(privateMessage(' save50 ', { reply_to_message: { message_id: 1, from: BOT, chat: { id: STUDENT.id }, text: prompt.args[1].replace(/<[^>]+>/g, '') } }));
+  const lookup = sheet.calls.find((c) => c.name === 'getCoupon');
+  assert.deepEqual(lookup.args, ['SAVE50', '42'], 'the code is normalised and checked for this student');
+
+  const offer = messages(STUDENT.id).at(-1);
+  assert.match(offer.args[1], /Coupon <b>SAVE50<\/b> applied — ₹50 off[\s\S]*<s>₹199<\/s> <b>₹149<\/b> \(you save ₹50\)/);
+  const buttons = offer.args[2].reply_markup.inline_keyboard.flat();
+  assert.equal(buttons[0].text, '💳 Pay ₹149');
+  assert.equal(buttons[0].callback_data, 'buy:upsc:exam_pass:SAVE50');
+  assert.equal(buttons[1].callback_data, 'pick:upsc', 'the student can remove the coupon');
+});
+
+test('a refused coupon says why and offers another try or the full price', async () => {
+  const sheet = fakeSheet({ getCoupon: coupon({ used_by_student: 1 }) });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(privateMessage('SAVE50', { reply_to_message: { message_id: 1, from: BOT, chat: { id: STUDENT.id }, text: '🎟 Coupon code for UPSC Prelims\n\nType it' } }));
+
+  const [reply] = messages(STUDENT.id);
+  assert.match(reply.args[1], /SAVE50<\/b>: You have already used that coupon code/);
+  assert.deepEqual(reply.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data), ['cpn:upsc', 'pick:upsc']);
+});
+
+test('paying with a coupon re-checks it and charges the discounted amount, with the coupon in the notes', async () => {
+  await withPaymentLinks(async (links) => {
+    const sheet = fakeSheet({ getCoupon: coupon({ discount_type: 'percent', discount_value: 20 }), getSubscriber: null,
+      getBotSettings: { pass_valid_until: '31-05-2099', pass_name: 'Target 2026' } });
+    const { deliver, messages } = makeBot({ sheet });
+    await deliver(tap('buy:upsc:exam_pass:SAVE50'));
+
+    assert.equal(links.length, 1);
+    assert.equal(links[0].plan.amountPaise, 15920, '20% off ₹199 is ₹159.20');
+    assert.equal(links[0].plan.groupId, 'upsc');
+    assert.deepEqual(links[0].extraNotes, {
+      plan_label: 'Target 2026', valid_until: '31-05-2099',
+      coupon_code: 'SAVE50', original_amount: '199', discount_amount: '39.8'
+    });
+    assert.match(messages(STUDENT.id).at(-1).args[1], /You pay <b>₹159.20<\/b> \(coupon SAVE50, you save ₹39.80\)/);
+  });
+});
+
+test('a coupon that stopped working before the tap is refused and nothing is charged', async () => {
+  await withPaymentLinks(async (links) => {
+    const sheet = fakeSheet({ getCoupon: coupon({ active: false }), getSubscriber: null });
+    const { deliver, messages } = makeBot({ sheet });
+    await deliver(tap('buy:upsc:exam_pass:SAVE50'));
+    assert.equal(links.length, 0);
+    assert.match(messages(STUDENT.id).at(-1).args[1], /no longer active/);
+  });
+});
+
+test('a button for a retired pass sells nothing and shows the current pass instead', async () => {
+  await withPaymentLinks(async (links) => {
+    const { deliver, messages } = makeBot();
+    await deliver(tap('buy:upsc:sprint_30'));
+    assert.equal(links.length, 0);
+    assert.match(messages(STUDENT.id)[0].args[1], /no longer sold/);
+    assert.match(messages(STUDENT.id)[1].args[1], /Price: <b>₹199/);
+  });
+});
+
+test('someone who already holds the pass to the same date is not charged again', async () => {
+  await withPaymentLinks(async (links) => {
+    const sheet = fakeSheet({
+      getBotSettings: { pass_valid_until: '31-05-2099' },
+      getSubscriber: { status: 'active', expiry_date: '31-05-2099, 11:59:59 PM IST', plan_label: 'Target 2026' }
+    });
+    const { deliver, messages } = makeBot({ sheet });
+    await deliver(tap('buy:upsc:exam_pass'));
+    assert.equal(links.length, 0);
+    assert.match(messages(STUDENT.id)[0].args[1], /nothing to buy/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Support: the case file and the admin tools
+// ---------------------------------------------------------------------------
+
+test('a student already in the group gets a different suggestion than one outside it', async () => {
+  const prompt = { message_id: 800, from: BOT, chat: { id: STUDENT.id, type: 'private' },
+    text: support.promptLine(support.categoryById('invite')) };
+  const inside = makeBot({ memberStatus: 'member' });
+  await inside.deliver(privateMessage('cannot see posts', { reply_to_message: prompt }));
+  assert.match(inside.messages(SUPPORT_CHAT)[0].args[1], /in the group[\s\S]*already in the group → ask what exactly they see/);
+});
+
+test('a ticket that mentions a payment id gets a Check payment button', async () => {
+  const { deliver, messages } = makeBot();
+  const prompt = { message_id: 801, from: BOT, chat: { id: STUDENT.id, type: 'private' },
+    text: support.promptLine(support.categoryById('payment')) };
+  await deliver(privateMessage('paid, id pay_TZ8ciB8Yng8WE3', { reply_to_message: prompt }));
+  const buttons = messages(SUPPORT_CHAT)[0].args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(buttons.some((b) => /^adm:k:T-\d{6}-[A-Z0-9]{4}:42:pay_TZ8ciB8Yng8WE3$/.test(b)));
+});
+
+test('📋 Quick replies lists the answers for this issue type, relevant ones first', async () => {
+  const sheet = fakeSheet({ getTicket: { ticket_id: 'T-260917-AB2C', category: 'payment', status: 'open' } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(adminTap('adm:q:T-260917-AB2C:42'));
+
+  const [menu] = messages(SUPPORT_CHAT);
+  const buttons = menu.args[2].reply_markup.inline_keyboard.flat();
+  assert.equal(buttons[0].text, '📎 Ask for payment proof');
+  assert.equal(buttons.at(-1).text, '✅ Resolved — close ticket');
+  assert.equal(buttons[0].callback_data, 'adm:q1:T-260917-AB2C:42');
+  assert.match(menu.args[1], /Payment not received/);
+});
+
+test('a quick reply is sent to the student, logged, and uses the text admins set', async () => {
+  const sheet = fakeSheet({ getBotSettings: { qr_payment_not_received: 'Custom: no payment found.' } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(adminTap('adm:q2:T-260917-AB2C:42'));
+
+  assert.match(messages(STUDENT.id)[0].args[1], /Support reply · T-260917-AB2C[\s\S]*Custom: no payment found\./);
+  const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
+  assert.equal(appended.args[1].logAction, 'quick_reply:qr_payment_not_received');
+  assert.equal(appended.args[1].handledBy, '@ravi_admin');
+  assert.equal(appended.args[1].status, 'answered');
+  assert.equal(sheet.calls.filter((c) => c.name === 'setTicketStatus').length, 0);
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Quick reply sent<\/b> by @ravi_admin/);
+});
+
+test('the "Resolved" quick reply also closes the ticket', async () => {
+  const { deliver, sheet, messages } = makeBot();
+  await deliver(adminTap('adm:q7:T-260917-AB2C:42'));
+  assert.deepEqual(sheet.calls.find((c) => c.name === 'setTicketStatus').args, ['T-260917-AB2C', 'closed', '@ravi_admin']);
+  const buttons = messages(SUPPORT_CHAT)[0].args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(buttons.includes('adm:o:T-260917-AB2C:42'), 'a closed ticket offers Reopen');
+});
+
+test('an invite that could not be sent is still written to the Support Log', async () => {
+  await withResendInvite(async () => ({ sent: false, reason: 'no subscription on record', subscriber: null }), async () => {
+    const { deliver, sheet } = makeBot();
+    await deliver(adminTap('adm:i:T-260917-AB2C:42'));
+    const logged = sheet.calls.find((c) => c.name === 'logTicketEvent');
+    assert.equal(logged.args[0], 'T-260917-AB2C');
+    assert.equal(logged.args[1].action, 'invite_not_sent');
+    assert.equal(logged.args[1].who, '@ravi_admin');
+  });
+});
+
+/** Replaces razorpay.getPayment for one test. */
+async function withPayment(payment, fn) {
+  const original = razorpay.getPayment;
+  razorpay.getPayment = async () => {
+    if (payment instanceof Error) throw payment;
+    return payment;
+  };
+  try {
+    return await fn();
+  } finally {
+    razorpay.getPayment = original;
+  }
+}
+
+test('🔍 Check payment reports what Razorpay says and logs the check', async () => {
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'failed', amount: 19900, method: 'upi',
+    created_at: 1789000000, error_description: 'Payment was declined by the bank' }, async () => {
+    const { deliver, sheet, messages } = makeBot();
+    await deliver(adminTap('adm:k:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+
+    const [report] = messages(SUPPORT_CHAT);
+    assert.match(report.args[1], /failed — no money was taken[\s\S]*₹199[\s\S]*declined by the bank/);
+    assert.ok(!report.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data.startsWith('adm:g:')),
+      'a failed payment must not offer a grant');
+    const logged = sheet.calls.find((c) => c.name === 'logTicketEvent');
+    assert.equal(logged.args[1].action, 'payment_checked');
+    assert.match(logged.args[1].details, /failed/);
+  });
+});
+
+test('a captured payment with no pass offers "Grant pass for this payment"', async () => {
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900, created_at: 1789000000 }, async () => {
+    const { deliver, messages } = makeBot({ sheet: fakeSheet({ getSubscriber: null }) });
+    await deliver(adminTap('adm:k:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+    const [report] = messages(SUPPORT_CHAT);
+    assert.match(report.args[1], /Money was received but the student has no valid pass/);
+    assert.ok(report.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:g:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+  });
+});
+
+test('granting asks which group first, then grants through the normal payment path', async () => {
+  await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 14900, created_at: 1789000000 }, async () => {
+    const original = membership.grantAccess;
+    const grants = [];
+    membership.grantAccess = async (options) => {
+      grants.push(options);
+      return { subscriber: { plan_label: 'Target 2026', expiry_date: '31-05-2099, 11:59:59 PM IST' }, inviteLink: 'https://t.me/+granted', alreadyProcessed: false };
+    };
+    try {
+      const sheet = fakeSheet({ getSubscriber: null, getBotSettings: { pass_valid_until: '31-05-2099', pass_name: 'Target 2026' } });
+      const { deliver, messages } = makeBot({ sheet });
+
+      await deliver(adminTap('adm:g:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      const ask = messages(SUPPORT_CHAT)[0];
+      assert.match(ask.args[1], /Grant a pass for <code>pay_TZ8ciB8Yng8WE3/);
+      assert.equal(grants.length, 0, 'nothing is granted before the admin confirms');
+      assert.equal(ask.args[2].reply_markup.inline_keyboard[0][0].callback_data, 'adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3');
+
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.equal(grants.length, 1);
+      assert.deepEqual({ ...grants[0] }, {
+        groupId: 'upsc', telegramId: '42', planId: 'exam_pass', paymentId: 'pay_TZ8ciB8Yng8WE3',
+        amountPaise: 14900, event: 'manual.grant', validUntil: '31-05-2099', planLabel: 'Target 2026'
+      });
+      assert.equal(messages(STUDENT.id)[0].args[2].reply_markup.inline_keyboard[0][0].url, 'https://t.me/+granted');
+      const appended = sheet.calls.find((c) => c.name === 'appendTicketMessage');
+      assert.equal(appended.args[1].logAction, 'pass_granted');
+      assert.match(messages(SUPPORT_CHAT).at(-1).args[1], /Pass granted<\/b> by @ravi_admin/);
+    } finally {
+      membership.grantAccess = original;
+    }
+  });
+});
+
+test('a grant is refused when the payment was not captured, belongs to someone else, or was already used', async () => {
+  const original = membership.grantAccess;
+  let granted = 0;
+  membership.grantAccess = async () => { granted++; return {}; };
+  try {
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'authorized', amount: 19900 }, async () => {
+      const { deliver, messages } = makeBot();
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /Not granted.<\/b> Razorpay does not show this payment as captured/);
+    });
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900, notes: { telegram_id: '999' } }, async () => {
+      const { deliver, messages } = makeBot();
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /another student's checkout/);
+    });
+    await withPayment({ id: 'pay_TZ8ciB8Yng8WE3', status: 'captured', amount: 19900 }, async () => {
+      const sheet = fakeSheet({ listSubscribers: { total: 1, subscribers: [{ telegram_id: '777', payment_id: 'pay_TZ8ciB8Yng8WE3' }] } });
+      const { deliver, messages } = makeBot({ sheet });
+      await deliver(adminTap('adm:g0:T-260917-AB2C:42:pay_TZ8ciB8Yng8WE3'));
+      assert.match(messages(SUPPORT_CHAT)[0].args[1], /already recorded for Telegram id <code>777/);
+      assert.equal(sheet.calls.find((c) => c.name === 'logTicketEvent').args[1].action, 'pass_grant_refused');
+    });
+    assert.equal(granted, 0);
+  } finally {
+    membership.grantAccess = original;
+  }
+});
+
+test('/msg by Telegram id messages the student and opens a logged conversation', async () => {
+  const { deliver, sheet, messages } = makeBot();
+  await deliver(supportChatMessage('/msg 42 Your refund has been processed.'));
+
+  const [toStudent] = messages(STUDENT.id);
+  const ticketId = support.parseReplyLine(toStudent.args[1]);
+  assert.ok(ticketId, 'the message must carry a ticket so the student\'s reply threads');
+  assert.match(toStudent.args[1], /Your refund has been processed\./);
+
+  const created = sheet.calls.find((c) => c.name === 'createTicket').args[0];
+  assert.equal(created.ticket_id, ticketId);
+  assert.equal(created.opened_by, '@ravi_admin');
+  assert.equal(created.telegram_id, '42');
+  assert.match(messages(SUPPORT_CHAT)[0].args[1], /Message sent<\/b> by @ravi_admin/);
+});
+
+test('/msg by @username finds the student in the members sheet', async () => {
+  const sheet = fakeSheet({ listSubscribers: { total: 1, subscribers: [{ telegram_id: '42', username: 'Asha', name: 'Asha K' }] } });
+  const { deliver, messages } = makeBot({ sheet });
+  await deliver(supportChatMessage('/msg @asha hello'));
+  assert.equal(messages(STUDENT.id).length, 1);
+
+  const unknown = makeBot();
+  await unknown.deliver(supportChatMessage('/msg @nobody_here hello'));
+  assert.match(unknown.messages(SUPPORT_CHAT)[0].args[1], /No student found/);
+  await unknown.deliver(supportChatMessage('/msg 42'));
+  assert.match(unknown.messages(SUPPORT_CHAT).at(-1).args[1], /Usage/);
 });

@@ -14,6 +14,7 @@ const sheets = require('./sheets');
 const paybot = require('./paybot');
 const groups = require('./groups');
 const plans = require('./plans');
+const pricing = require('./pricing');
 
 /**
  * contextFor — everything one group needs for a membership operation.
@@ -259,7 +260,7 @@ async function resendInvite(groupId, telegramId) {
 async function grantAccess(options) {
   const {
     groupId, telegramId, planId, paymentId, amountPaise,
-    username, name, linkId, subscriptionId, event
+    username, name, linkId, subscriptionId, event, validUntil, planLabel
   } = options;
 
   const ctx = contextFor(groupId);
@@ -276,7 +277,13 @@ async function grantAccess(options) {
 
   // A renewal extends from the current expiry, so paying early never costs days.
   const currentExpiry = existing ? parseIst(existing.expiry_date) : null;
-  const expiry = plans.computeExpiry(plan, new Date(), currentExpiry);
+  // The pass's end date as the student was shown it at checkout, carried in
+  // the link's notes. A date already past would grant nothing, so it is only
+  // used when it is still ahead.
+  const promised = validUntil ? pricing.endOfDayIst(validUntil) : null;
+  const expiry = promised && promised.getTime() > Date.now()
+    ? promised
+    : plans.computeExpiry(plan, new Date(), currentExpiry);
 
   // Reuse a still-valid invite rather than minting a second live link.
   let inviteLink = existing && existing.invite_link ? existing.invite_link : '';
@@ -297,7 +304,7 @@ async function grantAccess(options) {
     username: username || (existing ? existing.username : ''),
     name: name || (existing ? existing.name : ''),
     plan: plan.id,
-    plan_label: plan.label,
+    plan_label: String(planLabel || '').trim() || plan.label,
     status: 'active',
     start_date: existing && existing.start_date ? existing.start_date : formatIst(new Date()),
     expiry_date: formatIst(expiry),

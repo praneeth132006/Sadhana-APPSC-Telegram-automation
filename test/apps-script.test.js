@@ -32,6 +32,14 @@ let lockGrants = [];
 /** Script properties the stubbed PropertiesService serves. */
 const scriptProperties = {};
 
+/**
+ * What Sheets keeps for a written value: a leading apostrophe means "store this
+ * as text" and is not part of the value read back.
+ */
+function asStored(value) {
+  return typeof value === 'string' && value.startsWith("'") ? value.slice(1) : value;
+}
+
 /** A tiny stand-in for a Google Sheet backed by a 2-D array. */
 class FakeSheet {
   constructor(name, values = []) {
@@ -39,6 +47,7 @@ class FakeSheet {
     this.values = values;          // Row-major, including the header row.
     this.validations = [];
     this.formatRules = [];
+    this.notes = {};
   }
 
   getName() { return this.name; }
@@ -65,16 +74,17 @@ class FakeSheet {
         while (sheet.values.length < row) sheet.values.push([]);
         const target = sheet.values[row - 1];
         while (target.length < col) target.push('');
-        target[col - 1] = value;
+        target[col - 1] = asStored(value);
         return this;
       },
       setValues(block) {
         block.forEach((line, r) => {
           while (sheet.values.length < row + r) sheet.values.push([]);
-          sheet.values[row - 1 + r] = line.slice();
+          sheet.values[row - 1 + r] = line.map(asStored);
         });
         return this;
       },
+      setNote(note) { sheet.notes[`${row},${col}`] = note; return this; },
       setDataValidation(v) { sheet.validations.push(v); return this; },
       // Formatting calls are chainable no-ops in these tests.
       setFontWeight() { return this; }, setFontColor() { return this; },
@@ -86,7 +96,7 @@ class FakeSheet {
   clear() { this.values = []; return this; }
   // Missing until now, which is why nothing exercised upsertSubscriber or
   // logPayment — and why a payment could be counted twice unnoticed.
-  appendRow(row) { this.values.push(row.slice()); return this; }
+  appendRow(row) { this.values.push(row.map(asStored)); return this; }
   deleteRow(row) { this.values.splice(row - 1, 1); return this; }
   setFrozenRows() { return this; }
   setFrozenColumns() { return this; }
@@ -1773,6 +1783,171 @@ test('the support actions are routed over HTTP and still require the token', () 
 
     const read = JSON.parse(script.doGet({ parameter: { action: 'getBotSettings', token: 'secret-token' } }).text);
     assert.equal(read.data.support_hours, 'always');
+  } finally {
+    delete scriptProperties.API_TOKEN;
+  }
+});
+
+// ===========================================================================
+// Support Log, ticket columns and coupons
+// ===========================================================================
+
+test('every ticket action is written to the Support Log with who did it', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'Resent the link', 'answered', '@ravi', 'invite_sent');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'thanks, in now', 'open');
+  script.logTicketEvent('T-260917-AB2C', '@ravi', 'admin', 'payment_checked', 'pay_1 captured ₹199');
+  script.setTicketStatus('T-260917-AB2C', 'closed', '@ravi');
+  script.appendTicketMessage('T-260917-AB2C', 'A Student', 'one more thing', 'open');
+
+  const log = script.getTicket('T-260917-AB2C').log;
+  assert.deepEqual(Array.from(log, (e) => [e.who, e.role, e.action, e.status_after]), [
+    ['@student', 'student', 'ticket_opened', 'open'],
+    ['@ravi', 'admin', 'invite_sent', 'answered'],
+    ['A Student', 'student', 'student_message', 'open'],
+    ['@ravi', 'admin', 'payment_checked', 'open'],
+    ['@ravi', 'admin', 'closed', 'closed'],
+    ['A Student', 'student', 'student_message', 'open'],
+    ['A Student', 'student', 'reopened', 'open']
+  ]);
+});
+
+test('the ticket row tracks admin replies and who closed it', () => {
+  const script = freshScript();
+  script.createTicket(newTicket());
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @ravi', 'first', 'answered', '@ravi');
+  script.appendTicketMessage('T-260917-AB2C', 'Admin @sita', 'second', 'answered', '@sita');
+
+  let ticket = script.getTicket('T-260917-AB2C');
+  assert.equal(ticket.admin_replies, 2);
+  assert.ok(ticket.last_admin_reply_at);
+  assert.equal(ticket.handled_by, '@sita');
+
+  ticket = script.setTicketStatus('T-260917-AB2C', 'closed', '@sita');
+  assert.equal(ticket.closed_by, '@sita');
+  assert.ok(ticket.closed_at);
+
+  ticket = script.setTicketStatus('T-260917-AB2C', 'open', '@ravi');
+  assert.equal(ticket.closed_by, '', 'reopening must clear who closed it');
+  assert.equal(ticket.closed_at, '');
+});
+
+test('a Support tab from before the new columns gets them, and its rows still read', () => {
+  const oldHeaders = ['Ticket ID', 'Created At', 'Updated At', 'Telegram ID', 'Username', 'Name',
+    'Category', 'Status', 'Bot', 'Last Message', 'Conversation', 'Handled By'];
+  const old = new FakeSheet('Support', [
+    oldHeaders,
+    ['T-260917-OLD1', 'x', 'x', '42', 'asha', 'Asha', 'invite', 'open', 'TELEGRAM_PAYBOT_UPSC', 'hi', '[t] a:\nhi', '']
+  ]);
+  const script = loadScript(new FakeSpreadsheet([old]));
+
+  const ticket = script.getTicket('T-260917-OLD1');
+  assert.equal(ticket.status, 'open');
+  assert.equal(ticket.admin_replies, 0);
+  assert.equal(old.values[0].length, script.SUPPORT_HEADERS.length, 'the new headers were not added');
+  assert.equal(old.values[0][15], 'Closed By');
+  assert.match(old.notes['1,8'], /answered = Waiting for the student/);
+});
+
+test('an admin can start a conversation, which opens as waiting for the student', () => {
+  const script = freshScript();
+  const ticket = script.createTicket(newTicket({ opened_by: '@ravi', message: 'Your pass is ready' }));
+  assert.equal(ticket.status, 'answered');
+  assert.equal(ticket.admin_replies, 1);
+  assert.match(ticket.conversation, /Admin @ravi:\nYour pass is ready/);
+  assert.equal(script.getTicket(ticket.ticket_id).log[0].action, 'admin_started_conversation');
+});
+
+function newCoupon(overrides) {
+  return Object.assign({
+    code: 'save50', discount_type: 'flat', discount_value: 50, active: true,
+    expires_on: '31-12-2026', max_uses: 100, one_per_student: true, note: 'launch'
+  }, overrides || {});
+}
+
+test('upsertCoupon creates a code and an update keeps its usage and creator', () => {
+  const script = freshScript();
+  const created = script.upsertCoupon(newCoupon(), 'a@example.com');
+  assert.equal(created.code, 'SAVE50');
+  assert.equal(created.discount_value, 50);
+  assert.equal(created.expires_on, '31-12-2026', 'the date must survive as text');
+  assert.equal(created.max_uses, 100);
+  assert.equal(created.one_per_student, true);
+
+  script.recordRedemption({ code: 'SAVE50', telegram_id: '42', payment_id: 'pay_1', paid_amount: 149 });
+  const updated = script.upsertCoupon(newCoupon({ code: 'Save50', discount_value: 60, active: 'no', max_uses: '' }), 'b@example.com');
+  assert.equal(updated.discount_value, 60);
+  assert.equal(updated.active, false);
+  assert.equal(updated.max_uses, null, 'a blank limit means unlimited');
+  assert.equal(updated.times_used, 1, 'editing a code must not reset its usage');
+  assert.equal(updated.created_by, 'a@example.com');
+  assert.equal(updated.updated_by, 'b@example.com');
+  assert.equal(script.listCoupons().length, 1, 'codes are matched regardless of case');
+});
+
+test('upsertCoupon refuses a malformed code or type', () => {
+  const script = freshScript();
+  assert.throws(() => script.upsertCoupon(newCoupon({ code: 'no spaces' }), 'x'), /Invalid coupon code/);
+  assert.throws(() => script.upsertCoupon(newCoupon({ code: 'AB' }), 'x'), /Invalid coupon code/);
+  assert.throws(() => script.upsertCoupon(newCoupon({ discount_type: 'free' }), 'x'), /percent or flat/);
+});
+
+test('a redemption is counted once per payment and tracked per student', () => {
+  const script = freshScript();
+  script.upsertCoupon(newCoupon(), 'x');
+
+  assert.deepEqual({ ...script.recordRedemption({ code: 'save50', telegram_id: '42', payment_id: 'pay_1' }) },
+    { recorded: true, times_used: 1 });
+  assert.deepEqual({ ...script.recordRedemption({ code: 'SAVE50', telegram_id: '42', payment_id: 'pay_1' }) },
+    { recorded: false, times_used: 1 }, 'a repeated webhook counted twice');
+  script.recordRedemption({ code: 'SAVE50', telegram_id: '43', payment_id: 'pay_2' });
+
+  assert.equal(script.getCoupon('SAVE50', '42').used_by_student, 1);
+  assert.equal(script.getCoupon('save50', '99').used_by_student, 0);
+  assert.equal(script.getCoupon('SAVE50').times_used, 2);
+  assert.equal(script.getCoupon('NOPE'), null);
+
+  const list = script.listRedemptions({ code: 'save50' });
+  assert.equal(list.total, 2);
+  assert.equal(list.redemptions[0].payment_id, 'pay_2', 'newest first');
+});
+
+test('a used coupon cannot be deleted, an unused one can', () => {
+  const script = freshScript();
+  script.upsertCoupon(newCoupon({ code: 'USED1' }), 'x');
+  script.upsertCoupon(newCoupon({ code: 'FRESH1' }), 'x');
+  script.recordRedemption({ code: 'USED1', telegram_id: '42', payment_id: 'pay_9' });
+
+  const refused = script.deleteCoupon('USED1');
+  assert.equal(refused.deleted, false);
+  assert.match(refused.reason, /Switch it off instead/);
+  assert.equal(script.deleteCoupon('fresh1').deleted, true);
+  assert.deepEqual(Array.from(script.listCoupons(), (c) => c.code), ['USED1']);
+});
+
+test('coupon and log tabs are never mistaken for question subjects', () => {
+  const script = freshScript();
+  script.setupSupportSheets();
+  script.book().insertSheet('Polity');
+  assert.deepEqual(Array.from(script.listSubjectSheets()), ['Polity']);
+});
+
+test('the coupon actions are routed over HTTP behind the token', () => {
+  const script = freshScript();
+  scriptProperties.API_TOKEN = 'secret-token';
+  try {
+    const post = (body) => JSON.parse(script.doPost({ postData: { contents: JSON.stringify(Object.assign({ token: 'secret-token' }, body)) } }).text);
+    const get = (params) => JSON.parse(script.doGet({ parameter: Object.assign({ token: 'secret-token' }, params) }).text);
+
+    assert.equal(JSON.parse(script.doGet({ parameter: { action: 'listCoupons' } }).text).success, false);
+    assert.equal(post({ action: 'upsertCoupon', coupon: newCoupon(), updated_by: 'x' }).data.code, 'SAVE50');
+    assert.equal(get({ action: 'getCoupon', code: 'save50', telegramId: '42' }).data.used_by_student, 0);
+    assert.equal(post({ action: 'recordRedemption', redemption: { code: 'SAVE50', telegram_id: '42', payment_id: 'pay_1' } }).data.recorded, true);
+    assert.equal(get({ action: 'listRedemptions' }).data.total, 1);
+    assert.equal(get({ action: 'listCoupons' }).data[0].times_used, 1);
+    assert.equal(post({ action: 'deleteCoupon', code: 'SAVE50' }).data.deleted, false);
+    assert.equal(post({ action: 'logTicketEvent', ticketId: 'T-000000-NONE', logAction: 'x' }).data, null);
   } finally {
     delete scriptProperties.API_TOKEN;
   }

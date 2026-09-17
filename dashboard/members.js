@@ -84,6 +84,36 @@ function membersTable(rows) {
   ]);
 }
 
+/** The one pass on sale, or the configured catalogue if the sheet could not say. */
+function passSummary(pricing, planInfo) {
+  const pass = pricing && pricing.pass;
+  const link = el('a', { href: `pricing.html${window.location.search}`, text: 'Change the pass or manage coupons →' });
+  if (!pass) {
+    return el('div', {}, [
+      ...planInfo.plans.map((p) => el('div', { class: 'check-item' }, [
+        el('span', { class: 'check-icon', text: p.emoji }),
+        el('div', {}, [el('div', { class: 'check-title', text: `${p.label} — ${p.price}` })])
+      ])),
+      el('p', { class: 'hint-text' }, [link])
+    ]);
+  }
+  const liveCoupons = (pricing.coupons || []).filter((c) => c.state === 'live').length;
+  return el('div', {}, [
+    el('div', { class: 'check-item' }, [
+      el('span', { class: 'check-icon', text: '🎯' }),
+      el('div', {}, [
+        el('div', { class: 'check-title', text: `${pass.name} — ${pass.priceText}` }),
+        el('div', { class: 'check-detail', text: pass.validUntil ? `Valid until ${pass.validUntil}` : 'No valid-until date set' })
+      ])
+    ]),
+    el('div', { class: 'check-item' }, [
+      el('span', { class: 'check-icon', text: '🎟' }),
+      el('div', {}, [el('div', { class: 'check-title', text: `${liveCoupons} live coupon code${liveCoupons === 1 ? '' : 's'}` })])
+    ]),
+    el('p', { class: 'hint-text' }, [link])
+  ]);
+}
+
 /** Recent payment activity from the immutable log. */
 function recentPayments(stats) {
   const rows = stats.recentPayments || [];
@@ -164,10 +194,13 @@ async function load() {
   $('refreshBtn').disabled = true;
 
   try {
-    const [stats, page, planInfo] = await Promise.all([
+    const [stats, page, planInfo, pricing] = await Promise.all([
       api('/api/members/revenue'),
       api('/api/members', { query: filters }),
-      api('/api/plans')
+      api('/api/plans'),
+      // The pass as students see it, including the price and date admins set.
+      // A sheet that cannot answer yet must not take the member list down.
+      api('/api/pricing').catch(() => null)
     ]);
 
     revenue = stats;
@@ -191,19 +224,8 @@ async function load() {
     replaceChildren(panels,
       el('div', { class: 'two-col' }, [
         panel('Revenue by Plan', 'Lifetime rupees and member count per pass', planBreakdown(stats)),
-        // api() puts the selected group on the query string, so this is now
-        // the catalogue for THIS group rather than a global price list that
-        // matched no group.
-        panel('Pass Catalogue', 'What students can buy in this group right now',
-          el('div', {}, planInfo.plans.map((p) => el('div', { class: 'check-item' }, [
-            el('span', { class: 'check-icon', text: p.emoji }),
-            el('div', {}, [
-              el('div', { class: 'check-title', text: `${p.label} — ${p.price}` }),
-              el('div', { class: 'check-detail', text: p.tagline })
-            ]),
-            pill(p.type === 'recurring' ? 'recurring' : 'one-time', p.type === 'recurring' ? 'info' : 'muted')
-          ])))
-        )
+        panel('The Pass on Sale', 'What students buy from the bot right now',
+          passSummary(pricing, planInfo))
       ]),
       membersPanel,
       panel('Recent Payments', 'Straight from the Payments log in the sheet', recentPayments(stats)),

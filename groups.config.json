@@ -28,7 +28,9 @@
     "subscription is refused outright when the two disagree, so a student can",
     "never be charged an amount other than the one they were shown.",
     "",
-    "shortName is what the dashboard switcher shows. The full label and language are too long for the header, and a truncated group name is worse than a short one: it is the field that says which sheet you are about to write to."
+    "shortName is what the dashboard switcher shows. The full label and language are too long for the header, and a truncated group name is worse than a short one: it is the field that says which sheet you are about to write to.",
+    "",
+    "ONE PASS: only exam_pass is sold, at Rs 199 (19900 paise). sprint_30 and autopay_monthly are \"retired\": no longer offered anywhere, but still defined so a member who bought one keeps working — their renewal webhook, reminders and /cancel all still look the plan up by id. Do not delete them while anyone holds one. The pass name, price and valid-until date can be overridden per bot from the dashboard (Pass & Coupons page) without editing this file."
   ],
   "planShapes": {
     "sprint_30": {
@@ -38,7 +40,8 @@
       "durationDays": 30,
       "tagline": "30 days validity, renew manually",
       "description": "Full access to every subject topic for 30 days.",
-      "reminderDaysBefore": 3
+      "reminderDaysBefore": 3,
+      "retired": true
     },
     "autopay_monthly": {
       "label": "Monthly Auto-Pay",
@@ -49,7 +52,8 @@
       "description": "Renews itself every 30 days over UPI AutoPay or card. Cancel whenever you like.",
       "reminderDaysBefore": 0,
       "intervalMonths": 1,
-      "totalBillingCycles": 12
+      "totalBillingCycles": 12,
+      "retired": true
     },
     "exam_pass": {
       "label": "Target 2026 Pass",
@@ -71,7 +75,7 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 300
+        "exam_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_NEWS",
       "subjects": [
@@ -102,7 +106,7 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 300
+        "exam_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_NEWS",
       "subjects": [
@@ -133,7 +137,7 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 300
+        "exam_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_SADHANA",
       "subjects": [
@@ -164,7 +168,7 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 300
+        "exam_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_SADHANA",
       "subjects": [
@@ -195,7 +199,7 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 300
+        "exam_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_UPSC",
       "subjects": [

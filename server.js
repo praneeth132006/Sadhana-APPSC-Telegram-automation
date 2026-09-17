@@ -37,6 +37,7 @@ const membership = require('./src/membership');
 const plans = require('./src/plans');
 const botapp = require('./src/botapp');
 const support = require('./src/support');
+const pricing = require('./src/pricing');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -582,6 +583,33 @@ async function deliverAccess(result, plan, telegramId, groupId) {
   }
 }
 
+/**
+ * recordCouponUse — counts a coupon once its payment has actually succeeded.
+ *
+ * Never fails the webhook: the student has paid and must get access whether
+ * or not the coupon tally can be written. The sheet ignores a payment id it
+ * has already recorded, so a redelivered webhook counts nothing twice.
+ */
+async function recordCouponUse(notes, paymentId, paidPaise) {
+  try {
+    const group = groupRegistry.requireGroup(notes.group_id);
+    const primary = groupRegistry.listGroups()
+      .find((g) => g.ready && g.paymentBotEnv === group.paymentBotEnv) || group;
+    await sheets.forGroup(primary.id).recordRedemption({
+      code: notes.coupon_code,
+      telegram_id: notes.telegram_id,
+      username: notes.telegram_username || '',
+      group: group.shortName,
+      original_amount: Number(notes.original_amount) || 0,
+      discount: Number(notes.discount_amount) || 0,
+      paid_amount: (Number(paidPaise) || 0) / 100,
+      payment_id: paymentId
+    });
+  } catch (err) {
+    console.error(`[payments] could not record coupon ${notes.coupon_code} for ${paymentId}: ${err.message}`);
+  }
+}
+
 async function handlePaymentEvent(event) {
   const type = String(event.event || '');
   const payload = event.payload || {};
@@ -599,20 +627,29 @@ async function handlePaymentEvent(event) {
       return { handled: false, reason: 'payment link notes lacked telegram_id / plan_id / group_id' };
     }
 
+    const paidPaise = payment.amount || link.amount_paid || link.amount;
     const granted = await membership.grantAccess({
       groupId: notes.group_id,
       telegramId: notes.telegram_id,
       planId: notes.plan_id,
       username: notes.telegram_username,
       paymentId: payment.id || link.id,
-      amountPaise: payment.amount || link.amount_paid || link.amount,
+      amountPaise: paidPaise,
       linkId: link.id,
-      event: type
+      event: type,
+      validUntil: notes.valid_until,
+      planLabel: notes.plan_label
     });
+
+    if (notes.coupon_code) {
+      await recordCouponUse(notes, payment.id || link.id, paidPaise);
+    }
 
     // A repeat delivery of the same payment must not send a second message.
     if (!granted.alreadyProcessed) {
-      await deliverAccess(granted, groupRegistry.getPlanFor(notes.group_id, notes.plan_id), notes.telegram_id, notes.group_id);
+      const plan = groupRegistry.getPlanFor(notes.group_id, notes.plan_id);
+      await deliverAccess(granted, plan && Object.assign({}, plan, { label: notes.plan_label || plan.label }),
+        notes.telegram_id, notes.group_id);
     }
     return { handled: true };
   }
@@ -1256,8 +1293,11 @@ function refreshBotSettings(payBotEnv) {
  *
  * @returns {Promise<boolean>} true when the route was handled
  */
-async function handleSupportRoute(pathname, method, req, res, query, groupId, db, actor) {
+async function handleSupportRoute(pathname, method, req, res, query, groupId, selectedDb, actor) {
   const { group, primary } = familyOf(groupId);
+  // A bot's tickets and settings live in its first group's sheet, whichever of
+  // its groups the dashboard is looking at.
+  const db = primary.id === group.id ? selectedDb : sheets.forGroup(primary.id);
   const context = {
     groupId: group.id,
     primaryGroupId: primary.id,
@@ -1391,6 +1431,126 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, db
     return true;
   }
 
+  if (pathname === '/api/support/student' && method === 'GET') {
+    const ticketId = str(query.get('ticketId'), 20);
+    if (!TICKET_ID_RE.test(ticketId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticketId is required.' });
+      return true;
+    }
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found.` });
+      return true;
+    }
+    const app = supportBotFor(res, ticket);
+    if (!app) return true;
+
+    const passes = await app.studentSnapshot(ticket.telegram_id);
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        passes: passes.map((p) => ({
+          group: p.group.shortName,
+          groupId: p.group.id,
+          hasPass: Boolean(p.subscriber),
+          valid: p.eligible,
+          reason: p.reason,
+          inGroup: p.inGroup,
+          status: p.subscriber ? p.subscriber.status : '',
+          passName: p.subscriber ? (p.subscriber.plan_label || p.subscriber.plan) : '',
+          expiry: p.subscriber ? p.subscriber.expiry_date : '',
+          totalPaid: p.subscriber ? p.subscriber.total_paid : 0,
+          paymentId: p.subscriber ? p.subscriber.payment_id : '',
+          lastPaymentAt: p.subscriber ? p.subscriber.last_payment_at : ''
+        })),
+        suggestion: support.suggestNextStep(ticket.category, passes),
+        paymentIdInTicket: support.findPaymentId(ticket.conversation)
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/support/check-payment' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    const paymentId = str(body.paymentId, 40);
+    if (!TICKET_ID_RE.test(ticketId) || !/^pay_[A-Za-z0-9]{8,30}$/.test(paymentId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticketId and a payment id starting with pay_ are required.' });
+      return true;
+    }
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found.` });
+      return true;
+    }
+    const app = supportBotFor(res, ticket);
+    if (!app) return true;
+
+    const result = await app.checkPayment(paymentId, ticket.telegram_id);
+    const payment = result.payment || null;
+    try {
+      await db.logTicketEvent(ticketId, {
+        who: actor, role: 'admin', action: 'payment_checked',
+        details: payment ? `${paymentId}: ${payment.status}, ${pricing.rupees(payment.amount)}` : `${paymentId}: not found`
+      });
+    } catch (err) {
+      console.warn(`[support] could not log the payment check on ${ticketId}: ${err.message}`);
+    }
+
+    const notes = (payment && payment.notes) || {};
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        found: result.found,
+        captured: result.captured,
+        message: htmlToText(result.html),
+        payment: payment && {
+          id: payment.id,
+          status: payment.status,
+          amount: pricing.rupees(payment.amount),
+          method: payment.method || '',
+          createdAt: payment.created_at ? membership.formatIst(new Date(payment.created_at * 1000)) : '',
+          description: payment.description || '',
+          error: payment.error_description || '',
+          belongsTo: notes.telegram_id
+            ? (String(notes.telegram_id) === String(ticket.telegram_id) ? 'this student' : `Telegram id ${notes.telegram_id}`)
+            : 'unknown'
+        },
+        groups: app.familyGroups().map((g) => ({ id: g.id, name: g.shortName }))
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/support/grant-pass' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const ticketId = str(body.ticketId, 20);
+    const paymentId = str(body.paymentId, 40);
+    if (!TICKET_ID_RE.test(ticketId) || !/^pay_[A-Za-z0-9]{8,30}$/.test(paymentId)) {
+      sendJSON(res, 400, { success: false, error: 'A valid ticketId and a payment id starting with pay_ are required.' });
+      return true;
+    }
+    const ticket = await db.getTicket(ticketId);
+    if (!ticket) {
+      sendJSON(res, 404, { success: false, error: `Ticket ${ticketId} was not found.` });
+      return true;
+    }
+    const app = supportBotFor(res, ticket);
+    if (!app) return true;
+
+    const target = app.familyGroups().find((g) => g.id === str(body.groupId, 40));
+    if (!target) {
+      sendJSON(res, 400, { success: false, error: 'Choose which group the student paid for.' });
+      return true;
+    }
+    const outcome = await app.grantForPayment({
+      group: target, telegramId: ticket.telegram_id, paymentId, ticketId, admin: actor
+    });
+    await mirrorToSupportChat(app, ticket, `💻 From the dashboard:\n${outcome.html}`);
+    sendJSON(res, 200, { success: true, data: { granted: outcome.granted, message: htmlToText(outcome.html) } });
+    return true;
+  }
+
   if (pathname === '/api/support/status' && method === 'POST') {
     const body = await readJsonBody(req);
     const ticketId = str(body.ticketId, 20);
@@ -1437,7 +1597,13 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, db
         context,
         definitions: support.SETTINGS,
         settings: support.normaliseSettings(stored),
-        categories: support.CATEGORIES.map((c) => ({ id: c.id, label: c.label, emoji: c.emoji }))
+        categories: support.CATEGORIES.map((c) => ({ id: c.id, label: c.label, emoji: c.emoji })),
+        statuses: support.TICKET_STATUSES.map((id) => ({
+          id, label: support.STATUS_LABELS[id], meaning: support.STATUS_MEANINGS[id]
+        })),
+        quickReplies: support.QUICK_REPLIES.map((q) => ({
+          id: q.id, key: q.key, button: q.button, closes: Boolean(q.closes), for: q.for
+        }))
       }
     });
     return true;
@@ -1464,6 +1630,149 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, db
 }
 
 const TICKET_ID_RE = /^T-\d{6}-[A-Z0-9]{4}$/;
+
+/** Telegram HTML as plain text, for the dashboard. */
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+/** Where a coupon stands today, for the dashboard. */
+function couponState(coupon, now = new Date()) {
+  if (!coupon.active) return 'off';
+  const end = coupon.expires_on ? pricing.endOfDayIst(coupon.expires_on) : null;
+  if (coupon.expires_on && (!end || end.getTime() < now.getTime())) return 'expired';
+  if (coupon.max_uses !== null && coupon.max_uses !== '' && coupon.max_uses !== undefined &&
+      Number(coupon.times_used) >= Number(coupon.max_uses)) return 'used_up';
+  return 'live';
+}
+
+/**
+ * handlePricingRoute — the pass on sale and its coupon codes.
+ *
+ * Both are per payment bot and live in its first group's sheet, like the
+ * support settings, so the two languages of a family can never disagree.
+ *
+ * @returns {Promise<boolean>} true when the route was handled
+ */
+async function handlePricingRoute(pathname, method, req, res, query, groupId, actor) {
+  const { group, primary } = familyOf(groupId);
+  const db = sheets.forGroup(primary.id);
+  const context = {
+    groupId: group.id,
+    primaryGroupId: primary.id,
+    primaryGroupName: primary.shortName,
+    isPrimary: primary.id === group.id,
+    payBotEnv: group.paymentBotEnv || ''
+  };
+
+  const describePass = (settings) => {
+    const pass = pricing.currentPass(primary.id, support.normaliseSettings(settings));
+    if (!pass) return null;
+    return {
+      name: pass.label,
+      price: pass.amountPaise / 100,
+      priceText: pricing.rupees(pass.amountPaise),
+      validUntil: pass.validUntil,
+      description: pass.description,
+      defaults: (() => {
+        const base = pricing.currentPass(primary.id, {});
+        return { name: base.label, price: base.amountPaise / 100, validUntil: base.validUntil, description: base.description };
+      })()
+    };
+  };
+
+  if (pathname === '/api/pricing' && method === 'GET') {
+    const [stored, coupons, redemptions] = await Promise.all([
+      db.getBotSettings(),
+      db.listCoupons(),
+      db.listRedemptions({ limit: str(query.get('limit'), 3) || '50' })
+    ]);
+    const settings = support.normaliseSettings(stored);
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        context,
+        pass: describePass(stored),
+        passSettings: {
+          name: settings.pass_name, price: settings.pass_price,
+          validUntil: settings.pass_valid_until, description: settings.pass_description
+        },
+        coupons: coupons.map((c) => Object.assign({}, c, {
+          state: couponState(c),
+          discountText: pricing.describeDiscount(c)
+        })),
+        redemptions
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/pricing/pass' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const checked = pricing.validatePassInput(body);
+    if (!checked.ok) {
+      sendJSON(res, 400, { success: false, error: checked.error });
+      return true;
+    }
+    const stored = await db.updateBotSettings(checked.value, actor);
+    refreshBotSettings(group.paymentBotEnv);
+    sendJSON(res, 200, { success: true, data: { context, pass: describePass(stored) } });
+    return true;
+  }
+
+  if (pathname === '/api/pricing/coupon' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const checked = pricing.validateCouponInput(body.coupon);
+    if (!checked.ok) {
+      sendJSON(res, 400, { success: false, error: checked.error });
+      return true;
+    }
+    if (body.mode === 'create') {
+      const existing = await db.getCoupon(checked.value.code);
+      if (existing) {
+        sendJSON(res, 409, { success: false, error: `${checked.value.code} already exists. Edit it instead.` });
+        return true;
+      }
+    }
+    const saved = await db.upsertCoupon(checked.value, actor);
+    sendJSON(res, 200, {
+      success: true,
+      data: saved && Object.assign({}, saved, { state: couponState(saved), discountText: pricing.describeDiscount(saved) })
+    });
+    return true;
+  }
+
+  if (pathname === '/api/pricing/coupon/delete' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const code = pricing.normaliseCode(body.code);
+    if (!pricing.COUPON_CODE_PATTERN.test(code)) {
+      sendJSON(res, 400, { success: false, error: 'A valid coupon code is required.' });
+      return true;
+    }
+    const result = await db.deleteCoupon(code);
+    if (!result.deleted) {
+      sendJSON(res, result.reason === 'not found' ? 404 : 409, { success: false, error: result.reason });
+      return true;
+    }
+    sendJSON(res, 200, { success: true, data: result });
+    return true;
+  }
+
+  if (pathname === '/api/pricing/redemptions' && method === 'GET') {
+    const code = pricing.normaliseCode(query.get('code'));
+    const data = await db.listRedemptions({
+      code: pricing.COUPON_CODE_PATTERN.test(code) ? code : '',
+      limit: str(query.get('limit'), 3) || '100'
+    });
+    sendJSON(res, 200, { success: true, data });
+    return true;
+  }
+
+  sendJSON(res, 404, { success: false, error: `Unknown API route: ${method} ${pathname}` });
+  return true;
+}
 
 /**
  * supportBotFor — the bot a ticket's student talks to, or an error response.
@@ -1931,6 +2240,10 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
   // the page can say where to look instead of showing an empty list.
   if (pathname.startsWith('/api/support/')) {
     return handleSupportRoute(pathname, method, req, res, query, groupId, db, actor);
+  }
+
+  if (pathname === '/api/pricing' || pathname.startsWith('/api/pricing/')) {
+    return handlePricingRoute(pathname, method, req, res, query, groupId, actor);
   }
 
   // ---- Telegram status -----------------------------------------------------

@@ -42,7 +42,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -585,9 +585,10 @@ async function createTicket(ctx, ticket) {
 }
 
 /** Adds a message to a ticket's thread. Resolves null for an unknown ticket. */
-async function appendTicketMessage(ctx, ticketId, { author, text, status, handledBy } = {}) {
+async function appendTicketMessage(ctx, ticketId, { author, text, status, handledBy, logAction } = {}) {
   const result = await request(ctx, 'POST', {
-    action: 'appendTicketMessage', ticketId, author, text, status: status || '', handledBy: handledBy || ''
+    action: 'appendTicketMessage', ticketId, author, text, status: status || '', handledBy: handledBy || '',
+    logAction: logAction || ''
   });
   return result.data || null;
 }
@@ -602,6 +603,54 @@ async function setTicketStatus(ctx, ticketId, status, handledBy) {
 async function listTickets(ctx, filters = {}) {
   const result = await request(ctx, 'GET', Object.assign({ action: 'listTickets' }, filters));
   return result.data || { total: 0, tickets: [], counts: {}, page: 1, totalPages: 1 };
+}
+
+/**
+ * logTicketEvent — records something done on a ticket that is not a message
+ * (a payment check, an invite that could not be sent). Resolves null for an
+ * unknown ticket.
+ */
+async function logTicketEvent(ctx, ticketId, { who, role, action, details } = {}) {
+  const result = await request(ctx, 'POST', {
+    action: 'logTicketEvent', ticketId, who: who || '', role: role || '', logAction: action, details: details || ''
+  });
+  return result.data || null;
+}
+
+/** Every coupon in the sheet. */
+async function listCoupons(ctx) {
+  const result = await request(ctx, 'GET', { action: 'listCoupons' });
+  return result.data || [];
+}
+
+/** One coupon plus how often this student already used it, or null. */
+async function getCoupon(ctx, code, telegramId) {
+  const result = await request(ctx, 'GET', { action: 'getCoupon', code, telegramId });
+  return result.data || null;
+}
+
+/** Creates or updates a coupon; resolves the stored coupon. */
+async function upsertCoupon(ctx, coupon, updatedBy) {
+  const result = await request(ctx, 'POST', { action: 'upsertCoupon', coupon, updated_by: updatedBy });
+  return result.data || null;
+}
+
+/** Deletes an unused coupon; resolves { deleted, reason }. */
+async function deleteCoupon(ctx, code) {
+  const result = await request(ctx, 'POST', { action: 'deleteCoupon', code });
+  return result.data || { deleted: false };
+}
+
+/** Logs a paid checkout that used a code. Idempotent on payment_id. */
+async function recordRedemption(ctx, redemption) {
+  const result = await request(ctx, 'POST', { action: 'recordRedemption', redemption });
+  return result.data || { recorded: false };
+}
+
+/** Newest-first redemptions, optionally for one code. */
+async function listRedemptions(ctx, filters = {}) {
+  const result = await request(ctx, 'GET', Object.assign({ action: 'listRedemptions' }, filters));
+  return result.data || { total: 0, redemptions: [] };
 }
 
 /** One ticket including its whole conversation, or null. */
@@ -660,7 +709,8 @@ const IMPLEMENTATIONS = {
   unpostQuestions, listPosted, bulkStatus, scheduleQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
-  setTicketStatus, listTickets, getTicket
+  setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,
+  upsertCoupon, deleteCoupon, recordRedemption, listRedemptions
 };
 
 API_NAMES.forEach((name) => {

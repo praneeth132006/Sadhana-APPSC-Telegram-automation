@@ -66,7 +66,8 @@ const PAGES = [
   { id: 'questions',  href: 'questions.html',  icon: '📚', label: 'Questions',  hint: 'Browse, search and edit the whole question bank' },
   { id: 'automation', href: 'automation.html', icon: '🤖', label: 'Automation', hint: 'Post to Telegram now and manage schedules' },
   { id: 'members',    href: 'members.html',    icon: '💳', label: 'Members',    hint: 'Paying members, revenue and expiry sweep' },
-  { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets and payment bot settings' },
+  { id: 'pricing',    href: 'pricing.html',    icon: '🎟', label: 'Pass & Coupons', hint: 'The pass students buy, its price, and coupon codes' },
+  { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets: reply, send invite links, check payments' },
   { id: 'health',     href: 'health.html',     icon: '🩺', label: 'Health',     hint: 'System status and security posture' }
 ];
 

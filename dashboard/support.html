@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Support — Sadhana APPSC</title>
-  <meta name="description" content="Student support tickets raised through the payment bots, and the bot texts admins can change without a deploy.">
+  <meta name="description" content="Student support tickets raised through the payment bots: reply, send a new invite, check a payment, resolve.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -16,22 +16,41 @@
     <main id="pageRoot" class="page-root" style="display:none">
       <div class="page-header">
         <div>
-          <h1 class="page-title">Support &amp; Bot Settings</h1>
+          <h1 class="page-title">Support</h1>
           <p class="page-subtitle">
-            Tickets students raise with /support in the payment bot, your replies to them, and the
-            bot texts you can change without a deploy.
+            Students ask for help in the payment bot. Pick a ticket, read the conversation, and answer —
+            everything you do here is also shown in the Telegram support chat and logged in the sheet.
           </p>
         </div>
         <div class="page-actions">
+          <button id="helpBtn" class="btn btn-ghost" aria-expanded="false" aria-controls="howItWorks">How this works</button>
           <button id="refreshBtn" class="btn btn-primary">Refresh</button>
         </div>
       </div>
 
+      <section id="howItWorks" class="panel sp-howto" hidden></section>
       <div id="notices"></div>
-      <div id="statGrid" class="stat-grid"></div>
-      <div id="ticketDetail"></div>
-      <div id="panels"></div>
-      <div id="settingsPanel"></div>
+
+      <div class="sp-toolbar">
+        <div id="statusTabs" class="sp-tabs" role="tablist" aria-label="Ticket status"></div>
+        <input id="searchInput" type="search" class="field-input sp-search"
+               placeholder="Search name, @username, Telegram id, ticket id or message" aria-label="Search tickets">
+      </div>
+
+      <div class="sp-layout">
+        <section class="sp-list-pane" aria-label="Tickets">
+          <div id="ticketList" class="sp-list"></div>
+        </section>
+        <section id="workspace" class="sp-workspace" aria-live="polite"></section>
+      </div>
+
+      <details id="textsPanel" class="panel sp-texts">
+        <summary class="sp-texts-summary">
+          <span>⚙️ Bot texts &amp; quick replies</span>
+          <span class="hint-text">Support hours, the instant answers students see, and your one-tap replies</span>
+        </summary>
+        <div id="settingsBody" class="panel-body"></div>
+      </details>
     </main>
   </div>
 
