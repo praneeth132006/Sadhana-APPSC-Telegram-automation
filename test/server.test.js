@@ -125,6 +125,30 @@ stub(sheets, 'upsertSubscriber', { telegram_id: '555' });
 
 const server = require('../server');
 
+// .env names the real support chat. Tests that want one set it themselves.
+delete process.env.SUPPORT_CHAT_ID;
+delete process.env.SUPPORT_THREAD_ID;
+
+// No test may reach the real Telegram API. The server reads .env, which holds
+// real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
+// test forgot to stub would post into the live support group. A test that
+// wants Telegram replaces the specific method it needs, which runs instead.
+require('node-telegram-bot-api').prototype._request = async function (method) {
+  throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
+};
+
+// Nor the live Google Sheets or Razorpay: .env points at real ones.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = function guardedFetch(url, ...rest) {
+    const target = String(url && url.url ? url.url : url);
+    if (/^https:\/\/(script\.google(usercontent)?\.com|api\.razorpay\.com|api\.telegram\.org)\//.test(target)) {
+      return Promise.reject(new Error(`Network call to ${target.split('?')[0]} attempted in a test — stub it`));
+    }
+    return realFetch.call(this, url, ...rest);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -1777,7 +1801,7 @@ test('POST /api/support/reply sends through the ticket\'s bot and records the re
     assert.match(toStudent.text, /Resent &lt;b&gt;your&lt;\/b&gt; link/, 'dashboard text must be escaped');
 
     const appended = calls.find((c) => c.name === 'appendTicketMessage');
-    assert.equal(appended.args[1].status, 'answered');
+    assert.equal(appended.args[1].status, undefined, 'the sheet decides the status from who wrote');
     assert.equal(appended.args[1].handledBy, 'Test Curator (curator@example.com)');
   });
 });
@@ -1860,4 +1884,416 @@ test('the Support page is served and linked from the navigation', async () => {
   assert.match(page.text, /support\.js/);
   const shared = await call('/shared.js');
   assert.match(shared.text, /href: 'support\.html'/);
+});
+
+// ---- Resending an invite from the dashboard --------------------------------
+
+test('POST /api/support/resend-invite sends through the ticket\'s bot and reports each group', async () => {
+  const savedChat = process.env.SUPPORT_CHAT_ID;
+  const originalResend = membership.resendInvite;
+  const asked = [];
+  membership.resendInvite = async (groupId, telegramId) => {
+    asked.push({ groupId, telegramId: String(telegramId) });
+    return groupId === 'appsc_news_en'
+      ? { sent: true, inviteLink: 'https://t.me/+fresh', subscriber: { status: 'active' } }
+      : { sent: false, reason: 'no subscription on record', subscriber: null };
+  };
+  process.env.SUPPORT_CHAT_ID = '-1007777777777';
+  try {
+    await withRecordedBot(async (sends) => {
+      assert.equal((await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'nope' } })).status, 400);
+      assert.equal((await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'T-260917-ZZZZ' } })).status, 404);
+
+      calls.length = 0;
+      const res = await authed('/api/support/resend-invite', { method: 'POST', body: { ticketId: 'T-260917-AB2C' } });
+      assert.equal(res.status, 200, res.json && res.json.error);
+
+      assert.ok(asked.every((a) => a.telegramId === '4242'), 'the invite must be for the ticket\'s student');
+      const byGroup = Object.fromEntries(res.json.data.results.map((r) => [r.group, r]));
+      const sentEntry = res.json.data.results.find((r) => r.sent);
+      assert.ok(sentEntry && sentEntry.delivered, 'the active group should report a delivered invite');
+      assert.equal(sentEntry.inviteLink, '', 'a delivered link is not echoed back to the browser');
+      assert.ok(Object.values(byGroup).some((r) => !r.sent && r.reason === 'no subscription on record'));
+
+      const toStudent = sends.find((s) => s.chatId === '4242');
+      assert.equal(toStudent.options.reply_markup.inline_keyboard[0][0].url, 'https://t.me/+fresh');
+
+      const mirrored = sends.find((s) => s.chatId === '-1007777777777');
+      assert.ok(mirrored, 'the support chat should hear about it');
+      assert.match(mirrored.text, /Resend invite<\/b> from the dashboard · by Test Curator/);
+      assert.ok(mirrored.options.reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'adm:i:T-260917-AB2C:4242'),
+        'a mirrored post carries the admin buttons');
+
+      const appended = calls.find((c) => c.name === 'appendTicketMessage');
+      assert.ok(appended, 'the resend should be recorded on the ticket');
+      assert.match(appended.args[1].text, /Sent a fresh invite link/);
+    });
+  } finally {
+    membership.resendInvite = originalResend;
+    if (savedChat === undefined) delete process.env.SUPPORT_CHAT_ID;
+    else process.env.SUPPORT_CHAT_ID = savedChat;
+  }
+});
+
+test('POST /api/support/resend-invite requires sign-in', async () => {
+  const res = await call(`/api/support/resend-invite?group=${TEST_GROUP}`, { method: 'POST', body: { ticketId: 'T-260917-AB2C' } });
+  assert.equal(res.status, 401);
+});
+
+// ---- The pass and coupons in the payment webhook ---------------------------
+
+test('a paid link grants the promised date and name and counts its coupon once', async () => {
+  paymentCalls.length = 0;
+  calls.length = 0;
+  stub(sheets, 'recordRedemption', { recorded: true, times_used: 1 });
+  const body = JSON.stringify({
+    event: 'payment_link.paid',
+    payload: {
+      payment_link: { entity: { id: 'plink_c', notes: {
+        telegram_id: '4242', telegram_username: 'asha', plan_id: 'exam_pass', group_id: 'appsc_news_en',
+        valid_until: '31-05-2099', plan_label: 'Target APPSC 2026',
+        coupon_code: 'SAVE50', original_amount: '199', discount_amount: '50'
+      } } },
+      payment: { entity: { id: 'pay_coupon1', amount: 14900 } }
+    }
+  });
+
+  const res = await fetch(baseUrl + '/api/payments/webhook', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': signWebhook(body) },
+    body
+  });
+  assert.equal(res.status, 200);
+
+  assert.equal(paymentCalls.length, 1);
+  assert.equal(paymentCalls[0].validUntil, '31-05-2099');
+  assert.equal(paymentCalls[0].planLabel, 'Target APPSC 2026');
+  assert.equal(paymentCalls[0].amountPaise, 14900, 'the amount actually paid is recorded');
+
+  const redemption = calls.find((c) => c.name === 'recordRedemption');
+  assert.ok(redemption, 'the coupon use was not recorded');
+  assert.deepEqual(redemption.args[0], {
+    code: 'SAVE50', telegram_id: '4242', username: 'asha', group: 'Newspaper · English',
+    original_amount: 199, discount: 50, paid_amount: 149, payment_id: 'pay_coupon1'
+  });
+});
+
+test('a coupon tally that cannot be written never blocks the student\'s access', async () => {
+  paymentCalls.length = 0;
+  const original = clientStubs.recordRedemption;
+  clientStubs.recordRedemption = async () => { throw new Error('Unknown POST action: recordRedemption'); };
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    const body = JSON.stringify({
+      event: 'payment_link.paid',
+      payload: {
+        payment_link: { entity: { id: 'plink_d', notes: {
+          telegram_id: '4243', plan_id: 'exam_pass', group_id: 'appsc_news_en', coupon_code: 'SAVE50'
+        } } },
+        payment: { entity: { id: 'pay_coupon2', amount: 14900 } }
+      }
+    });
+    const res = await fetch(baseUrl + '/api/payments/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': signWebhook(body) },
+      body
+    });
+    assert.equal(res.status, 200, 'a coupon bookkeeping failure must not make Razorpay retry the grant');
+    assert.equal(paymentCalls.length, 1);
+  } finally {
+    clientStubs.recordRedemption = original;
+    console.error = quiet;
+  }
+});
+
+// ===========================================================================
+// Pass & Coupons API
+// ===========================================================================
+
+stub(sheets, 'listCoupons', [
+  { code: 'SAVE50', discount_type: 'flat', discount_value: 50, active: true, expires_on: '', max_uses: null, times_used: 3, one_per_student: true },
+  { code: 'OLD10', discount_type: 'percent', discount_value: 10, active: true, expires_on: '01-01-2020', max_uses: null, times_used: 0, one_per_student: true },
+  { code: 'FULL', discount_type: 'flat', discount_value: 20, active: true, expires_on: '', max_uses: 5, times_used: 5, one_per_student: false },
+  { code: 'PAUSED', discount_type: 'flat', discount_value: 20, active: false, expires_on: '', max_uses: null, times_used: 0, one_per_student: true }
+]);
+stub(sheets, 'listRedemptions', { total: 1, redemptions: [{ code: 'SAVE50', telegram_id: '1', paid_amount: 149 }] });
+stub(sheets, 'getCoupon', (code) => (code === 'SAVE50' ? { code: 'SAVE50', times_used: 3 } : null));
+stub(sheets, 'upsertCoupon', (coupon) => Object.assign({ times_used: 0 }, coupon));
+stub(sheets, 'deleteCoupon', (code) => (code === 'UNUSED1' ? { deleted: true }
+  : code === 'SAVE50' ? { deleted: false, reason: 'This code has been used 3 time(s). Switch it off instead.' }
+    : { deleted: false, reason: 'not found' }));
+stub(sheets, 'logTicketEvent', (id) => ({ ticket_id: id }));
+
+test('the pricing routes require sign-in', async () => {
+  for (const [method, path] of [['GET', '/api/pricing'], ['POST', '/api/pricing/pass'], ['POST', '/api/pricing/coupon'],
+    ['POST', '/api/pricing/coupon/delete'], ['GET', '/api/pricing/redemptions']]) {
+    const res = await call(`${path}?group=${TEST_GROUP}`, { method, body: method === 'POST' ? {} : undefined });
+    assert.equal(res.status, 401, `${method} ${path} answered without sign-in`);
+  }
+});
+
+test('GET /api/pricing shows the pass with admin overrides and each coupon\'s state', async () => {
+  const original = clientStubs.getBotSettings;
+  clientStubs.getBotSettings = async () => ({ pass_name: 'Target APPSC 2026', pass_price: '249', pass_valid_until: '31-05-2099' });
+  try {
+    const res = await authed('/api/pricing');
+    assert.equal(res.status, 200);
+    const { pass, coupons, redemptions, passSettings } = res.json.data;
+    assert.equal(pass.name, 'Target APPSC 2026');
+    assert.equal(pass.price, 249);
+    assert.equal(pass.priceText, '₹249');
+    assert.equal(pass.validUntil, '31-05-2099');
+    assert.equal(pass.defaults.price, 199, 'the built-in default is shown alongside');
+    assert.equal(passSettings.price, '249');
+    assert.deepEqual(coupons.map((c) => [c.code, c.state, c.discountText]), [
+      ['SAVE50', 'live', '₹50 off'], ['OLD10', 'expired', '10% off'], ['FULL', 'used_up', '₹20 off'], ['PAUSED', 'off', '₹20 off']
+    ]);
+    assert.equal(redemptions.total, 1);
+  } finally {
+    clientStubs.getBotSettings = original;
+  }
+});
+
+test('POST /api/pricing/pass validates and saves the pass as settings, with the real actor', async () => {
+  assert.equal((await authed('/api/pricing/pass', { method: 'POST', body: { price: '0' } })).status, 400);
+  assert.equal((await authed('/api/pricing/pass', { method: 'POST', body: { validUntil: '01-01-2020' } })).status, 400);
+
+  calls.length = 0;
+  const res = await authed('/api/pricing/pass', {
+    method: 'POST', body: { name: 'Target Group 2', price: '199', validUntil: '31-05-2099', description: '' }
+  });
+  assert.equal(res.status, 200, res.json && res.json.error);
+  const saved = calls.find((c) => c.name === 'updateBotSettings');
+  assert.deepEqual(saved.args, [
+    { pass_name: 'Target Group 2', pass_price: '199', pass_valid_until: '31-05-2099', pass_description: '' },
+    'Test Curator (curator@example.com)'
+  ]);
+});
+
+test('POST /api/pricing/coupon creates, refuses a duplicate create, and validates', async () => {
+  assert.equal((await authed('/api/pricing/coupon', { method: 'POST', body: { coupon: { code: 'x y', discount_type: 'flat', discount_value: 10 } } })).status, 400);
+  assert.equal((await authed('/api/pricing/coupon', { method: 'POST', body: { coupon: { code: 'BIG', discount_type: 'percent', discount_value: 100 } } })).status, 400);
+
+  const dup = await authed('/api/pricing/coupon', { method: 'POST', body: { mode: 'create', coupon: { code: 'save50', discount_type: 'flat', discount_value: 10 } } });
+  assert.equal(dup.status, 409);
+  assert.match(dup.json.error, /already exists/);
+
+  calls.length = 0;
+  const created = await authed('/api/pricing/coupon', {
+    method: 'POST',
+    body: { mode: 'create', coupon: { code: 'diwali25', discount_type: 'percent', discount_value: '25', expires_on: '10-11-2099', max_uses: '100' } }
+  });
+  assert.equal(created.status, 200, created.json && created.json.error);
+  const upsert = calls.find((c) => c.name === 'upsertCoupon');
+  assert.equal(upsert.args[0].code, 'DIWALI25');
+  assert.equal(upsert.args[0].max_uses, 100);
+  assert.equal(upsert.args[1], 'Test Curator (curator@example.com)');
+  assert.equal(created.json.data.state, 'live');
+  assert.equal(created.json.data.discountText, '25% off');
+
+  // Editing an existing code is allowed.
+  const edited = await authed('/api/pricing/coupon', { method: 'POST', body: { mode: 'edit', coupon: { code: 'SAVE50', discount_type: 'flat', discount_value: 60, active: false } } });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.json.data.state, 'off');
+});
+
+test('POST /api/pricing/coupon/delete deletes an unused code and explains a refusal', async () => {
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'unused1' } })).status, 200);
+  const used = await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'SAVE50' } });
+  assert.equal(used.status, 409);
+  assert.match(used.json.error, /Switch it off/);
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: 'NOPE99' } })).status, 404);
+  assert.equal((await authed('/api/pricing/coupon/delete', { method: 'POST', body: { code: '' } })).status, 400);
+});
+
+// ---- Support: student details, payment check and grant ---------------------
+
+test('GET /api/support/student reports passes and a suggestion for the ticket\'s student', async () => {
+  await withRecordedBot(async () => {
+    const originalEligible = membership.isEligible;
+    const originalMember = TelegramBotClient.prototype.getChatMember;
+    membership.isEligible = async () => ({ ok: true, reason: 'active subscription',
+      subscriber: { status: 'active', plan_label: 'Target 2026', expiry_date: '31-05-2099, 11:59:59 PM IST', total_paid: 199, payment_id: 'pay_OLD000000001' } });
+    TelegramBotClient.prototype.getChatMember = async () => ({ status: 'left' });
+    try {
+      assert.equal((await authed('/api/support/student?ticketId=bad')).status, 400);
+      const res = await authed('/api/support/student?ticketId=T-260917-AB2C');
+      assert.equal(res.status, 200, res.json && res.json.error);
+      const first = res.json.data.passes[0];
+      assert.equal(first.valid, true);
+      assert.equal(first.inGroup, 'no');
+      assert.equal(first.paymentId, 'pay_OLD000000001');
+      assert.match(res.json.data.suggestion, /not in .* → tap "🔗 Send new invite link"/);
+    } finally {
+      membership.isEligible = originalEligible;
+      TelegramBotClient.prototype.getChatMember = originalMember;
+    }
+  });
+});
+
+test('POST /api/support/check-payment asks Razorpay and logs the check', async () => {
+  const razorpayModule = require('../src/razorpay');
+  const original = razorpayModule.getPayment;
+  razorpayModule.getPayment = async (id) => ({ id, status: 'captured', amount: 19900, method: 'upi', created_at: 1789000000, notes: { telegram_id: '4242' } });
+  try {
+    await withRecordedBot(async () => {
+      assert.equal((await authed('/api/support/check-payment', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'notapay' } })).status, 400);
+
+      calls.length = 0;
+      const res = await authed('/api/support/check-payment', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3' } });
+      assert.equal(res.status, 200, res.json && res.json.error);
+      assert.equal(res.json.data.captured, true);
+      assert.equal(res.json.data.payment.amount, '₹199');
+      assert.equal(res.json.data.payment.belongsTo, 'this student');
+      assert.ok(res.json.data.groups.length >= 1);
+      const logged = calls.find((c) => c.name === 'logTicketEvent');
+      assert.equal(logged.args[1].action, 'payment_checked');
+      assert.equal(logged.args[1].who, 'Test Curator (curator@example.com)');
+    });
+  } finally {
+    razorpayModule.getPayment = original;
+  }
+});
+
+test('POST /api/support/grant-pass needs a group from the ticket\'s bot and reports the outcome', async () => {
+  const razorpayModule = require('../src/razorpay');
+  const original = razorpayModule.getPayment;
+  razorpayModule.getPayment = async (id) => ({ id, status: 'failed', amount: 19900 });
+  try {
+    await withRecordedBot(async () => {
+      const noGroup = await authed('/api/support/grant-pass', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3', groupId: 'upsc' } });
+      assert.equal(noGroup.status, 400, 'a group from another bot must be refused');
+
+      const res = await authed('/api/support/grant-pass', { method: 'POST', body: { ticketId: 'T-260917-AB2C', paymentId: 'pay_TZ8ciB8Yng8WE3', groupId: 'appsc_news_en' } });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.data.granted, false);
+      assert.match(res.json.data.message, /Not granted\. Razorpay does not show this payment as captured/);
+    });
+  } finally {
+    razorpayModule.getPayment = original;
+  }
+});
+
+
+// ---- Ticket lifecycle over the API ----------------------------------------
+
+test('reopening from the dashboard always asks the sheet for in_progress', async () => {
+  for (const requested of ['open', 'in_progress', 'answered']) {
+    calls.length = 0;
+    const res = await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: requested } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(calls.find((c) => c.name === 'setTicketStatus').args,
+      ['T-260917-AB2C', 'in_progress', 'Test Curator (curator@example.com)'], `"${requested}" was not mapped to in_progress`);
+  }
+});
+
+test('closing a ticket that was already closed does not message the student again', async () => {
+  const original = clientStubs.setTicketStatus;
+  clientStubs.setTicketStatus = async (id) => Object.assign({}, SAMPLE_TICKET, { ticket_id: id, status: 'closed', previous_status: 'closed' });
+  try {
+    await withRecordedBot(async (sends) => {
+      const res = await authed('/api/support/status', { method: 'POST', body: { ticketId: 'T-260917-AB2C', status: 'closed' } });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.changed, false);
+      assert.equal(res.json.notified, false);
+      assert.equal(sends.filter((m) => m.chatId === '4242').length, 0);
+    });
+  } finally {
+    clientStubs.setTicketStatus = original;
+  }
+});
+
+test('GET /api/support/tickets passes the queue filters and drops anything else', async () => {
+  calls.length = 0;
+  await authed('/api/support/tickets?status=answered&waitingOn=admin&sort=waiting');
+  let forwarded = calls.find((c) => c.name === 'listTickets').args[0];
+  assert.equal(forwarded.status, 'in_progress');
+  assert.equal(forwarded.waitingOn, 'admin');
+  assert.equal(forwarded.sort, 'waiting');
+
+  calls.length = 0;
+  await authed('/api/support/tickets?status=deleted&waitingOn=everyone&sort=random');
+  forwarded = calls.find((c) => c.name === 'listTickets').args[0];
+  assert.equal(forwarded.status, '');
+  assert.equal(forwarded.waitingOn, '');
+  assert.equal(forwarded.sort, '');
+});
+
+test('GET /api/support/stats returns the sheet\'s analysis for the chosen period', async () => {
+  stub(sheets, 'getSupportStats', (opts) => ({ period_days: Number(opts.days), counts: { needs_reply: 2 } }));
+  calls.length = 0;
+  const res = await authed('/api/support/stats?days=7');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.data.period_days, 7);
+  assert.equal(res.json.data.counts.needs_reply, 2);
+  assert.ok(res.json.data.context);
+
+  await authed('/api/support/stats?days=abc');
+  assert.equal(calls.filter((c) => c.name === 'getSupportStats').at(-1).args[0].days, '30');
+  assert.equal((await call(`/api/support/stats?group=${TEST_GROUP}`)).status, 401);
+});
+
+// ---- Rate limiting ----------------------------------------------------------
+
+test('signed webhooks are never rate limited, so a busy minute cannot drop a payment', async () => {
+  const statuses = new Set();
+  const body = JSON.stringify({ event: 'noop' });
+  const requests = [];
+  for (let i = 0; i < 260; i++) {
+    requests.push(fetch(baseUrl + '/api/payments/webhook', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Razorpay-Signature': 'bad' }, body
+    }).then((r) => statuses.add(r.status)));
+  }
+  await Promise.all(requests);
+  assert.ok(!statuses.has(429), 'the payment webhook was rate limited');
+  assert.ok(statuses.has(401));
+});
+
+test('behind Vercel the client address comes from the platform headers, elsewhere from the socket', () => {
+  const req = { headers: { 'x-real-ip': '203.0.113.9', 'x-forwarded-for': '198.51.100.1, 10.0.0.1' }, socket: { remoteAddress: '10.0.0.1' } };
+  const saved = process.env.VERCEL;
+  try {
+    delete process.env.VERCEL;
+    assert.equal(server.clientAddress(req), '10.0.0.1', 'headers must not be trusted outside Vercel');
+    process.env.VERCEL = '1';
+    assert.equal(server.clientAddress(req), '203.0.113.9');
+    assert.equal(server.clientAddress({ headers: { 'x-forwarded-for': '198.51.100.1, 10.0.0.1' }, socket: {} }), '198.51.100.1');
+  } finally {
+    if (saved === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = saved;
+  }
+});
+
+test('the daily job posts a support summary to each bot\'s support chat, and can be switched off', async () => {
+  const before = { secret: process.env.CRON_SECRET, chat: process.env.SUPPORT_CHAT_ID, daily: process.env.SUPPORT_DAILY_SUMMARY };
+  process.env.CRON_SECRET = 'a-secret-for-tests';
+  process.env.SUPPORT_CHAT_ID = '-1007777777777';
+  const membershipModule = require('../src/membership');
+  const originalSweep = membershipModule.runDailyCheckAllGroups;
+  membershipModule.runDailyCheckAllGroups = async () => ({ groups: [], totals: { reminded: 0, removed: 0 } });
+  stub(sheets, 'getSupportStats', { period_days: 7, counts: { needs_reply: 3, open: 1, in_progress: 2, closed: 5, total: 8 }, by_category: {}, by_admin: {} });
+  try {
+    await withRecordedBot(async (sends) => {
+      delete process.env.SUPPORT_DAILY_SUMMARY;
+      const res = await call('/api/cron/sweep', { method: 'POST', headers: { Authorization: 'Bearer a-secret-for-tests' } });
+      assert.equal(res.status, 200);
+      const posted = sends.filter((m) => m.chatId === '-1007777777777');
+      assert.ok(posted.length >= 1, 'no summary reached the support chat');
+      assert.match(posted[0].text, /support summary[\s\S]*Needs reply: <b>3<\/b>/);
+      assert.ok(res.json.data.supportSummaries.every((r) => r.posted));
+
+      sends.length = 0;
+      process.env.SUPPORT_DAILY_SUMMARY = 'off';
+      const off = await call('/api/cron/sweep', { method: 'POST', headers: { Authorization: 'Bearer a-secret-for-tests' } });
+      assert.equal(off.status, 200);
+      assert.equal(sends.length, 0);
+    });
+  } finally {
+    membershipModule.runDailyCheckAllGroups = originalSweep;
+    for (const [key, env] of [['secret', 'CRON_SECRET'], ['chat', 'SUPPORT_CHAT_ID'], ['daily', 'SUPPORT_DAILY_SUMMARY']]) {
+      if (before[key] === undefined) delete process.env[env];
+      else process.env[env] = before[key];
+    }
+  }
 });

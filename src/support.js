@@ -13,12 +13,18 @@
 
 const crypto = require('crypto');
 
-/** Issue types a student picks from. Each has an admin-editable instant answer. */
+/**
+ * Issue types a student picks from. Each has an admin-editable instant answer.
+ * `aliases` are labels a category used to have, so a support prompt sent
+ * before a rename still opens the right kind of ticket. `hidden` keeps a
+ * category readable on old tickets without offering it any more.
+ */
 const CATEGORIES = [
   {
     id: 'payment',
     emoji: '💳',
-    label: 'Paid but no access',
+    label: 'Paid, but no invite link',
+    aliases: ['Paid but no access'],
     settingKey: 'faq_payment',
     answer:
       'Payments usually confirm within a minute, and your private invite link is sent to this chat ' +
@@ -26,7 +32,7 @@ const CATEGORIES = [
       '• Send /status — if your pass shows as active, the invite button is right there.\n' +
       '• UPI payments can take up to 15 minutes to confirm at the bank.\n' +
       '• If money left your account and /status still shows no pass after 30 minutes, raise a ticket ' +
-      'below with your payment ID or a screenshot and we will sort it out.'
+      'below with your payment ID (it starts with pay_) or a screenshot and we will sort it out.'
   },
   {
     id: 'invite',
@@ -40,16 +46,24 @@ const CATEGORIES = [
       '• Tapping the link sends a join request; it is approved automatically within a few seconds.'
   },
   {
-    id: 'renewal',
-    emoji: '🔁',
-    label: 'Renewal or auto-pay',
-    settingKey: 'faq_renewal',
+    id: 'payment_failed',
+    emoji: '❌',
+    label: 'Payment failed or money deducted',
+    settingKey: 'faq_payment_failed',
     answer:
-      '• One-time passes do not renew — buy again from /plans before they expire and the new days are ' +
-      'added on top.\n' +
-      '• Monthly Auto-Pay renews itself. Send /cancel to stop future charges; you keep access until ' +
-      'the date you have already paid for.\n' +
-      '• You get a reminder before a pass runs out.'
+      '• If the payment page showed an error, no pass was bought — you can simply try again from /plans.\n' +
+      '• If money was deducted but the payment failed, your bank normally returns it within 5–7 working days.\n' +
+      '• If you are not sure, raise a ticket below with your payment ID (starts with pay_) or a screenshot.'
+  },
+  {
+    id: 'coupon',
+    emoji: '🎟',
+    label: 'Coupon code not working',
+    settingKey: 'faq_coupon',
+    answer:
+      '• Codes are not case-sensitive, but must be typed exactly, without spaces.\n' +
+      '• A code can expire, be switched off, or reach its usage limit, and most codes work once per student.\n' +
+      '• Apply the code from /plans before you pay — a discount cannot be added after payment.'
   },
   {
     id: 'access',
@@ -59,7 +73,7 @@ const CATEGORIES = [
     answer:
       'Members are removed automatically when their pass expires.\n\n' +
       '• Send /status to see your expiry date.\n' +
-      '• If it has expired, renew from /plans and you will get a new invite.\n' +
+      '• If it has expired, buy again from /plans and you will get a new invite.\n' +
       '• If your pass is still active and you were removed, raise a ticket below.'
   },
   {
@@ -68,50 +82,200 @@ const CATEGORIES = [
     label: 'Something else',
     settingKey: 'faq_other',
     answer: 'Tell us what is going on and an admin will get back to you here in this chat.'
+  },
+  {
+    id: 'renewal',
+    emoji: '🔁',
+    label: 'Renewal or auto-pay',
+    settingKey: 'faq_renewal',
+    hidden: true,
+    answer:
+      '• Passes do not renew by themselves — buy again from /plans when yours runs out.\n' +
+      '• If you are on the old Monthly Auto-Pay, send /cancel to stop future charges; you keep access ' +
+      'until the date you have already paid for.'
   }
 ];
+
+/** Categories offered in the /support menu, in order. */
+const MENU_CATEGORIES = CATEGORIES.filter((c) => !c.hidden);
+
+/**
+ * Ticket lifecycle. A ticket is `open` until an admin does anything with it,
+ * then `in_progress` until an admin explicitly closes it. Nothing else closes
+ * a ticket. Who has to act next is tracked separately in `waiting_on`, so a
+ * ticket can be in progress and still need a reply.
+ */
+const TICKET_STATUSES = ['open', 'in_progress', 'closed'];
+
+const STATUS_LABELS = {
+  open: '🆕 Open',
+  in_progress: '🟡 In progress',
+  closed: '✅ Closed'
+};
+
+const STATUS_MEANINGS = {
+  open: 'New — no admin has picked it up yet.',
+  in_progress: 'An admin has replied or acted. It stays in progress until an admin closes it.',
+  closed: 'An admin closed it. If the student writes again it reopens as in progress.'
+};
+
+/** Who has to act next on a ticket that is not closed. */
+const WAITING_LABELS = {
+  admin: '🔴 Needs reply',
+  student: '⏳ Waiting for student'
+};
+
+/** A stored status, with the old "answered" read as in_progress. */
+function normaliseStatus(status) {
+  const value = String(status || '').trim().toLowerCase();
+  if (value === 'answered') return 'in_progress';
+  return TICKET_STATUSES.includes(value) ? value : 'open';
+}
+
+/** The label for a status, tolerating an old or unknown one. */
+function statusLabel(status) {
+  return STATUS_LABELS[normaliseStatus(status)];
+}
+
+/** "🟡 In progress · 🔴 Needs reply", or just "✅ Closed". */
+function statusLine(status, waitingOn) {
+  const normalised = normaliseStatus(status);
+  const waiting = normalised === 'closed' ? '' : WAITING_LABELS[waitingOn];
+  return waiting ? `${STATUS_LABELS[normalised]} · ${waiting}` : STATUS_LABELS[normalised];
+}
+
+/**
+ * Ready-made answers an admin can send with one tap. The text is editable in
+ * Bot Settings; `for` lists the issue types it is shown first for.
+ */
+const QUICK_REPLIES = [
+  {
+    id: 'q1', key: 'qr_ask_payment_proof', button: '📎 Ask for payment proof',
+    for: ['payment', 'payment_failed', 'other'],
+    text: 'Please send your payment ID (it starts with pay_ and is in the Razorpay receipt or your UPI app) ' +
+      'or a screenshot of the payment, and we will check it right away.'
+  },
+  {
+    id: 'q2', key: 'qr_payment_not_received', button: '❌ Payment not received',
+    for: ['payment', 'payment_failed'],
+    text: 'We checked and could not find a successful payment for your account. If money left your bank, ' +
+      'it is usually returned within 5–7 working days. You can buy the pass again with /plans.'
+  },
+  {
+    id: 'q3', key: 'qr_payment_processing', button: '⏳ Payment still processing',
+    for: ['payment', 'payment_failed'],
+    text: 'Your payment is still being confirmed by the bank. This can take up to 30 minutes — your invite ' +
+      'link will arrive in this chat automatically as soon as it clears.'
+  },
+  {
+    id: 'q4', key: 'qr_pass_expired', button: '⌛ Pass has expired',
+    for: ['access', 'invite'],
+    text: 'Your pass has expired, which is why the link no longer works. Buy a new one with /plans and you ' +
+      'will get a fresh invite link straight away.'
+  },
+  {
+    id: 'q5', key: 'qr_invite_sent', button: '🔗 New link sent — tap it',
+    for: ['invite', 'payment', 'access'],
+    text: 'We have sent you a new invite link in this chat. Tap it from this same Telegram account and you ' +
+      'will be let in automatically.'
+  },
+  {
+    id: 'q6', key: 'qr_coupon_help', button: '🎟 How to use a coupon',
+    for: ['coupon'],
+    text: 'Send /plans, pick your group, tap "Apply coupon code" and type the code. The discounted price is ' +
+      'shown before you pay. A discount cannot be added to a payment that is already made.'
+  },
+  {
+    id: 'q7', key: 'qr_resolved', button: '✅ Resolved — close ticket', closes: true,
+    for: [],
+    text: 'Glad we could help! We are closing this ticket. If anything else comes up, just send a message here.'
+  }
+];
+
+/** The quick reply for an id such as "q2", or null. */
+function quickReplyById(id) {
+  return QUICK_REPLIES.find((q) => q.id === id) || null;
+}
+
+/** Quick replies ordered for an issue type: the relevant ones first, "resolved" last. */
+function quickRepliesFor(category) {
+  const relevant = QUICK_REPLIES.filter((q) => q.for.includes(category));
+  const others = QUICK_REPLIES.filter((q) => !q.for.includes(category) && !q.closes);
+  return [...relevant, ...others, ...QUICK_REPLIES.filter((q) => q.closes)];
+}
 
 /**
  * The settings admins can change without a deploy. Stored in each sheet's
  * "Bot Settings" tab; anything not listed here is ignored when read and
- * refused when written.
+ * refused when written. `section` groups them on the dashboard. `optional`
+ * settings may be blank on purpose; the rest fall back to their default.
  */
 const SETTINGS = [
   {
-    key: 'support_enabled', label: 'Support tickets enabled', type: 'toggle', default: 'yes',
+    key: 'support_enabled', section: 'support', label: 'Support tickets enabled', type: 'toggle', default: 'yes',
     hint: 'When "no", /support still shows the answers below but does not accept tickets.'
   },
   {
-    key: 'support_hours', label: 'Support hours', type: 'text', maxLength: 120,
+    key: 'support_hours', section: 'support', label: 'Support hours', type: 'text', maxLength: 120,
     default: 'Mon–Sat, 9 AM – 7 PM IST',
     hint: 'Shown to students when they raise a ticket.'
   },
   {
-    key: 'support_response_time', label: 'Expected response time', type: 'text', maxLength: 120,
+    key: 'support_response_time', section: 'support', label: 'Expected response time', type: 'text', maxLength: 120,
     default: 'within 24 hours',
     hint: 'Completes the sentence "An admin will reply …".'
   },
   {
-    key: 'support_contact', label: 'Fallback contact', type: 'text', maxLength: 120, default: '',
+    key: 'support_contact', section: 'support', label: 'Fallback contact', type: 'text', maxLength: 120,
+    default: '', optional: true,
     hint: 'Optional, e.g. @YourAdminHandle or an email. Shown when tickets are switched off.'
   },
   {
-    key: 'welcome_note', label: 'Extra /start message', type: 'textarea', maxLength: 1000, default: '',
+    key: 'welcome_note', section: 'support', label: 'Extra /start message', type: 'textarea', maxLength: 1000,
+    default: '', optional: true,
     hint: 'Optional. Added to the /start greeting, e.g. an offer or an announcement.'
   },
-  ...CATEGORIES.map((category) => ({
+  ...CATEGORIES.filter((c) => !c.hidden).map((category) => ({
     key: category.settingKey,
-    label: `Answer: ${category.label}`,
+    section: 'answers',
+    label: `${category.emoji} ${category.label}`,
     type: 'textarea',
     maxLength: 2000,
     default: category.answer,
-    hint: `Shown when a student picks "${category.label}" in /support.`
-  }))
+    hint: `Shown instantly when a student picks "${category.label}" in /support.`
+  })),
+  ...QUICK_REPLIES.map((reply) => ({
+    key: reply.key,
+    section: 'quick',
+    label: reply.button,
+    type: 'textarea',
+    maxLength: 1500,
+    default: reply.text,
+    hint: reply.closes
+      ? 'Sent to the student when an admin taps this quick reply. It also closes the ticket.'
+      : 'Sent to the student when an admin taps this quick reply.'
+  })),
+  {
+    key: 'pass_name', section: 'pass', label: 'Pass name', type: 'text', maxLength: 80, default: '', optional: true,
+    hint: 'The exam the pass is for, e.g. "Target APPSC Group 2 – 2026". Blank uses the built-in name.'
+  },
+  {
+    key: 'pass_price', section: 'pass', label: 'Price (₹)', type: 'price', maxLength: 6, default: '', optional: true,
+    hint: 'Whole rupees. Blank uses ₹199.'
+  },
+  {
+    key: 'pass_valid_until', section: 'pass', label: 'Valid until', type: 'date', maxLength: 10, default: '',
+    optional: true,
+    hint: 'dd-mm-yyyy. Access ends at the end of this day. Blank uses EXAM_PASS_END_DATE.'
+  },
+  {
+    key: 'pass_description', section: 'pass', label: 'Description', type: 'textarea', maxLength: 300,
+    default: '', optional: true,
+    hint: 'One or two lines shown with the price. Blank uses the built-in description.'
+  }
 ];
 
 const SETTING_KEYS = SETTINGS.map((s) => s.key);
-
-const TICKET_STATUSES = ['open', 'answered', 'closed'];
 
 /** Longest message accepted into a ticket; Telegram's own limit is 4096. */
 const MAX_MESSAGE_CHARS = 3500;
@@ -124,13 +288,14 @@ function esc(text) {
 
 /** A category by id, falling back to "other". */
 function categoryById(id) {
-  return CATEGORIES.find((c) => c.id === id) || CATEGORIES[CATEGORIES.length - 1];
+  return CATEGORIES.find((c) => c.id === id) || CATEGORIES.find((c) => c.id === 'other');
 }
 
-/** A category by its label, as it appears on a support prompt. */
+/** A category by its label (or a label it used to have), as it appears on a support prompt. */
 function categoryByLabel(label) {
   const clean = String(label || '').trim();
-  return CATEGORIES.find((c) => c.label === clean) || categoryById('other');
+  return CATEGORIES.find((c) => c.label === clean || (c.aliases || []).includes(clean)) ||
+    categoryById('other');
 }
 
 /**
@@ -138,7 +303,7 @@ function categoryByLabel(label) {
  *
  * A blank stored value falls back to the default for the answers and the
  * toggle, because an empty answer or an empty "enabled" would read as broken
- * rather than as a choice. The optional texts may legitimately be blank.
+ * rather than as a choice. Optional settings may legitimately be blank.
  *
  * @param {Object} stored Raw { key: value } from the sheet
  * @returns {Object} { key: value } for every key in SETTINGS
@@ -148,9 +313,8 @@ function normaliseSettings(stored = {}) {
   SETTINGS.forEach((def) => {
     const raw = stored && Object.prototype.hasOwnProperty.call(stored, def.key) ? stored[def.key] : undefined;
     const value = raw === undefined || raw === null ? '' : String(raw).trim();
-    const optional = def.key === 'support_contact' || def.key === 'welcome_note';
-    if (!value && !(optional && raw !== undefined)) {
-      out[def.key] = def.default;
+    if (!value) {
+      out[def.key] = def.optional ? '' : def.default;
     } else if (def.type === 'toggle') {
       out[def.key] = /^(no|false|off|0)$/i.test(value) ? 'no' : 'yes';
     } else {
@@ -187,9 +351,40 @@ function validateSettingsPatch(patch) {
     if (text.length > def.maxLength) {
       return { ok: false, error: `"${key}" is ${text.length} characters; the limit is ${def.maxLength}.` };
     }
+    if (def.type === 'price' && text && (!/^\d+$/.test(text) || Number(text) < 1)) {
+      return { ok: false, error: `"${key}" must be a whole number of rupees, at least 1.` };
+    }
+    if (def.type === 'date' && text && !isRealDate(text)) {
+      return { ok: false, error: `"${key}" must be a real date written as dd-mm-yyyy.` };
+    }
+    if (def.type === 'date' && text && isPastDay(text)) {
+      return { ok: false, error: `"${key}" is in the past. Choose today or a later date.` };
+    }
     value[key] = text;
   }
   return { ok: true, value };
+}
+
+/** Whether "dd-mm-yyyy" names a real calendar date. */
+function isRealDate(text) {
+  const match = String(text || '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (!match) return false;
+  const [, dd, mm, yyyy] = match.map(Number);
+  const date = new Date(Date.UTC(yyyy, mm - 1, dd));
+  return date.getUTCFullYear() === yyyy && date.getUTCMonth() === mm - 1 && date.getUTCDate() === dd;
+}
+
+/** Whether a real dd-mm-yyyy date ended before now, in India. */
+function isPastDay(text, now = Date.now()) {
+  const [dd, mm, yyyy] = String(text).split('-').map(Number);
+  const endOfDay = Date.UTC(yyyy, mm - 1, dd, 23, 59, 59, 999) - (5 * 60 + 30) * 60 * 1000;
+  return endOfDay < now;
+}
+
+/** The first Razorpay payment id in some text, e.g. "pay_TZ8ciB8Yng8WE3". */
+function findPaymentId(text) {
+  const match = String(text || '').match(/\bpay_[A-Za-z0-9]{8,30}\b/);
+  return match ? match[0] : '';
 }
 
 /** Whether students can raise tickets. */
@@ -256,6 +451,178 @@ function parseReplyLine(text) {
 /** First line of the confirmation a student gets after raising a ticket. */
 function receivedLine(ticketId) {
   return `📨 Ticket received · ${ticketId}`;
+}
+
+// ---- Admin buttons ---------------------------------------------------------
+// Every ticket post in the support chat carries these, so nothing needs a
+// command. The data is adm:<action>:<ticketId>:<telegramId>[:<paymentId>] —
+// at most about 55 bytes, inside Telegram's 64.
+
+const ADMIN_ACTIONS = {
+  r: 'reply',
+  q: 'quickMenu',
+  i: 'invite',
+  p: 'passes',
+  h: 'history',
+  c: 'close',
+  o: 'reopen',
+  k: 'checkPayment',
+  g: 'grantAsk'
+};
+
+/**
+ * Buttons under a ticket in the support chat.
+ *
+ * @param {string} ticketId
+ * @param {string|number} telegramId
+ * @param {{closed?: boolean, paymentId?: string}} [options] paymentId adds a
+ *   "Check payment" button for a pay_ id the student mentioned
+ */
+function adminKeyboard(ticketId, telegramId, { closed = false, paymentId = '' } = {}) {
+  const data = (code, extra) => `adm:${code}:${ticketId}:${telegramId}${extra ? ':' + extra : ''}`;
+  const rows = [
+    [
+      { text: '✍️ Write reply', callback_data: data('r') },
+      { text: '📋 Quick replies', callback_data: data('q') }
+    ],
+    [
+      { text: '🔗 Send new invite link', callback_data: data('i') },
+      { text: '🎟 Pass & payment', callback_data: data('p') }
+    ]
+  ];
+  if (paymentId) rows.push([{ text: `🔍 Check payment ${paymentId}`, callback_data: data('k', paymentId) }]);
+  rows.push([
+    { text: '📜 History', callback_data: data('h') },
+    closed
+      ? { text: '🔓 Reopen', callback_data: data('o') }
+      : { text: '✅ Close ticket', callback_data: data('c') }
+  ]);
+  return { inline_keyboard: rows };
+}
+
+/** One button per quick reply, relevant ones first. */
+function quickReplyKeyboard(ticketId, telegramId, category) {
+  return {
+    inline_keyboard: quickRepliesFor(category).map((reply) => ([{
+      text: reply.button,
+      callback_data: `adm:${reply.id}:${ticketId}:${telegramId}`
+    }]))
+  };
+}
+
+/**
+ * { action, ticketId, telegramId, paymentId?, quickReply? } from an admin
+ * button, or null for anything malformed.
+ */
+function parseAdminCallback(data) {
+  const match = String(data || '').match(
+    new RegExp(`^adm:([a-z])(\\d?):(${TICKET_ID_PATTERN}):(\\d+)(?::(pay_[A-Za-z0-9]{8,30}))?$`)
+  );
+  if (!match) return null;
+  const [, letter, digit, ticketId, telegramId, paymentId] = match;
+
+  if (letter === 'q' && digit) {
+    if (paymentId) return null;
+    const reply = quickReplyById(`q${digit}`);
+    return reply ? { action: 'quickReply', ticketId, telegramId, quickReply: reply } : null;
+  }
+  // g<n>: grant the pass for payment in the family's n-th group, confirmed.
+  if (letter === 'g' && digit) {
+    return paymentId
+      ? { action: 'grantConfirm', ticketId, telegramId, paymentId, groupIndex: Number(digit) }
+      : null;
+  }
+  if (digit || !ADMIN_ACTIONS[letter]) return null;
+  const needsPayment = letter === 'k' || letter === 'g';
+  if (needsPayment !== Boolean(paymentId)) return null;
+  return { action: ADMIN_ACTIONS[letter], ticketId, telegramId, paymentId: paymentId || '' };
+}
+
+/**
+ * suggestNextStep — the one line that tells an admin what to do, from the
+ * issue type and what the student actually holds.
+ *
+ * @param {string} category
+ * @param {Array<{group: Object, eligible: boolean, subscriber: Object|null, inGroup: string, reason: string}>} passes
+ *   inGroup is 'yes' | 'no' | 'unknown'
+ * @returns {string} Plain text
+ */
+function suggestNextStep(category, passes = []) {
+  const valid = passes.filter((p) => p.eligible);
+  const outside = valid.filter((p) => p.inGroup === 'no');
+  const expired = passes.filter((p) => p.subscriber && !p.eligible);
+
+  if (outside.length) {
+    return `Pass is valid but they are not in ${outside.map((p) => p.group.shortName).join(', ')} → ` +
+      'tap "🔗 Send new invite link".';
+  }
+  if (valid.length && valid.every((p) => p.inGroup === 'yes')) {
+    return 'Pass is valid and they are already in the group → ask what exactly they see (✍️ Write reply).';
+  }
+  if (valid.length) {
+    return 'Pass is valid → "🔗 Send new invite link" is safe to send.';
+  }
+  if (category === 'coupon') {
+    return 'Check the code on the dashboard Pass & Coupons page (active, expiry, uses) → then reply.';
+  }
+  if (expired.length) {
+    return `No valid pass (${expired.map((p) => `${p.group.shortName}: ${p.reason}`).join('; ')}) → ` +
+      'quick reply "⌛ Pass has expired" or check their payment.';
+  }
+  if (category === 'payment' || category === 'payment_failed') {
+    return 'No payment recorded for this account → ask for the payment ID (📋 Quick replies → ' +
+      '"📎 Ask for payment proof"), then 🔍 check it.';
+  }
+  return 'No pass on record → reply to find out more.';
+}
+
+/** Where each "[time] who:" entry of a stored conversation starts. */
+const ENTRY_START = /(?:^|\n\n)(?=\[[^\]\n]{6,40}\] [^\n]*:\n)/g;
+
+/**
+ * earlierConversation — the thread before its newest message, trimmed to the
+ * most recent `maxChars`, starting on a whole entry.
+ *
+ * @param {string} conversation The Conversation cell of a ticket
+ * @param {number} [maxChars]
+ * @returns {string} '' when there is nothing before the newest message
+ */
+function earlierConversation(conversation, maxChars = 1500) {
+  const text = String(conversation || '');
+  const starts = [];
+  let match;
+  ENTRY_START.lastIndex = 0;
+  while ((match = ENTRY_START.exec(text)) !== null) {
+    starts.push(match.index + (match[0].startsWith('\n\n') ? 2 : 0));
+    if (match[0] === '') ENTRY_START.lastIndex++;
+  }
+  if (starts.length < 2) return '';
+
+  const before = text.slice(0, starts[starts.length - 1]).trimEnd();
+  return lastChars(before, maxChars);
+}
+
+/** The newest `maxChars` of a thread, cut at an entry boundary when one is near. */
+function lastChars(text, maxChars = 3500) {
+  const value = String(text || '');
+  if (value.length <= maxChars) return value;
+  const tail = value.slice(value.length - maxChars);
+  const boundary = tail.search(/\n\n\[/);
+  return '…\n' + (boundary !== -1 && boundary < maxChars / 2 ? tail.slice(boundary + 2) : tail);
+}
+
+/**
+ * isRecent — whether an IST stamp from the sheet is within `days` of now.
+ * An unreadable stamp counts as recent, so a formatting quirk never splits a
+ * conversation into a second ticket.
+ */
+function isRecent(stamp, days, now = Date.now()) {
+  const match = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{4}),\s*(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)/i);
+  if (!match) return true;
+  let hour = parseInt(match[4], 10) % 12;
+  if (match[7].toUpperCase() === 'PM') hour += 12;
+  const at = Date.UTC(+match[3], +match[2] - 1, +match[1], hour, +match[5], +match[6]) - (5 * 60 + 30) * 60 * 1000;
+  return now - at <= days * 24 * 60 * 60 * 1000;
 }
 
 /**
@@ -373,6 +740,20 @@ function createThrottle({ limit = 5, windowMs = 10 * 60 * 1000, now = Date.now }
 
 module.exports = {
   CATEGORIES,
+  MENU_CATEGORIES,
+  STATUS_LABELS,
+  STATUS_MEANINGS,
+  WAITING_LABELS,
+  normaliseStatus,
+  statusLabel,
+  statusLine,
+  QUICK_REPLIES,
+  quickReplyById,
+  quickRepliesFor,
+  quickReplyKeyboard,
+  suggestNextStep,
+  isRealDate,
+  findPaymentId,
   SETTINGS,
   SETTING_KEYS,
   TICKET_STATUSES,
@@ -391,6 +772,11 @@ module.exports = {
   replyLine,
   parseReplyLine,
   receivedLine,
+  adminKeyboard,
+  parseAdminCallback,
+  earlierConversation,
+  lastChars,
+  isRecent,
   supportChatFor,
   botIdFromToken,
   parseCommand,

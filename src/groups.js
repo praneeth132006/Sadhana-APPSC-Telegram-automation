@@ -147,6 +147,11 @@ function decorate(group) {
   const razorpayPlanId =
     String(process.env[`RAZORPAY_PLAN_${prefix}`] || '').trim() || legacy.plan;
 
+  // Auto-pay only needs a Razorpay plan while a recurring pass is on sale.
+  const shapes = loadConfig().planShapes || {};
+  const sellsRecurring = Object.keys(group.plans || {})
+    .some((planId) => shapes[planId] && shapes[planId].type === 'recurring' && !shapes[planId].retired);
+
   return Object.assign({}, group, {
     displayName: displayName(group),
     // Falls back to the full name, so a group without one still works.
@@ -168,8 +173,8 @@ function decorate(group) {
     // plan id still sells its one-time passes perfectly well. But it is not
     // silent either — without this the only symptom was a student tapping
     // Monthly Auto-Pay and being told the bot could not create a link.
-    autopayReady: Boolean(razorpayPlanId),
-    autopayMissing: razorpayPlanId ? null : `RAZORPAY_PLAN_${prefix}`
+    autopayReady: Boolean(razorpayPlanId) || !sellsRecurring,
+    autopayMissing: razorpayPlanId || !sellsRecurring ? null : `RAZORPAY_PLAN_${prefix}`
   });
 }
 
@@ -179,10 +184,14 @@ function decorate(group) {
  * Shape comes from planShapes, price from the group. That way a price differs
  * per group without five copies of the same wording drifting apart.
  *
+ * A plan marked `retired` in planShapes is no longer sold, so it is left out
+ * here — but it still exists for anyone who bought it. getPlanFor finds it by
+ * id, because a renewal webhook, a reminder or /cancel for an existing member
+ * must keep working after the plan comes off sale.
+ *
  * @param {string} groupId
- * @param {Object} [options] Reserved; no pass is hidden any more. The 5-minute
- *   Rs 1 test pass it used to gate was removed once test-stage pricing made
- *   every pass cheap enough to exercise for real.
+ * @param {Object} [options]
+ * @param {boolean} [options.includeRetired] Also return plans no longer sold
  * @returns {Array<Object>} Plan objects, in configuration order
  */
 function plansFor(groupId, options = {}) {
@@ -193,6 +202,7 @@ function plansFor(groupId, options = {}) {
     .map(([planId, amountPaise]) => {
       const shape = shapes[planId];
       if (!shape) return null;
+      if (shape.retired && !options.includeRetired) return null;
       return Object.assign({}, shape, {
         id: planId,
         amountPaise: Number(amountPaise),
@@ -206,15 +216,16 @@ function plansFor(groupId, options = {}) {
 }
 
 /**
- * getPlanFor — one plan within one group.
+ * getPlanFor — one plan within one group, retired or not.
  *
  * @param {string} groupId
  * @param {string} planId
- * @param {Object} [options] Passed to plansFor
+ * @param {Object} [options] Passed to plansFor; includeRetired defaults to true
  * @returns {Object|null}
  */
 function getPlanFor(groupId, planId, options = {}) {
-  return plansFor(groupId, options).find((p) => p.id === planId) || null;
+  return plansFor(groupId, Object.assign({ includeRetired: true }, options))
+    .find((p) => p.id === planId) || null;
 }
 
 module.exports = {

@@ -21,6 +21,7 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const groups = require('./src/groups');
+const support = require('./src/support');
 
 /** Must match telegramWebhookSecret() in server.js exactly. */
 function webhookSecret() {
@@ -51,6 +52,43 @@ async function call(token, method, body) {
     body: JSON.stringify(body || {})
   });
   return res.json();
+}
+
+/** What students see when they type "/" to the bot. */
+const STUDENT_COMMANDS = [
+  { command: 'plans', description: 'See the pass and buy it' },
+  { command: 'status', description: 'Your pass and expiry date' },
+  { command: 'support', description: 'Get help with a problem' },
+  { command: 'help', description: 'How it works' }
+];
+
+/** What admins see when they type "/" in the support chat. */
+const ADMIN_COMMANDS = [
+  { command: 'summary', description: 'How many tickets need a reply, are open, in progress, closed' },
+  { command: 'tickets', description: 'Tickets needing a reply (or: open, progress, student, closed)' },
+  { command: 'msg', description: 'Message a student: /msg <id or @username> text' },
+  { command: 'settings', description: 'Bot texts, pass name and price' },
+  { command: 'supporthelp', description: 'How to handle support' }
+];
+
+/**
+ * registerCommandMenus — the "/" menus: student commands in private chats,
+ * admin commands in this bot's support chat. Failure is reported, never fatal.
+ */
+async function registerCommandMenus(token, payBotEnv) {
+  const students = await call(token, 'setMyCommands', {
+    commands: STUDENT_COMMANDS, scope: { type: 'all_private_chats' }
+  });
+  console.log(students.ok ? '   ✅ student command menu' : `   ⚠️ student command menu: ${students.description}`);
+
+  const chat = support.supportChatFor(payBotEnv);
+  if (!chat) return;
+  const admins = await call(token, 'setMyCommands', {
+    commands: ADMIN_COMMANDS, scope: { type: 'chat', chat_id: chat.chatId }
+  });
+  console.log(admins.ok
+    ? '   ✅ admin command menu in the support chat'
+    : `   ⚠️ admin command menu: ${admins.description} (is the bot a member of the support chat?)`);
 }
 
 async function main() {
@@ -205,7 +243,9 @@ async function main() {
       continue;
     }
 
-    console.log(`   ✅ ${url}\n`);
+    console.log(`   ✅ ${url}`);
+    await registerCommandMenus(token, payBotEnv);
+    console.log('');
   }
 
   // A per-bot readback only proves the webhook survived that instant. A poller

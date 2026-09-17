@@ -69,27 +69,36 @@ test('a 30-day pass expires 30 days out', () => {
   assert.equal(Math.round((expiry - now) / 86400000), 30);
 });
 
-test('exactly three passes are sold, and the 5-minute test pass is gone', () => {
-  // It could be bought by any student who found the bot, and it existed only to
-  // make the expiry sweep watchable. Test-stage pricing does that job now
-  // without a pass that hands out five minutes of access for a rupee.
-  assert.deepEqual(plans.listPlans().map((p) => p.id), ['sprint_30', 'autopay_monthly', 'exam_pass']);
+test('only the exam pass is sold, and the 5-minute test pass is gone', () => {
   assert.equal(plans.getPlan('test_5min'), null);
 
   for (const group of groups.listGroups()) {
     const sold = groups.plansFor(group.id).map((p) => p.id);
-    assert.deepEqual(sold, ['sprint_30', 'autopay_monthly', 'exam_pass'], `${group.id} sells the wrong set`);
+    assert.deepEqual(sold, ['exam_pass'], `${group.id} sells the wrong set`);
   }
 });
 
-test('every group is on test-stage pricing: Rs 1, Rs 2, Rs 3', () => {
+test('retired passes are off sale but still found for the members who hold one', () => {
+  // A monthly auto-pay renewal arrives as a webhook naming autopay_monthly.
+  // grantAccess looks the plan up by id; if it vanished with the plan coming
+  // off sale, every renewal would fail and Razorpay would retry forever.
+  for (const group of groups.listGroups()) {
+    for (const planId of ['sprint_30', 'autopay_monthly']) {
+      const plan = groups.getPlanFor(group.id, planId);
+      assert.ok(plan, `${group.id}/${planId} can no longer be looked up`);
+      assert.equal(plan.groupId, group.id);
+      assert.ok(!groups.plansFor(group.id).some((p) => p.id === planId), `${planId} is still on sale`);
+    }
+    assert.equal(group.autopayReady, true, 'no recurring pass is sold, so none should be reported missing');
+  }
+});
+
+test('every group sells the exam pass at Rs 199', () => {
   for (const group of groups.listGroups()) {
     const priced = Object.fromEntries(groups.plansFor(group.id).map((p) => [p.id, p.amountPaise]));
-    assert.deepEqual(priced, { sprint_30: 100, autopay_monthly: 200, exam_pass: 300 },
-      `${group.id} is not on test-stage pricing`);
+    assert.deepEqual(priced, { exam_pass: 19900 }, `${group.id} is not at Rs 199`);
   }
 });
-
 test('a timestamp survives a round trip whatever timezone the server is in', () => {
   // formatIst writes an IST wall-clock reading; parseIst used to rebuild it
   // from LOCAL parts, so on Vercel (UTC) every expiry read back 5h30m late.
@@ -371,6 +380,26 @@ function loadServerWithStubs() {
 const membership = require('../src/membership');
 const sheets = require('../src/sheets');
 const paybot = require('../src/paybot');
+
+// No test may reach the real Telegram API. The server reads .env, which holds
+// real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
+// test forgot to stub would post into the live support group. A test that
+// wants Telegram replaces the specific method it needs, which runs instead.
+require('node-telegram-bot-api').prototype._request = async function (method) {
+  throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
+};
+
+// Nor the live Google Sheets or Razorpay: .env points at real ones.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = function guardedFetch(url, ...rest) {
+    const target = String(url && url.url ? url.url : url);
+    if (/^https:\/\/(script\.google(usercontent)?\.com|api\.razorpay\.com|api\.telegram\.org)\//.test(target)) {
+      return Promise.reject(new Error(`Network call to ${target.split('?')[0]} attempted in a test — stub it`));
+    }
+    return realFetch.call(this, url, ...rest);
+  };
+}
 
 const TEST_GROUP = 'appsc_q_en';
 
@@ -890,8 +919,8 @@ test('prices are per group, not shared', () => {
 
   // And the shape still comes from the shared planShapes block, so the wording
   // is not five copies drifting apart.
-  const a = groups.getPlanFor('appsc_q_en', 'sprint_30');
-  const b = groups.getPlanFor('upsc', 'sprint_30');
+  const a = groups.getPlanFor('appsc_q_en', 'exam_pass');
+  const b = groups.getPlanFor('upsc', 'exam_pass');
   assert.equal(a.label, b.label);
 });
 
@@ -947,7 +976,7 @@ test('a payment bot sees only its own groups', () => {
 test('the two languages in a family cost the same but are separate groups', () => {
   // Same price, different chat: paying for English must not open Telugu.
   const [en, te] = familyOf('TELEGRAM_PAYBOT_SADHANA');
-  const price = (g) => groups.plansFor(g.id).find((p) => p.id === 'sprint_30').amountPaise;
+  const price = (g) => groups.plansFor(g.id).find((p) => p.id === 'exam_pass').amountPaise;
 
   assert.equal(price(en), price(te), 'the two languages should cost the same');
   assert.notEqual(en.telegramGroupId, te.telegramGroupId,
@@ -962,8 +991,8 @@ test('each family prices from its own group entry', () => {
 
   for (const env of ['TELEGRAM_PAYBOT_UPSC', 'TELEGRAM_PAYBOT_NEWS', 'TELEGRAM_PAYBOT_SADHANA']) {
     for (const group of familyOf(env)) {
-      const price = groups.plansFor(group.id).find((p) => p.id === 'sprint_30').amountPaise;
-      assert.equal(price, configured(group.id).plans.sprint_30, `${group.id} is mispriced`);
+      const price = groups.plansFor(group.id).find((p) => p.id === 'exam_pass').amountPaise;
+      assert.equal(price, configured(group.id).plans.exam_pass, `${group.id} is mispriced`);
     }
   }
 });
@@ -1056,5 +1085,101 @@ test('a pass for one group does not admit its sibling', async () => {
   } finally {
     stub.restore();
     sheets.forGroup = original;
+  }
+});
+
+// ===========================================================================
+// Resending an invite from support
+// ===========================================================================
+// For the student who paid and never got in. It must never become a way to
+// hand an invite to someone without a live pass.
+
+test('resendInvite makes a fresh link for an active member and records it', async () => {
+  const originalInvite = paybot.createJoinRequestInvite;
+  const originalForGroup = sheets.forGroup;
+  const invited = [];
+  const written = [];
+  paybot.createJoinRequestInvite = async (env, chatId, telegramId) => {
+    invited.push({ env, chatId, telegramId: String(telegramId) });
+    return 'https://t.me/+fresh-one';
+  };
+  sheets.forGroup = (groupId) => Object.assign({}, originalForGroup(groupId), {
+    getSubscriber: async () => ({ telegram_id: '555', status: 'active', expiry_date: '30-11-2099' }),
+    upsertSubscriber: async (data, event) => { written.push({ data, event }); return data; }
+  });
+  try {
+    const result = await membership.resendInvite(TEST_GROUP, 555);
+    assert.equal(result.sent, true);
+    assert.equal(result.inviteLink, 'https://t.me/+fresh-one');
+    assert.equal(invited.length, 1);
+    assert.equal(invited[0].env, 'TELEGRAM_PAYBOT_SADHANA', 'the invite must come from this group\'s own bot');
+
+    assert.equal(written.length, 1);
+    assert.deepEqual(written[0].data, { telegram_id: '555', invite_link: 'https://t.me/+fresh-one', is_payment: false });
+    assert.equal(written[0].event, 'invite.resent');
+    assert.equal(written[0].data.status, undefined, 'a resend must not change the pass itself');
+    assert.equal(written[0].data.expiry_date, undefined);
+  } finally {
+    paybot.createJoinRequestInvite = originalInvite;
+    sheets.forGroup = originalForGroup;
+  }
+});
+
+test('resendInvite refuses anyone without an active pass', async () => {
+  const originalInvite = paybot.createJoinRequestInvite;
+  let invited = 0;
+  paybot.createJoinRequestInvite = async () => { invited++; return 'https://t.me/+nope'; };
+  try {
+    const refused = [
+      null,
+      { status: 'expired', expiry_date: '30-11-2099' },
+      { status: 'removed', expiry_date: '30-11-2099' },
+      { status: 'pending', expiry_date: '30-11-2099' },
+      // Marked active but already past expiry: the join request would decline it.
+      { status: 'active', expiry_date: '01-01-2020' },
+      { status: 'active', expiry_date: '' }
+    ];
+    for (const row of refused) {
+      const result = await withSubscriber(row, () => membership.resendInvite(TEST_GROUP, 555));
+      assert.equal(result.sent, false, `sent an invite for ${JSON.stringify(row)}`);
+      assert.ok(result.reason, 'a refusal must say why');
+    }
+    assert.equal(invited, 0);
+  } finally {
+    paybot.createJoinRequestInvite = originalInvite;
+  }
+});
+
+test('grantAccess uses the valid-until date promised at checkout, but never a date already past', async () => {
+  const originalInvite = paybot.createJoinRequestInvite;
+  const originalForGroup = sheets.forGroup;
+  const written = [];
+  paybot.createJoinRequestInvite = async () => 'https://t.me/+x';
+  sheets.forGroup = (groupId) => Object.assign({}, originalForGroup(groupId), {
+    getSubscriber: async () => null,
+    upsertSubscriber: async (data) => { written.push(data); return data; }
+  });
+  const savedEnd = process.env.EXAM_PASS_END_DATE;
+  process.env.EXAM_PASS_END_DATE = '30-11-2098';
+  try {
+    await membership.grantAccess({
+      groupId: TEST_GROUP, telegramId: 1, planId: 'exam_pass', paymentId: 'pay_a', amountPaise: 14900,
+      validUntil: '31-05-2099', planLabel: 'Target Group 2 2099'
+    });
+    assert.match(written[0].expiry_date, /^31-05-2099, 11:59:59 PM IST$/);
+    assert.equal(written[0].plan_label, 'Target Group 2 2099');
+    assert.equal(written[0].amount, 149);
+
+    await membership.grantAccess({
+      groupId: TEST_GROUP, telegramId: 2, planId: 'exam_pass', paymentId: 'pay_b', amountPaise: 19900,
+      validUntil: '01-01-2020'
+    });
+    assert.match(written[1].expiry_date, /^30-11-2098/, 'a past promised date must fall back rather than grant nothing');
+    assert.ok(written[1].plan_label, 'the built-in name is used when none was promised');
+  } finally {
+    paybot.createJoinRequestInvite = originalInvite;
+    sheets.forGroup = originalForGroup;
+    if (savedEnd === undefined) delete process.env.EXAM_PASS_END_DATE;
+    else process.env.EXAM_PASS_END_DATE = savedEnd;
   }
 });

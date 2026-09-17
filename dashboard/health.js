@@ -12,7 +12,7 @@
 
 import {
   initDashboard, api, el, replaceChildren, panel, statCard, emptyState,
-  pill, showToast, $
+  pill, showToast, escapeHtml, $
 } from './shared.js';
 
 /** Last /api/health response. */
@@ -102,7 +102,7 @@ function connectivityChecks(data) {
       'No <code>GOOGLE_SHEET_WEBAPP_URL</code> in <code>.env</code>. Deploy <code>google_apps_script.js</code> and paste the /exec URL there.'));
   } else if (!data.sheets.reachable) {
     checks.push(check('fail', 'Google Apps Script Web App',
-      `Not reachable: ${data.sheets.error}. Redeploy the script with <code>Execute as: Me</code> and ` +
+      `Not reachable: ${escapeHtml(data.sheets.error)}. Redeploy the script with <code>Execute as: Me</code> and ` +
       '<code>Who has access: Anyone</code>, then confirm the /exec URL in <code>.env</code>.'));
   } else if (data.sheets.bound === false) {
     // Deployed and answering, but it cannot see any spreadsheet — the code was
@@ -116,23 +116,23 @@ function connectivityChecks(data) {
   } else if (!data.sheets.current) {
     // Reachable and bound, but an older version of the script.
     checks.push(check('fail', 'Google Apps Script version',
-      `The deployed Web App is running <code>${data.sheets.version || 'an unknown version'}</code>, but these ` +
-      `dashboards need <code>${data.sheets.requiredVersion || 'a newer version'}</code>. Analytics, the question browser and editing will not ` +
+      `The deployed Web App is running <code>${escapeHtml(data.sheets.version || 'an unknown version')}</code>, but these ` +
+      `dashboards need <code>${escapeHtml(data.sheets.requiredVersion || 'a newer version')}</code>. Analytics, the question browser and editing will not ` +
       'work until you open your Sheet → <code>Extensions → Apps Script</code>, paste the current ' +
       '<code>google_apps_script.js</code>, run <code>upgradeSpreadsheet</code>, and deploy a ' +
       '<strong>New version</strong> of that same deployment.'));
   } else {
     checks.push(check('pass', 'Google Apps Script Web App',
-      `Responding with <code>${data.sheets.version}</code>` +
-      (data.sheets.spreadsheetName ? `, attached to "${data.sheets.spreadsheetName}".` : '.')));
+      `Responding with <code>${escapeHtml(data.sheets.version)}</code>` +
+      (data.sheets.spreadsheetName ? `, attached to "${escapeHtml(data.sheets.spreadsheetName)}".` : '.')));
   }
 
   checks.push(data.telegram.configured
     ? (data.telegram.reachable
         ? check('pass', 'Telegram Bot API',
-            `Bot <code>@${data.telegram.botUsername}</code> is answering getMe.`)
+            `Bot <code>@${escapeHtml(data.telegram.botUsername)}</code> is answering getMe.`)
         : check('fail', 'Telegram Bot API',
-            `Bot not reachable: ${data.telegram.error}. Check <code>TELEGRAM_BOT_TOKEN</code> is current and that the bot is still an admin of the group.`))
+            `Bot not reachable: ${escapeHtml(data.telegram.error)}. Check <code>TELEGRAM_BOT_TOKEN</code> is current and that the bot is still an admin of the group.`))
     : check('fail', 'Telegram Bot API',
         'Set <code>TELEGRAM_BOT_TOKEN</code> and <code>TELEGRAM_GROUP_ID</code> in <code>.env</code>. Without them the Automation dashboard cannot post.'));
 
@@ -146,7 +146,7 @@ function connectivityChecks(data) {
       'The deployed Apps Script does not have the membership actions, so every payment webhook will fail ' +
       'and nobody gets group access after paying. Paste the current <code>google_apps_script.js</code>, run ' +
       '<code>setupSubscriptionSheets</code>, and deploy a new version. ' +
-      `<br><small>${data.sheets.membershipError || ''}</small>`));
+      `<br><small>${escapeHtml(data.sheets.membershipError || '')}</small>`));
   } else if (data.sheets.membershipReady) {
     checks.push(check('pass', 'Subscription storage',
       'Subscribers and Payments tabs are reachable — paid members will be recorded.'));
@@ -187,7 +187,7 @@ function connectivityChecks(data) {
   if (Array.isArray(data.sheets.missingActions) && data.sheets.missingActions.length) {
     checks.push(check('fail', 'This sheet\'s Apps Script is out of date',
       'It has never heard of: ' +
-      data.sheets.missingActions.map((a) => `<code>${a}</code>`).join(', ') + '. ' +
+      data.sheets.missingActions.map((a) => `<code>${escapeHtml(a)}</code>`).join(', ') + '. ' +
       'Anything using them fails. Open the sheet → <strong>Extensions → Apps Script</strong>, ' +
       'paste this group\'s file from <code>apps-script/</code> over what is there, then ' +
       '<strong>Deploy → Manage deployments → edit → Version: New version</strong>.'));

@@ -165,6 +165,16 @@ function formatPaise(amountPaise) {
   return '₹' + (Number.isInteger(rupees) ? rupees : rupees.toFixed(2));
 }
 
+/** Notes Razorpay will accept: at most 10 extra, short, BMP-only string values. */
+function cleanExtraNotes(extra) {
+  const out = {};
+  Object.entries(extra || {}).slice(0, 10).forEach(([key, value]) => {
+    if (!/^[a-z_]{1,40}$/.test(key) || value === undefined || value === null || value === '') return;
+    out[key] = bmpOnly(String(value), 250);
+  });
+  return out;
+}
+
 /**
  * requireGroupId — refuses to create a checkout that the webhook cannot honour.
  *
@@ -191,7 +201,15 @@ function requireGroupId(plan) {
   return groupId;
 }
 
-async function createPaymentLink({ plan, telegramId, name, username, callbackUrl }) {
+/**
+ * createPaymentLink — a one-time Razorpay link for a group's pass.
+ *
+ * @param {Object} options
+ * @param {Object} options.plan Group-scoped plan; amountPaise is what is charged
+ * @param {Object} [options.extraNotes] More notes for the webhook (valid_until,
+ *   plan_label, coupon_code, …). They can never replace the identity notes.
+ */
+async function createPaymentLink({ plan, telegramId, name, username, callbackUrl, extraNotes }) {
   const groupId = requireGroupId(plan);
   const body = {
     amount: plan.amountPaise,
@@ -207,6 +225,7 @@ async function createPaymentLink({ plan, telegramId, name, username, callbackUrl
     expire_by: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
     reference_id: `tg_${telegramId}_${plan.id}_${Date.now()}`,
     notes: {
+      ...cleanExtraNotes(extraNotes),
       telegram_id: String(telegramId),
       telegram_username: bmpOnly(username, 60),
       plan_id: plan.id,

@@ -20,6 +20,8 @@ Live at <https://appscsadhana.vercel.app>, or locally with `npm run dashboard` a
 | 📚 | **Questions** (`/questions.html`) | Browse and search the whole bank. Filter by subject, status, difficulty or posted state. Edit any question in place, approve or reject in bulk, delete. |
 | 🤖 | **Automation** (`/automation.html`) | Post to Telegram straight from the browser. Queue batches for a planned time. See every subject's cron cadence and remaining runway. |
 | 💳 | **Members** (`/members.html`) | Paying members, revenue by plan, who is about to lapse, and a dry run of the nightly expiry sweep. |
+| 🎟 | **Pass & Coupons** (`/pricing.html`) | The pass students buy — name, price, valid-until date — and coupon codes with their usage. |
+| 🆘 | **Support** (`/support.html`) | Student tickets: read the conversation, reply, send a new invite link, check a payment, grant a pass, resolve. |
 | 🩺 | **Health** (`/health.html`) | Is the server, the sheet and the bot reachable — and are the security controls that protect them actually switched on. |
 
 ---
@@ -325,49 +327,146 @@ npx cloudflared tunnel --url http://localhost:3000
 Put that HTTPS URL in `PUBLIC_BASE_URL` and in the Razorpay webhook, then buy a pass
 from the bot with a test card and watch the invite arrive.
 
+### The pass and coupon codes
+
+One pass is sold: the **exam pass**, ₹199 by default, valid until a fixed date.
+The 30-day and monthly auto-pay passes are retired — no longer offered, but
+members who already hold one keep working (their renewals, reminders and
+`/cancel` still function).
+
+From the dashboard's **🎟 Pass & Coupons** page (or `/set` in the support chat)
+an admin can change, per payment bot:
+
+- the **pass name** (the exam it is for), **price**, **valid-until date** and
+  **description** — a blank field uses the built-in value;
+- **coupon codes**: ₹ off or % off, optional expiry date, optional maximum number
+  of uses, one use per student or unlimited, on/off.
+
+A student applies a code from `/plans` → **🎟 Apply coupon code**, sees the
+discounted price, and pays. The code is checked again when they tap Pay, and a use
+is counted only when the payment succeeds (Coupon Redemptions tab). A code that
+has been used cannot be deleted — switch it off instead. The price after a
+discount must stay at least ₹1. Payment links already sent keep the price and date
+they were created with.
+
+Sheet tabs involved: **Bot Settings** (pass name/price/date), **Coupons**,
+**Coupon Redemptions**.
+
 ### Bot commands
 
 | Command | What it does |
 |---|---|
-| `/start`, `/plans` | Show the three passes as buttons |
+| `/start`, `/plans` | Show the pass (choose a group first where a bot sells two) |
 | `/status` | Current pass, expiry date, days left |
-| `/cancel` | Stop auto-renewal, keeping the paid period |
-| `/help` | How the flow works |
+| `/help` | How buying works |
 | `/support` | Help topics with instant answers, and a way to raise a ticket |
+| `/cancel` | Only for members still on the old monthly auto-pay: stop future charges |
 
-Typing any ordinary message to the bot also offers to send it to support.
+Typing any ordinary message to the bot also offers to send it to support, or adds
+it to the student's open ticket.
 
-### Support tickets and bot settings
+### Support: how it works
 
-A student picks an issue in `/support`, gets the instant answer for it, and can
-then raise a ticket (text or a screenshot). Each ticket is:
+A student picks an issue in `/support` — *Paid, but no invite link*, *Invite link
+not working*, *Payment failed or money deducted*, *Coupon code not working*,
+*Removed from the group* or *Something else* — and gets an instant answer. If
+that does not help they raise a ticket (text or a screenshot). Each ticket is:
 
 - written to the **Support** tab of the sheet of the first group the bot sells,
-- posted to the admin **support chat**, if one is configured, together with the
-  student's current pass status, and
+  and every action on it to the **Support Log** tab;
+- posted to the admin **support chat** (`SUPPORT_CHAT_ID`) as a case file:
+  the student, each pass they hold, whether they are in the group, what they
+  wrote, and a 🧭 suggested next step;
 - listed on the dashboard's **🆘 Support** page.
 
-Admins answer either by **replying to the ticket message in the support chat**
-or from the **Support** page. The student's reply to an answer goes back into
-the same ticket. In the support chat, reply `/close` or `/reopen` to a ticket;
-`/tickets` lists open ones, `/settings` shows the bot texts and
-`/set key value` changes one. `/supporthelp` lists these.
+Anything the student sends while they have a ticket touched in the last 7 days
+joins that ticket (an open one first, otherwise the most recently closed one,
+which reopens). Each follow-up in the support chat shows the earlier
+conversation.
 
-The texts students see — support hours, response time, a fallback contact, an
-extra `/start` note, and the instant answer for each issue — live in the sheet's
-**Bot Settings** tab and are edited from the Support page or with `/set`. No
-deploy is needed; the bot picks changes up within a minute.
+**Ticket statuses** (Status column H, and shown everywhere). Only an admin
+closes a ticket — with ✅ Close, the *Resolved* quick reply, or "close after
+sending" on the dashboard. Nothing closes one automatically.
 
-Setup:
+| Status | Shown as | Means | Becomes |
+|---|---|---|---|
+| `open` | 🆕 Open | New — no admin has done anything with it yet | `in_progress` on the first admin action (reply, quick reply, invite, payment check, grant) |
+| `in_progress` | 🟡 In progress | An admin has picked it up | `closed` only when an admin closes it |
+| `closed` | ✅ Closed | An admin closed it | `in_progress` if the student writes again, or an admin reopens it |
 
-1. Re-paste the generated `apps-script/<group>.gs.js` into each sheet and deploy a
-   new version. Until then the bot still answers with the default texts and still
-   delivers tickets to the support chat, but cannot save them to the sheet.
-2. Optional: create a **private** Telegram group for admins, add each payment bot,
-   and set `SUPPORT_CHAT_ID` (see `.env.example` for per-bot chats and forum
-   topics). Everyone in that group can answer students and change bot texts.
+Separately, **Waiting On** (column Q) says who has to act next, so an in-progress
+ticket can still need a reply:
 
----
+| Waiting On | Shown as | Means |
+|---|---|---|
+| `admin` | 🔴 Needs reply | The student wrote last |
+| `student` | ⏳ Waiting for student | An admin wrote to the student last |
+| blank | — | Closed |
+
+The Support tab records, per ticket: **Handled By** (last admin), **Admin Replies**,
+**Last Admin Reply At**, **Closed At / Closed By**, **Waiting On**, **Picked Up By /
+Picked Up At** (the first admin to act), **First Reply At** and **Times Reopened**.
+Old rows are upgraded automatically (`answered` becomes `in_progress`). The
+**Support Log** tab has one row per event — ticket opened, student message,
+picked up, admin reply, quick reply (which one), invite sent / not sent, payment
+checked, pass granted / refused, closed, reopened — with who did it, their role
+and the status afterwards.
+
+**At a glance.** The dashboard's Support page shows Needs reply, Open, In
+progress, Closed and All tickets, then average and median time to first reply
+and to close, today's opened/closed, and the longest-waiting student; the
+📈 Analysis section breaks tickets down by issue type and shows what each admin
+did. In Telegram, `/summary` shows the same numbers with buttons to list each
+queue, and the daily job posts it to the support chat every morning (around
+6:30 AM IST; set `SUPPORT_DAILY_SUMMARY=off` to stop it).
+
+### Support: the admin handbook
+
+Everything below works both in the Telegram support chat (buttons under each
+ticket) and on the dashboard's Support page, and both write to the same sheet.
+
+| Option | Use it when | What happens |
+|---|---|---|
+| ✍️ **Write reply** | You need to say something specific | You type an answer; the bot sends it to the student. In Telegram you can also simply reply to any ticket message |
+| 📋 **Quick replies** | A common answer fits | One tap sends a ready answer: *Ask for payment proof*, *Payment not received*, *Payment still processing*, *Pass has expired*, *New link sent*, *How to use a coupon*, *Resolved — close ticket*. Texts are editable |
+| 🔗 **Send new invite link** | The pass is valid but the link failed, expired or never arrived | A fresh single-use link is sent for each group where the pass is valid. Nothing is sent without a valid pass — you are told why |
+| 🎟 **Pass & payment** | You want to see what they hold | Each group: valid / expired / none, expiry, amount paid, payment id, in the group or not, plus a suggestion |
+| 🔍 **Check payment** | The student sent a `pay_…` id (the button appears automatically) | Razorpay's answer: captured / failed / processing, amount, time, and whether it came from this student's checkout |
+| ✅ **Grant pass for this payment** | Check payment shows *captured* but the student has no pass | Asks which group, checks Razorpay again, refuses a payment already used by another student, then gives the pass and sends the invite link |
+| 📜 **History** | You are picking up someone else's ticket | The whole conversation and the recent actions |
+| ✅ **Close ticket** / 🔓 **Reopen** | It is sorted / it is not | Only an admin closes a ticket; closing tells the student it is resolved. Reopening puts it back to In progress |
+
+Typical cases:
+
+- **"I paid but did not get the link"** — look at the 🧭 suggestion. Valid pass
+  and not in the group → 🔗 Send new invite link. No pass → 📋 *Ask for payment
+  proof*; when they send the `pay_` id → 🔍 Check payment → if captured,
+  ✅ Grant pass; if failed → 📋 *Payment not received*; if processing →
+  📋 *Payment still processing*.
+- **"The link does not work"** — valid pass → 🔗 Send new invite link, then
+  📋 *New link sent*. Expired → 📋 *Pass has expired*.
+- **"My coupon does not work"** — check the code on Pass & Coupons (live, expired,
+  used up, already used by this student), then reply.
+- **"I was removed"** — 🎟 Pass & payment: expired → 📋 *Pass has expired*;
+  valid → 🔗 Send new invite link.
+
+Support chat commands:
+
+| Command | What it does |
+|---|---|
+| `/summary` (or `/stats`) | Needs reply, open, in progress, waiting for student, closed; today; reply times; longest waiting; open tickets by issue; each admin's last 7 days. Buttons list each queue; 🔄 refreshes it in place |
+| `/tickets` | Tickets needing a reply, longest waiting first, each with its buttons. Also `/tickets open`, `progress`, `student`, `closed` |
+| `/msg 7234356929 text` or `/msg @username text` | Message a student first — it opens a ticket so their reply is tracked |
+| `/settings`, `/set key value` | Bot texts, pass name, price and date |
+| `/supporthelp` | This list, in Telegram |
+
+Student commands (`/start`, `/plans`, `/status`, `/help`, `/cancel`) only answer
+in a private chat with the bot, never in a group. Running `npm run set-webhooks`
+also sets the "/" command menus: student commands in private chats and the admin
+commands above in the support chat.
+
+Anyone in the support chat can do all of this, so keep it to admins. Messages
+sent to students from your own Telegram account are not tracked — use the bot.
 
 ## Troubleshooting
 

@@ -14,6 +14,13 @@ const sheets = require('./sheets');
 const paybot = require('./paybot');
 const groups = require('./groups');
 const plans = require('./plans');
+const pricing = require('./pricing');
+
+/** Escapes text for a Telegram HTML message. Pass names are admin-edited. */
+function esc(text) {
+  return String(text === null || text === undefined ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 /**
  * contextFor — everything one group needs for a membership operation.
@@ -203,6 +210,41 @@ async function createSingleUseInvite(groupId, telegramId) {
 }
 
 /**
+ * resendInvite — a fresh invite for someone who already holds an active pass.
+ *
+ * For the student who paid and says the link never arrived, expired, or was
+ * used up. Nothing is extended and nothing is charged: only the invite changes.
+ * The join request it produces is still checked against the pass, so a link
+ * sent to the wrong person lets nobody in.
+ *
+ * @param {string} groupId
+ * @param {string|number} telegramId
+ * @returns {Promise<{sent: boolean, inviteLink?: string, reason?: string, subscriber: Object|null}>}
+ *   sent is false, with the reason, when the student could not use an invite
+ */
+async function resendInvite(groupId, telegramId) {
+  const ctx = contextFor(groupId);
+  // The same test the join request will apply, so a link is never sent that
+  // would only be declined when it is used.
+  const verdict = await isEligible(groupId, telegramId);
+  const subscriber = verdict.subscriber;
+  if (!verdict.ok) return { sent: false, reason: verdict.reason, subscriber };
+
+  const inviteLink = await createSingleUseInvite(groupId, telegramId);
+  try {
+    await ctx.sheet.upsertSubscriber({
+      telegram_id: String(telegramId),
+      invite_link: inviteLink,
+      is_payment: false
+    }, 'invite.resent');
+  } catch (err) {
+    // The link works whether or not the sheet remembers it.
+    console.error(`[membership] ${groupId}: could not record the resent invite for ${telegramId}: ${err.message}`);
+  }
+  return { sent: true, inviteLink, subscriber };
+}
+
+/**
  * grantAccess — the single path from a verified payment to group membership.
  *
  * Idempotent by design: Razorpay retries webhooks, and a duplicate delivery
@@ -224,7 +266,7 @@ async function createSingleUseInvite(groupId, telegramId) {
 async function grantAccess(options) {
   const {
     groupId, telegramId, planId, paymentId, amountPaise,
-    username, name, linkId, subscriptionId, event
+    username, name, linkId, subscriptionId, event, validUntil, planLabel
   } = options;
 
   const ctx = contextFor(groupId);
@@ -241,7 +283,13 @@ async function grantAccess(options) {
 
   // A renewal extends from the current expiry, so paying early never costs days.
   const currentExpiry = existing ? parseIst(existing.expiry_date) : null;
-  const expiry = plans.computeExpiry(plan, new Date(), currentExpiry);
+  // The pass's end date as the student was shown it at checkout, carried in
+  // the link's notes. A date already past would grant nothing, so it is only
+  // used when it is still ahead.
+  const promised = validUntil ? pricing.endOfDayIst(validUntil) : null;
+  const expiry = promised && promised.getTime() > Date.now()
+    ? promised
+    : plans.computeExpiry(plan, new Date(), currentExpiry);
 
   // Reuse a still-valid invite rather than minting a second live link.
   let inviteLink = existing && existing.invite_link ? existing.invite_link : '';
@@ -262,7 +310,7 @@ async function grantAccess(options) {
     username: username || (existing ? existing.username : ''),
     name: name || (existing ? existing.name : ''),
     plan: plan.id,
-    plan_label: plan.label,
+    plan_label: String(planLabel || '').trim() || plan.label,
     status: 'active',
     start_date: existing && existing.start_date ? existing.start_date : formatIst(new Date()),
     expiry_date: formatIst(expiry),
@@ -348,13 +396,14 @@ async function sendRenewalReminder(groupId, subscriber, daysLeft) {
   const ctx = contextFor(groupId);
 
   const plan = planForSubscriber(groupId, subscriber.plan);
-  const label = plan ? plan.label : subscriber.plan_label || 'your pass';
+  // The name the student bought it under, which an admin may have changed since.
+  const label = subscriber.plan_label || (plan ? plan.label : 'your pass');
   const when = daysLeft <= 0
     ? 'today'
     : daysLeft === 1 ? 'tomorrow' : `in ${daysLeft} days`;
 
   const message =
-    `⏳ <b>Your ${label} expires ${when}.</b>\n\n` +
+    `⏳ <b>Your ${esc(label)} expires ${when}.</b>\n\n` +
     `Renew to keep your access to the APPSC premium group and daily quizzes.\n\n` +
     `Send /plans to this bot to renew in a couple of taps.`;
 
@@ -408,7 +457,7 @@ async function runDailyCheck({ groupId, dryRun = false } = {}) {
           try {
             await paybot.sendDirectMessage(ctx.botEnv,
               subscriber.telegram_id,
-              `Your <b>${subscriber.plan_label || 'pass'}</b> has expired and your group access has ended.\n\n` +
+              `Your <b>${esc(subscriber.plan_label || 'pass')}</b> has expired and your group access has ended.\n\n` +
               `Send /plans to rejoin whenever you are ready — your progress and history are kept.`
             );
           } catch (err) {
@@ -458,8 +507,8 @@ function describeStatus(subscriber) {
   const daysLeft = expiry ? plans.daysUntil(expiry) : null;
 
   if (subscriber.status === 'active' && daysLeft !== null && daysLeft > 0) {
-    return `✅ <b>${subscriber.plan_label}</b> — active\n\n` +
-           `Expires: <b>${subscriber.expiry_date}</b>\n` +
+    return `✅ <b>${esc(subscriber.plan_label)}</b> — active\n\n` +
+           `Expires: <b>${esc(subscriber.expiry_date)}</b>\n` +
            `Days remaining: <b>${daysLeft}</b>\n` +
            `Total paid: ₹${subscriber.total_paid}\n\n` +
            (subscriber.subscription_id
@@ -467,8 +516,8 @@ function describeStatus(subscriber) {
              : 'Send /plans to renew before it runs out.');
   }
 
-  return `⌛ Your <b>${subscriber.plan_label || 'pass'}</b> has ended.\n\n` +
-         `It expired on ${subscriber.expiry_date}.\n\n` +
+  return `⌛ Your <b>${esc(subscriber.plan_label || 'pass')}</b> has ended.\n\n` +
+         `It expired on ${esc(subscriber.expiry_date)}.\n\n` +
          `Send /plans to rejoin.`;
 }
 
@@ -519,6 +568,7 @@ module.exports = {
   formatIst,
   parseIst,
   createSingleUseInvite,
+  resendInvite,
   grantAccess,
   removeMember,
   markExpired,
