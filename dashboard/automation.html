@@ -55,7 +55,7 @@
                   <option value="3">3 questions</option>
                   <option value="5" selected>5 questions</option>
                   <option value="10">10 questions</option>
-                  <option value="20">20 questions (~1 minute)</option>
+                  <option value="20">20 questions</option>
                   <option value="all">All eligible questions</option>
                   <option value="custom">Custom number…</option>
                 </select>
@@ -78,7 +78,24 @@
             <p id="postCountHint" class="hint-text" style="margin-bottom:14px" aria-live="polite"></p>
 
             <button id="postNowBtn" class="btn btn-send" style="width:100%">🚀 Post to Telegram</button>
-            <button id="postStopBtn" class="btn btn-ghost" style="width:100%;margin-top:8px" hidden>⏹ Stop after this batch</button>
+            <button id="postStopBtn" class="btn btn-ghost" style="width:100%;margin-top:8px" hidden>⏹ Stop posting</button>
+
+            <div id="postProgress" class="post-progress" hidden>
+              <div class="post-progress-head">
+                <span id="postProgressTitle">Posting…</span>
+                <span id="postProgressCount" class="post-progress-count"></span>
+              </div>
+              <div id="postProgressTrack" class="progress-track indeterminate" role="progressbar"
+                   aria-labelledby="postProgressTitle" aria-valuemin="0" aria-valuemax="100">
+                <div id="postProgressFill" class="progress-fill"></div>
+              </div>
+              <div class="post-progress-meta">
+                <span id="postProgressStage" class="post-progress-stage" aria-live="polite"></span>
+                <span id="postProgressTime" class="post-progress-time"></span>
+              </div>
+            </div>
+            <!-- Right under the progress bar, so each question's outcome is seen as it lands. -->
+            <div id="postLog" class="log-output" style="display:none;margin-top:14px"></div>
 
             <p class="hint-text" style="margin-top:12px">
               Posts go to the forum topic configured for the subject in the Config tab. Each question
@@ -101,7 +118,6 @@
             </p>
             <div id="reconcileLog" class="log-output" style="display:none;margin-top:14px"></div>
 
-            <div id="postLog" class="log-output" style="display:none;margin-top:14px"></div>
           </div>
         </section>
 

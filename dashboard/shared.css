@@ -1656,3 +1656,135 @@
 .sp-analysis-head .field-select { width: auto; }
 .sp-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .sp-tab-count.alert { background: rgba(240, 82, 82, 0.25); color: #fca5a5; }
+
+/* ---- Network activity -------------------------------------------------- */
+/* A thin bar across the top whenever a request is in flight, and a note once
+   one has run long, so a slow Google Sheets read never looks like a dead page. */
+
+.net-activity-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 1000;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
+  pointer-events: none;
+}
+
+.net-activity-bar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 35%;
+  background: var(--accent-primary);
+  animation: net-slide 1.1s ease-in-out infinite;
+}
+
+.net-activity-bar[hidden],
+.net-activity-note[hidden] { display: none; }
+
+@keyframes net-slide {
+  from { left: -35%; }
+  to   { left: 100%; }
+}
+
+.net-activity-note {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 1000;
+  max-width: calc(100vw - 32px);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-card);
+  box-shadow: var(--shadow-md);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Posting progress -------------------------------------------------- */
+
+.post-progress {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+}
+
+.post-progress[hidden] { display: none; }
+
+.post-progress-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-bottom: 10px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.post-progress-count {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.progress-track {
+  position: relative;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent-success);
+  transition: width 400ms ease;
+}
+
+.progress-fill.has-failures { background: var(--accent-warn); }
+
+/* Before the first question is sent the length of the wait is unknown, so the
+   bar moves without claiming a percentage. */
+.progress-track.indeterminate .progress-fill {
+  width: 30% !important;
+  background: var(--accent-primary);
+  animation: net-slide 1.2s ease-in-out infinite;
+  position: absolute;
+}
+
+.post-progress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.post-progress-stage { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+
+.post-progress-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .net-activity-bar::before,
+  .progress-track.indeterminate .progress-fill { animation-duration: 3s; }
+}

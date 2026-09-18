@@ -264,18 +264,74 @@ export async function listGroups() {
   return groupsCache;
 }
 
-/**
- * api — calls the local server with a fresh Firebase ID token attached.
- * Tokens are short lived, so `getIdToken()` is called per request and the SDK
- * refreshes it transparently when needed.
- *
- * @param {string} path API path, e.g. '/api/analytics'
- * @param {Object} [options] { method, body, query }
- * @returns {Promise<Object>} The `data` field of the response
- */
-export async function api(path, options = {}) {
-  const { method = 'GET', body = null, query = null } = options;
+// ---------------------------------------------------------------------------
+// Network activity: a loading bar on every page
+// ---------------------------------------------------------------------------
+// Every page reads Google Sheets through Apps Script, which takes anywhere from
+// 3 to 30 seconds. With nothing on screen during that wait, a slow load and a
+// broken one looked the same. Any request in flight now shows a bar across the
+// top, and one that runs long says what it is waiting for and for how long.
 
+/** Seconds before a pending request earns a "still waiting" note. */
+const SLOW_REQUEST_SECONDS = 6;
+
+const activity = { pending: 0, since: 0, tick: null };
+
+function activityNodes() {
+  let bar = document.getElementById('netActivityBar');
+  if (!bar) {
+    bar = el('div', { id: 'netActivityBar', class: 'net-activity-bar', role: 'progressbar',
+      'aria-label': 'Loading', hidden: true });
+    document.body.append(bar);
+  }
+  let note = document.getElementById('netActivityNote');
+  if (!note) {
+    note = el('div', { id: 'netActivityNote', class: 'net-activity-note', role: 'status',
+      'aria-live': 'polite', hidden: true });
+    document.body.append(note);
+  }
+  return { bar, note };
+}
+
+function renderActivity() {
+  if (typeof document === 'undefined' || !document.body) return;
+  const { bar, note } = activityNodes();
+  if (!activity.pending) {
+    bar.hidden = true;
+    note.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const seconds = Math.floor((Date.now() - activity.since) / 1000);
+  if (seconds >= SLOW_REQUEST_SECONDS) {
+    note.hidden = false;
+    note.textContent = seconds < 40
+      ? `⏳ Waiting for Google Sheets… ${seconds}s`
+      : `⏳ Google Sheets is slow right now… ${seconds}s — still trying, retrying automatically if it fails`;
+  } else {
+    note.hidden = true;
+  }
+}
+
+function activityStart() {
+  if (activity.pending++ === 0) {
+    activity.since = Date.now();
+    activity.tick = setInterval(renderActivity, 1000);
+  }
+  renderActivity();
+}
+
+function activityEnd() {
+  activity.pending = Math.max(0, activity.pending - 1);
+  if (!activity.pending && activity.tick) {
+    clearInterval(activity.tick);
+    activity.tick = null;
+  }
+  renderActivity();
+}
+
+/** Builds the URL and fetch options shared by api() and apiStream(). */
+async function buildRequest(path, { method = 'GET', body = null, query = null } = {}) {
   const params = new URLSearchParams();
   if (query) {
     Object.entries(query).forEach(([k, v]) => {
@@ -300,18 +356,33 @@ export async function api(path, options = {}) {
   }
   if (body) headers['Content-Type'] = 'application/json';
 
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-    // Never send this request anywhere but our own origin.
-    credentials: 'same-origin'
-  });
+  return {
+    url,
+    init: {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      // Never send this request anywhere but our own origin.
+      credentials: 'same-origin'
+    }
+  };
+}
 
+/**
+ * Reads a JSON answer, turning the hosting platform's own error pages (which
+ * are HTML) into a sentence instead of "non-JSON response".
+ */
+async function readJsonAnswer(res) {
   let payload;
   try {
     payload = await res.json();
   } catch (err) {
+    if (res.status === 504) {
+      throw new Error('The server ran out of time waiting for Google Sheets (HTTP 504). Try again — the next attempt is usually faster.');
+    }
+    if (res.status === 404) {
+      throw new Error('The server answered 404 — this page may be out of date. Reload it and try again.');
+    }
     throw new Error(`Server returned a non-JSON response (HTTP ${res.status})`);
   }
 
@@ -319,6 +390,81 @@ export async function api(path, options = {}) {
     throw new Error(payload.error || `Request failed with HTTP ${res.status}`);
   }
   return payload.data !== undefined ? payload.data : payload;
+}
+
+/**
+ * api — calls the local server with a fresh Firebase ID token attached.
+ * Tokens are short lived, so `getIdToken()` is called per request and the SDK
+ * refreshes it transparently when needed.
+ *
+ * @param {string} path API path, e.g. '/api/analytics'
+ * @param {Object} [options] { method, body, query }
+ * @returns {Promise<Object>} The `data` field of the response
+ */
+export async function api(path, options = {}) {
+  activityStart();
+  try {
+    const { url, init } = await buildRequest(path, options);
+    const res = await fetch(url, init);
+    return await readJsonAnswer(res);
+  } finally {
+    activityEnd();
+  }
+}
+
+/**
+ * apiStream — POSTs to an endpoint that answers with NDJSON progress lines
+ * (see /api/telegram/post) and hands each line to `onEvent` as it arrives.
+ *
+ * Resolves with the final `{type: "done"}` line. Rejects when that line says
+ * the run failed, when the stream ends without one, or when `signal` aborts.
+ * An endpoint that answers plain JSON instead (an early validation error) is
+ * handled exactly as api() would.
+ *
+ * @param {string} path
+ * @param {{body?: Object, onEvent?: Function, signal?: AbortSignal}} options
+ * @returns {Promise<Object>}
+ */
+export async function apiStream(path, { body = {}, onEvent = () => {}, signal } = {}) {
+  const { url, init } = await buildRequest(path, {
+    method: 'POST',
+    body: Object.assign({}, body, { stream: true })
+  });
+  const res = await fetch(url, Object.assign(init, { signal }));
+
+  const type = res.headers.get('content-type') || '';
+  if (!type.includes('ndjson') || !res.body) return readJsonAnswer(res);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let final = null;
+
+  const handle = (line) => {
+    if (!line.trim()) return;
+    let event;
+    try { event = JSON.parse(line); } catch (err) { return; }
+    if (event.type === 'done') final = event;
+    try { onEvent(event); } catch (err) { console.error(err); }
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffered.indexOf('\n')) !== -1) {
+      handle(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+    }
+  }
+  handle(buffered + decoder.decode());
+
+  if (!final) {
+    throw new Error('The connection closed before the run finished. Check the Question Bank to see what went out before posting again.');
+  }
+  if (final.success === false) throw new Error(final.error || `Request failed with HTTP ${final.status}`);
+  return final;
 }
 
 // ---------------------------------------------------------------------------

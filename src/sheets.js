@@ -13,8 +13,17 @@
 // made the previous version SSRF-able from the browser.
 // ============================================================================
 
-/** Hard ceiling on how long we wait for Apps Script before giving up. */
-const REQUEST_TIMEOUT_MS = 30000;
+/**
+ * Hard ceiling on one attempt at an Apps Script call. A cold Apps Script
+ * reading a large sheet routinely takes 20–35s, and the old 30s ceiling cut
+ * those off just before they answered.
+ */
+const REQUEST_TIMEOUT_MS = Number(process.env.SHEET_TIMEOUT_MS) || 45000;
+
+/** Pause before a retry, multiplied by the attempt number. */
+const RETRY_BASE_DELAY_MS = Number(process.env.SHEET_RETRY_DELAY_MS) >= 0 && process.env.SHEET_RETRY_DELAY_MS !== undefined
+  ? Number(process.env.SHEET_RETRY_DELAY_MS)
+  : 1500;
 
 /** Largest upstream response we will buffer (Apps Script pages are far smaller). */
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -140,6 +149,102 @@ function getWebAppUrl(groupId) {
 }
 
 /**
+ * Reads the dashboards repeat within seconds of each other. Apps Script takes
+ * 3–30s to answer each one because it re-reads every subject tab, so they are
+ * served from a short per-group cache and identical requests in flight are
+ * shared. Any write to a group clears that group's cache, so a curator never
+ * sees their own change missing.
+ */
+const CACHED_GET_ACTIONS = new Set(['getConfig', 'getSubjects', 'getStats', 'getAnalytics', 'listQuestions']);
+const READ_CACHE_MS = Number(process.env.SHEET_READ_CACHE_MS) >= 0 && process.env.SHEET_READ_CACHE_MS !== undefined
+  ? Number(process.env.SHEET_READ_CACHE_MS)
+  : 20000;
+
+/** groupUrl -> Map(queryKey -> { at, promise }) */
+const readCache = new Map();
+
+/** Drops every cached read for one sheet. */
+function invalidateReads(ctx) {
+  readCache.delete(ctx.url);
+}
+
+/** Clears the whole read cache (tests, and a manual refresh). */
+function clearReadCache() {
+  readCache.clear();
+}
+
+/**
+ * How many times a READ is tried before giving up. Apps Script regularly
+ * answers a perfectly good request with a 404 from its redirect host, a 5xx,
+ * or nothing at all while it cold-starts; the next attempt almost always works.
+ */
+const GET_ATTEMPTS = 3;
+
+/** Statuses from Google that mean "busy, try again", not "you asked wrongly". */
+const TRANSIENT_STATUSES = new Set([404, 408, 425, 429, 500, 502, 503, 504]);
+
+/** No new attempt is started once a call has been going this long. */
+const RETRY_WINDOW_MS = 60000;
+
+/** Most redirects followed. Apps Script uses one (exec → echo). */
+const MAX_REDIRECTS = 5;
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Turns an HTTP status from Google into a sentence a curator can act on. */
+function describeStatus(status, statusText, attempts) {
+  const tried = attempts > 1 ? ` (tried ${attempts} times)` : '';
+  if (status === 404) {
+    return `Google Sheets answered 404 Not Found${tried}. Apps Script does this when it is overloaded, ` +
+      'and also when the deployment was removed — if it keeps happening, check the /exec URL in .env ' +
+      'still matches Deploy → Manage deployments.';
+  }
+  if (status === 429) return `Google Sheets is rate-limiting this script${tried}. Wait a minute and try again.`;
+  if (status >= 500) return `Google Sheets had a server error (HTTP ${status})${tried}. Try again in a minute.`;
+  return `Google Sheets request failed with status ${status} ${statusText || ''}`.trim() + tried;
+}
+
+/**
+ * fetchOnce — one Apps Script call, following redirects by hand.
+ *
+ * Following them ourselves is what lets a failure say WHERE it happened.
+ * A POST is executed by the /exec hop; everything after that only fetches
+ * the answer. So a POST that failed after /exec answered must never be sent
+ * again — it may already have written — while one refused by /exec itself
+ * (429, 5xx) never ran and is safe to repeat.
+ *
+ * @returns {Promise<{status: number, text: string, executed: boolean}>}
+ */
+async function fetchOnce(url, init, signal) {
+  let current = url;
+  let options = Object.assign({}, init, { redirect: 'manual', signal });
+  let executed = false;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const response = await fetch(current, options);
+    if (hop === 0 && response.status >= 300 && response.status < 400) executed = true;
+
+    const location = response.headers && typeof response.headers.get === 'function'
+      ? response.headers.get('location')
+      : null;
+    if (response.status >= 300 && response.status < 400 && location) {
+      // Drain so the socket is released, then follow as a GET, as browsers do.
+      try { await response.text(); } catch (err) { /* ignore */ }
+      current = new URL(location, current).toString();
+      options = { method: 'GET', redirect: 'manual', signal };
+      continue;
+    }
+
+    const text = await response.text();
+    return { status: response.status, statusText: response.statusText || '', text, executed: executed || response.ok };
+  }
+  const err = new Error('Google Sheets redirected too many times.');
+  err.transient = true;
+  err.executed = executed;
+  throw err;
+}
+
+/**
  * request — performs one Apps Script call and returns the parsed JSON body.
  *
  * @param {{url: string, token: string}} ctx Which sheet to talk to
@@ -148,57 +253,113 @@ function getWebAppUrl(groupId) {
  * @returns {Promise<Object>} Parsed response payload
  */
 async function request(ctx, method, params) {
+  if (method !== 'GET') {
+    // A write changes what every cached read would say.
+    invalidateReads(ctx);
+    try {
+      return await requestUncached(ctx, method, params);
+    } finally {
+      // Reads that started before the write finished may hold the old answer.
+      invalidateReads(ctx);
+    }
+  }
+
+  if (!CACHED_GET_ACTIONS.has(params.action) || READ_CACHE_MS <= 0) {
+    return requestUncached(ctx, method, params);
+  }
+
+  const key = JSON.stringify(Object.keys(params).sort().map((k) => [k, params[k]]));
+  let perSheet = readCache.get(ctx.url);
+  if (!perSheet) { perSheet = new Map(); readCache.set(ctx.url, perSheet); }
+
+  const hit = perSheet.get(key);
+  if (hit && (hit.pending || Date.now() - hit.at < READ_CACHE_MS)) return hit.promise;
+
+  const entry = { at: Date.now(), pending: true, promise: null };
+  entry.promise = requestUncached(ctx, method, params).then(
+    (result) => { entry.pending = false; entry.at = Date.now(); return result; },
+    (err) => { if (perSheet.get(key) === entry) perSheet.delete(key); throw err; }
+  );
+  perSheet.set(key, entry);
+  return entry.promise;
+}
+
+async function requestUncached(ctx, method, params) {
   const baseUrl = ctx.url;
   const token = ctx.token;
 
-  // AbortController gives us a hard timeout; without it a stalled Apps Script
-  // would hold the request open indefinitely.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  let response;
-  try {
-    if (method === 'GET') {
-      const query = new URLSearchParams();
-      Object.keys(params).forEach((key) => {
-        if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
-          query.set(key, String(params[key]));
-        }
-      });
-      if (token) query.set('token', token);
-
-      response = await fetch(`${baseUrl}?${query.toString()}`, {
-        redirect: 'follow',
-        signal: controller.signal
-      });
-    } else {
-      const body = Object.assign({}, params);
-      if (token) body.token = token;
-
-      response = await fetch(baseUrl, {
-        method: 'POST',
-        redirect: 'follow',
-        // Apps Script only receives e.postData.contents intact with text/plain;
-        // application/json triggers a CORS preflight it cannot answer.
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-    }
-  } catch (err) {
-    clearTimeout(timer);
-    if (err.name === 'AbortError') {
-      throw new Error(`Google Sheets request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
-    }
-    throw new Error('Google Sheets request failed: ' + err.message);
-  }
-  clearTimeout(timer);
-
-  if (!response.ok) {
-    throw new Error(`Google Sheets request failed with status ${response.status} ${response.statusText}`);
+  let url;
+  let init;
+  if (method === 'GET') {
+    const query = new URLSearchParams();
+    Object.keys(params).forEach((key) => {
+      if (params[key] !== undefined && params[key] !== null && params[key] !== '') {
+        query.set(key, String(params[key]));
+      }
+    });
+    if (token) query.set('token', token);
+    url = `${baseUrl}?${query.toString()}`;
+    init = { method: 'GET' };
+  } else {
+    const body = Object.assign({}, params);
+    if (token) body.token = token;
+    url = baseUrl;
+    init = {
+      method: 'POST',
+      // Apps Script only receives e.postData.contents intact with text/plain;
+      // application/json triggers a CORS preflight it cannot answer.
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(body)
+    };
   }
 
-  const text = await response.text();
+  // Reads are always safe to repeat. A write is repeated only when Google
+  // turned it away before the script ran (see fetchOnce).
+  const attempts = method === 'GET' ? GET_ATTEMPTS : 2;
+  let lastError = null;
+  let reply = null;
+  const startedAt = Date.now();
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    // AbortController gives us a hard timeout; without it a stalled Apps
+    // Script would hold the request open indefinitely.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let retryable = false;
+    try {
+      reply = await fetchOnce(url, init, controller.signal);
+      if (reply.status >= 200 && reply.status < 300) { lastError = null; break; }
+      lastError = new Error(describeStatus(reply.status, reply.statusText, attempt));
+      lastError.upstreamStatus = reply.status;
+      retryable = TRANSIENT_STATUSES.has(reply.status) && (method === 'GET' || !reply.executed);
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        lastError = new Error(
+          `Google Sheets did not answer within ${REQUEST_TIMEOUT_MS / 1000}s` +
+          (attempt > 1 ? ` (tried ${attempt} times)` : '') + '. Apps Script is slow right now — try again in a minute.'
+        );
+        lastError.transient = true;
+        // A write that timed out may still be running, so it is never resent.
+        retryable = method === 'GET';
+      } else {
+        lastError = new Error('Google Sheets request failed: ' + err.message);
+        lastError.transient = true;
+        retryable = method === 'GET' || err.executed === false;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!retryable || attempt === attempts) break;
+    // Two slow attempts already cost the curator a minute and a half; a third
+    // would only make the page look hung. Say so instead.
+    if (Date.now() - startedAt > RETRY_WINDOW_MS) break;
+    await sleepMs(RETRY_BASE_DELAY_MS * attempt);
+  }
+
+  if (lastError) throw lastError;
+
+  const text = reply.text;
   if (text.length > MAX_RESPONSE_BYTES) {
     throw new Error('Google Sheets response exceeded the size limit.');
   }
@@ -719,6 +880,7 @@ module.exports = {
   getWebAppUrl,
   validateWebAppUrl,
   sheetRowOf,
+  clearReadCache,
   API_NAMES
 };
 

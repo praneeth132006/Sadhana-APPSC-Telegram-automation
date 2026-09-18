@@ -173,7 +173,14 @@ function loadScript(spreadsheet) {
       formatDate: (date, _tz, format) => {
         const pad = (n) => String(n).padStart(2, '0');
         if (format === 'yyyyMMdd') return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`;
-        return `${pad(date.getDate())}-${pad(date.getMonth() + 1)}-${date.getFullYear()}, 10:30:00 AM`;
+        // The real IST wall clock, as Apps Script renders 'dd-MM-yyyy, hh:mm:ss a'.
+        // A fixed "10:30 AM" made every claim written after 10:45 IST look older
+        // than 15 minutes, so the stale-claim test passed or failed by time of day.
+        const ist = new Date(date.getTime() + 5.5 * 3600 * 1000);
+        const h24 = ist.getUTCHours();
+        const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+        return `${pad(ist.getUTCDate())}-${pad(ist.getUTCMonth() + 1)}-${ist.getUTCFullYear()}, ` +
+          `${pad(h12)}:${pad(ist.getUTCMinutes())}:${pad(ist.getUTCSeconds())} ${h24 < 12 ? 'AM' : 'PM'}`;
       }
     },
 

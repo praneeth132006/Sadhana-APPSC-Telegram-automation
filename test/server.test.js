@@ -586,6 +586,51 @@ test('POST /api/telegram/post sends and records the posting trail', async () => 
   assert.deepEqual(pollIds, { 2: 'poll-1' });
 });
 
+test('a streamed post reports each step and question as it happens', async () => {
+  // The dashboard's progress bar is driven by these lines. Without them a run
+  // that takes minutes showed only "Posting…", indistinguishable from a hang.
+  calls.length = 0;
+  const res = await authed('/api/telegram/post', {
+    method: 'POST',
+    body: { subject: 'Polity', count: 1, stream: true }
+  });
+
+  assert.equal(res.status, 200);
+  const events = res.text.trim().split('\n').map((line) => JSON.parse(line));
+  const types = events.map((e) => e.type);
+
+  assert.ok(types.includes('stage'), 'no progress stages were streamed');
+  assert.deepEqual(events.find((e) => e.type === 'plan'), { type: 'plan', total: 1, eligible: 1, skipped: 0 });
+  const sending = events.find((e) => e.type === 'sending');
+  assert.equal(sending.index, 1);
+  assert.equal(sending.total, 1);
+  assert.equal(events.find((e) => e.type === 'result').ok, true);
+
+  const done = events[events.length - 1];
+  assert.equal(done.type, 'done', 'the stream must end with the summary');
+  assert.equal(done.success, true);
+  assert.equal(done.postedCount, 1);
+  assert.ok(types.indexOf('sending') < types.indexOf('result'));
+});
+
+test('a streamed post that fails mid-run ends the stream with the error', async () => {
+  const original = clientStubs.getUnpostedQuestions;
+  clientStubs.getUnpostedQuestions = async () => { throw new Error('Google Sheets answered 404 Not Found'); };
+  try {
+    const res = await authed('/api/telegram/post', {
+      method: 'POST',
+      body: { subject: 'Polity', count: 1, stream: true }
+    });
+    const events = res.text.trim().split('\n').map((line) => JSON.parse(line));
+    const done = events[events.length - 1];
+    assert.equal(done.type, 'done');
+    assert.equal(done.success, false);
+    assert.match(done.error, /404/);
+  } finally {
+    clientStubs.getUnpostedQuestions = original;
+  }
+});
+
 test('posting defaults to Approved-only eligibility', async () => {
   calls.length = 0;
   await authed('/api/telegram/post', { method: 'POST', body: { subject: 'Polity', count: 1 } });

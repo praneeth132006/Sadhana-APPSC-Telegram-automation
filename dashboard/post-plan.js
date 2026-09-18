@@ -12,8 +12,12 @@
 /** Most questions the server posts in one request (MAX_POST_BATCH in server.js). */
 export const SERVER_BATCH_LIMIT = 20;
 
-/** Rough seconds per question, including the pacing between polls. */
-export const SECONDS_PER_QUESTION = 3;
+/**
+ * Rough seconds per question: the Telegram sends, the 3s pacing between polls,
+ * and the sheet write that records it — Apps Script alone takes 3–15s. The old
+ * figure of 3 counted only the pacing, so "under a minute" runs took five.
+ */
+export const SECONDS_PER_QUESTION = 12;
 
 /**
  * availableToPost — how many questions in a subject could go out right now.
@@ -70,7 +74,11 @@ export function estimateDuration(count) {
   const seconds = Math.max(0, Number(count) || 0) * SECONDS_PER_QUESTION;
   if (seconds < 60) return 'under a minute';
   const minutes = Math.ceil(seconds / 60);
-  return `about ${minutes} minute${minutes === 1 ? '' : 's'}`;
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  if (minutes < 60) return `about ${plural(minutes, 'minute')}`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return `about ${plural(hours, 'hour')}${rest ? ' ' + plural(rest, 'minute') : ''}`;
 }
 
 /**

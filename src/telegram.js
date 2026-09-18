@@ -527,7 +527,10 @@ async function sendQuizPoll(threadId, question) {
 
   // Only add explanation if there's actual text to show
   if (explanation) {
-    pollConfig.explanation = explanation;           // Text shown when user taps 💡
+    // Escaped because it is parsed as HTML: a bare "<" or "&" in the text made
+    // Telegram refuse the whole poll ("can't parse entities"). The 200 limit is
+    // counted after parsing, so truncating first and escaping second is exact.
+    pollConfig.explanation = escapeHtml(explanation); // Text shown when user taps 💡
     pollConfig.explanation_parse_mode = 'HTML';     // Allow basic HTML formatting
   }
 
