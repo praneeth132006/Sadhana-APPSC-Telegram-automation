@@ -205,7 +205,7 @@ async function testConnection() {
  * @returns {Promise<Object>} { username, firstName, groupTitle, groupType, isForum }
  * @throws {Error} When the bot is uninitialised or Telegram rejects the call
  */
-async function getBotInfo() {
+async function getBotInfo(chatId) {
   if (!bot) throw new Error('Bot not initialized');
 
   // Verify the token is valid and identify the bot.
@@ -215,7 +215,7 @@ async function getBotInfo() {
   // without hiding the fact that the token itself is fine.
   let chat = null;
   try {
-    chat = await bot.getChat(groupId);
+    chat = await bot.getChat(chatId || groupId);
   } catch (err) {
     chat = null;
   }
@@ -500,10 +500,18 @@ function formatListLayout(raw) {
  * @param {string} [question.date] — Date column, posted as #Date_DD_MM_YYYY
  * @param {string} [question.newspaper] — Newspaper column, posted as #PaperName
  * @param {string} [question.topic] — Topic column, posted as #TopicName
+ * @param {string} [chatId] — The group's supergroup chat id; defaults to the one given to init()
  * @returns {Promise<Object>} The sent message object from Telegram
  */
-async function sendQuizPoll(threadId, question) {
+async function sendQuizPoll(threadId, question, chatId) {
   if (!bot) throw new Error('Bot not initialized');
+  // Every group is its own Telegram supergroup, and a topic id only exists
+  // inside its own group. Posting every group's questions to the module-wide
+  // chat sent Telugu Physics (topic 33 of the Telugu group) to the English
+  // group, where Telegram answered "message thread not found". The dashboard
+  // always passes the selected group's chat; the fallback is for the
+  // single-group CLI scripts.
+  const chat = chatId || groupId;
 
   const post = buildQuizPost(question);
 
@@ -535,7 +543,7 @@ async function sendQuizPoll(threadId, question) {
   }
 
   if (post.leadMessage) {
-    await sendWithFloodWait(() => bot.sendMessage(groupId, post.leadMessage, {
+    await sendWithFloodWait(() => bot.sendMessage(chat, post.leadMessage, {
       message_thread_id: threadId, // Direct message to the specific subject forum topic
       parse_mode: 'HTML'           // Format as HTML for clean readability
     }));
@@ -544,7 +552,7 @@ async function sendQuizPoll(threadId, question) {
   const options = post.options;
 
   // Send the quiz poll to the Telegram group, targeting the specific topic
-  const sent = await sendWithFloodWait(() => bot.sendPoll(groupId, pollQuestion, options, pollConfig));
+  const sent = await sendWithFloodWait(() => bot.sendPoll(chat, pollQuestion, options, pollConfig));
 
   // Send the detailed Answer & Explanation message using Telegram's native <tg-spoiler> tag
   // This guarantees:
@@ -570,7 +578,7 @@ async function sendQuizPoll(threadId, question) {
     // The poll itself is already out and the row is about to be marked posted,
     // so a failure here must not undo that — log it and move on.
     try {
-      await sendWithFloodWait(() => bot.sendMessage(groupId, spoilerMessage, {
+      await sendWithFloodWait(() => bot.sendMessage(chat, spoilerMessage, {
         message_thread_id: threadId,
         parse_mode: 'HTML'
       }));
@@ -597,16 +605,17 @@ async function sendQuizPoll(threadId, question) {
  * of this is to avoid duplicates, not create them.
  *
  * @param {number|string} messageId The poll's message id
+ * @param {string} [chatId] The group the poll was posted to
  * @returns {Promise<boolean|null>} true/false, or null when it cannot be told
  */
-async function pollStillExists(messageId) {
+async function pollStillExists(messageId, chatId) {
   if (!bot) throw new Error('Bot not initialized');
   if (!messageId) return null;
 
   try {
     await bot.editMessageReplyMarkup(
       { inline_keyboard: [] },
-      { chat_id: groupId, message_id: Number(messageId) }
+      { chat_id: chatId || groupId, message_id: Number(messageId) }
     );
     // An edit that succeeds means the message is certainly there.
     return true;

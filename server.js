@@ -794,6 +794,31 @@ function ensureTelegram() {
   }
 }
 
+/**
+ * telegramChatFor — the Telegram supergroup a group's questions go to.
+ *
+ * Each group has its own supergroup (TELEGRAM_GROUP_<PREFIX>) with its own
+ * topic ids. Posting always went to TELEGRAM_GROUP_ID — the English newspaper
+ * group — so every other group's topic ids pointed at threads that did not
+ * exist there ("message thread not found"), or worse, at a real topic in the
+ * wrong group. No fallback: a group without its own chat must not post anywhere.
+ *
+ * @param {string} groupId
+ * @returns {string} The chat id, e.g. -100…
+ */
+function telegramChatFor(groupId) {
+  const group = groupRegistry.requireGroup(groupId);
+  if (!group.telegramGroupId) {
+    const err = new Error(
+      `No Telegram group is set for ${group.displayName}. Add TELEGRAM_GROUP_${group.envPrefix} ` +
+      '(the group\'s -100… chat id) to the environment and redeploy.'
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+  return group.telegramGroupId;
+}
+
 // ---------------------------------------------------------------------------
 // Payment bots, served over Telegram webhooks
 // ---------------------------------------------------------------------------
@@ -2140,7 +2165,9 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     if (telegramConfigured()) {
       try {
         ensureTelegram();
-        const info = await telegram.getBotInfo();
+        let chat = null;
+        try { chat = groupId ? telegramChatFor(groupId) : null; } catch (err) { chat = null; }
+        const info = await telegram.getBotInfo(chat);
         health.telegram.reachable = true;
         health.telegram.botUsername = info.username || null;
         health.telegram.groupTitle = info.groupTitle;
@@ -2398,7 +2425,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     }
     try {
       ensureTelegram();
-      const info = await telegram.getBotInfo();
+      const info = await telegram.getBotInfo(telegramChatFor(groupId));
       sendJSON(res, 200, {
         success: true,
         data: {
@@ -2434,8 +2461,10 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const subject = validateSubject(body.subject);
     if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
 
+    let chatId;
     try {
       ensureTelegram();
+      chatId = telegramChatFor(groupId);
     } catch (err) {
       sendJSON(res, 400, { success: false, error: err.message });
       return true;
@@ -2454,7 +2483,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       if (Date.now() > deadline) break;
       checked++;
 
-      const exists = await telegram.pollStillExists(row.message_id);
+      const exists = await telegram.pollStillExists(row.message_id, chatId);
       if (exists === false) missing.push(row);
       else if (exists === null) unknown.push(row.question_id);
 
@@ -2495,8 +2524,10 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const requireApproved = body.requireApproved !== false;
     const deadline = Date.now() + POST_BUDGET_MS;
 
+    let chatId;
     try {
       ensureTelegram();
+      chatId = telegramChatFor(groupId);
     } catch (err) {
       sendJSON(res, 400, { success: false, error: err.message });
       return true;
@@ -2637,7 +2668,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
         });
 
         try {
-          const sent = await telegram.sendQuizPoll(subjectConfig.topic_thread_id, q);
+          const sent = await telegram.sendQuizPoll(subjectConfig.topic_thread_id, q, chatId);
 
           const messageId = sent && sent.message_id ? sent.message_id : null;
           const pollIds = sent && sent.poll && sent.poll.id

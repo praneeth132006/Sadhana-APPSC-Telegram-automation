@@ -40,6 +40,11 @@ process.env.SHEET_URL_APPSC_NEWS_EN = 'https://script.google.com/macros/s/test-n
 process.env.SHEET_TOKEN_APPSC_NEWS_EN = 'token-for-tests';
 process.env.TELEGRAM_GROUP_APPSC_NEWS_EN = '-1001234567890';
 process.env.LEGACY_GROUP_ID = 'appsc_news_en';
+// A second group with its own supergroup, so posting can be checked to go to
+// the selected group's chat and not the default TELEGRAM_GROUP_ID.
+process.env.SHEET_URL_APPSC_NEWS_TE = 'https://script.google.com/macros/s/test-news-te/exec';
+process.env.SHEET_TOKEN_APPSC_NEWS_TE = 'token-for-tests';
+process.env.TELEGRAM_GROUP_APPSC_NEWS_TE = '-1009876543210';
 process.env.CURATOR_EMAILS = '';
 process.env.RAZORPAY_KEY_ID = 'rzp_test_dummy';
 process.env.RAZORPAY_KEY_SECRET = 'dummy_secret';
@@ -628,6 +633,44 @@ test('a streamed post that fails mid-run ends the stream with the error', async 
     assert.match(done.error, /404/);
   } finally {
     clientStubs.getUnpostedQuestions = original;
+  }
+});
+
+test('each group posts into its own Telegram group, never the default one', async () => {
+  // The bug: every group posted to TELEGRAM_GROUP_ID (the English newspaper
+  // group). Telugu Physics is topic 33 of the Telugu group, which does not
+  // exist in the English one, so every Telugu question failed with
+  // "message thread not found".
+  const originalSend = telegram.sendQuizPoll;
+  const chats = [];
+  telegram.sendQuizPoll = async (threadId, q, chatId) => {
+    chats.push(chatId);
+    return { message_id: 999, poll: { id: 'poll-1' } };
+  };
+  try {
+    const te = await call('/api/telegram/post?group=appsc_news_te', {
+      method: 'POST', token: 'valid-token', body: { subject: 'Polity', count: 1 }
+    });
+    assert.equal(te.status, 200);
+    const en = await authed('/api/telegram/post', { method: 'POST', body: { subject: 'Polity', count: 1 } });
+    assert.equal(en.status, 200);
+    assert.deepEqual(chats, ['-1009876543210', '-1001234567890']);
+  } finally {
+    telegram.sendQuizPoll = originalSend;
+  }
+});
+
+test('a group with no Telegram group of its own refuses to post rather than use another', async () => {
+  const saved = process.env.TELEGRAM_GROUP_APPSC_NEWS_TE;
+  delete process.env.TELEGRAM_GROUP_APPSC_NEWS_TE;
+  try {
+    const res = await call('/api/telegram/post?group=appsc_news_te', {
+      method: 'POST', token: 'valid-token', body: { subject: 'Polity', count: 1 }
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.json.error, /TELEGRAM_GROUP_APPSC_NEWS_TE/);
+  } finally {
+    process.env.TELEGRAM_GROUP_APPSC_NEWS_TE = saved;
   }
 });
 
