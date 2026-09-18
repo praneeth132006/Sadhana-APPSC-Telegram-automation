@@ -144,6 +144,10 @@ function decorate(group) {
   const sheetToken = String(process.env[`SHEET_TOKEN_${prefix}`] || '').trim() || legacy.token;
   const telegramGroupId =
     String(process.env[`TELEGRAM_GROUP_${prefix}`] || '').trim() || legacy.chat;
+  // The spreadsheet itself, for the direct Sheets API (src/sheets-direct.js).
+  // Accepts the bare id or the whole link copied from the browser.
+  const sheetIdRaw = String(process.env[`SHEET_ID_${prefix}`] || '').trim();
+  const sheetId = (sheetIdRaw.match(/\/d\/([A-Za-z0-9_-]{20,})/) || [null, sheetIdRaw])[1];
   const razorpayPlanId =
     String(process.env[`RAZORPAY_PLAN_${prefix}`] || '').trim() || legacy.plan;
 
@@ -158,6 +162,7 @@ function decorate(group) {
     shortName: group.shortName || displayName(group),
     sheetUrl,
     sheetToken,
+    sheetId,
     telegramGroupId,
     razorpayPlanId,
     // What a group needs before it can be used at all. Reported rather than
