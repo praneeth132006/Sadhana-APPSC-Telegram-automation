@@ -136,6 +136,10 @@ function forGroup(groupId) {
       bound[name] = async (...args) => {
         try {
           return await direct.DIRECT[name](ctx, ...args);
+        } catch (err) {
+          // An old-layout tab needs the Apps Script's column migration first.
+          if (err.needsAppsScript) return module.exports[`_${name}`](ctx, ...args);
+          throw err;
         } finally {
           // Dashboard reads cached from the Apps Script must not outlive a write.
           if (direct.WRITES.has(name)) invalidateReads(ctx);

@@ -51,7 +51,7 @@ function fakeSheets(book) {
     const u = String(url);
     const reply = (status, body) => ({ ok: status < 300, status, json: async () => body });
     if (u.startsWith('https://oauth2.googleapis.com/token')) return reply(200, { access_token: 'tok', expires_in: 3600 });
-    const path = u.replace(/^https:\/\/sheets\.googleapis\.com\/v4\/spreadsheets\/[^/]+/, '');
+    const path = u.replace(/^https:\/\/sheets\.googleapis\.com\/v4\/spreadsheets\/[^/:]+/, '');
     if (init.method === 'POST' && path.startsWith('/values:batchUpdate')) {
       const body = JSON.parse(init.body);
       assert.equal(body.valueInputOption, 'RAW');
@@ -63,6 +63,24 @@ function fakeSheets(book) {
         log.writes.push({ tab: r.tab, row: r.row, header: book[r.tab][0][r.col], value: d.values[0][0] });
       }
       if (log.afterWrite) log.afterWrite();
+      return reply(200, {});
+    }
+    if (init.method === 'POST' && path.startsWith(':batchUpdate')) {
+      const add = JSON.parse(init.body).requests[0].addSheet;
+      book[add.properties.title] = [];
+      return reply(200, {});
+    }
+    const append = path.match(/^\/values\/([^?:]+):append/);
+    if (init.method === 'POST' && append) {
+      const tab = parse(append[1]).tab;
+      const first = book[tab].length + 1;
+      JSON.parse(init.body).values.forEach((v) => book[tab].push(v.slice()));
+      log.appends = (log.appends || 0) + 1;
+      return reply(200, { updates: { updatedRange: `'${tab}'!A${first}:AD${book[tab].length}` } });
+    }
+    if (init.method === 'PUT') {
+      const r = parse(path.match(/^\/values\/([^?]+)/)[1]);
+      book[r.tab][r.row - 1] = JSON.parse(init.body).values[0].slice();
       return reply(200, {});
     }
     const m = path.match(/^\/values\/([^?]+)/);
@@ -202,4 +220,38 @@ test('a group with a sheet id posts through the direct client', () => {
     'a pasted link is reduced to the id');
   delete process.env.SHEET_ID_APPSC_NEWS_TE;
   assert.equal(sheets.forGroup('appsc_news_te').direct, false, 'without an id it stays on the Apps Script');
+});
+
+test('adding questions issues the next ids, skips repeats and stores text as text', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { 'Question ID': 'PHY-20260918-0001', 'Dup Hash': 'made-by-an-old-script' }),
+    question(2, { 'Question ID': 'PHY-20260918-0002' })] };
+  const log = fakeSheets(book);
+  const res = await DIRECT.addQuestions(ctx, 'Physics', [
+    { question: 'Question 1?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd', correct_answer: 'b' },
+    { question: '=HYPERLINK("x")', option_a: '1-D, 2-C', option_b: 'b', option_c: 'c', option_d: 'd', correct_answer: 'c', date: '09-05-2026' },
+    { question: '=HYPERLINK("x")', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }
+  ], 'Tester (t@x)', true);
+  assert.equal(res.addedCount, 1);
+  assert.equal(res.skippedCount, 2, 'a repeat of an existing question and a repeat inside the batch');
+  assert.match(res.ids[0], /^PHY-\d{8}-0003$/);
+  const row = book.Physics[3];
+  assert.equal(row[col('Question')], '=HYPERLINK("x")');
+  assert.equal(row[col('S.No')], 3);
+  assert.equal(row[col('Status')], 'Approved');
+  assert.equal(row[col('Posted')], 'NO');
+  assert.equal(row[col('Correct Answer')], 'C');
+  assert.equal(row[col('Dup Hash')], _internal.hashQuestion('=HYPERLINK("x")'));
+  assert.equal(row[col('Added By')], 'Tester (t@x)');
+  assert.ok(log.appends === 1);
+});
+
+test('adding to a subject with no tab creates it', async () => {
+  const book = {};
+  fakeSheets(book);
+  const res = await DIRECT.addQuestions(ctx, 'Art and Culture', [{ question: 'New?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }], 'T', true);
+  assert.equal(res.addedCount, 1);
+  assert.equal(book['Art and Culture'][0][col('Question')], 'Question');
+  assert.match(res.ids[0], /^ART-\d{8}-0001$/);
+  assert.equal(book['Art and Culture'][1][col('Question')], 'New?');
 });
