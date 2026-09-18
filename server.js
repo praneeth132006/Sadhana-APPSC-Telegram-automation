@@ -76,6 +76,16 @@ const BOT_UPDATE_BUDGET_MS = 20000;
  *  below the platform's function timeout (`maxDuration` in vercel.json). */
 const POST_BUDGET_MS = Number(process.env.POST_BUDGET_MS) || 240000;
 
+/**
+ * How long a claim may sit before a posting run treats it as abandoned.
+ *
+ * A run cannot last longer than POST_BUDGET_MS, so anything older than this
+ * belongs to a run that died — a serverless timeout, a closed laptop — and its
+ * unsent questions are waiting to be posted by someone. Comfortably above the
+ * budget so a slow run in progress is never robbed of its own rows.
+ */
+const STALE_CLAIM_MINUTES = Math.max(10, Math.ceil((POST_BUDGET_MS / 60000) * 2));
+
 /** Most questions one request will post. Anything larger is better split
  *  across runs than raced against the function timeout. */
 const MAX_POST_BATCH = 20;
@@ -873,13 +883,55 @@ async function paymentBotUsername(payBotEnv) {
  * @param {boolean} requireApproved Whether Drafts were excluded
  * @returns {Promise<string>} One sentence, or a fallback when the tab cannot be read
  */
+/**
+ * recoverAbandonedClaims — hands back rows a posting run claimed and never
+ * sent, so the questions it did not get to can be posted by the next run.
+ *
+ * Never fails a posting run: a sheet whose Apps Script predates this simply
+ * behaves as it did before, which is the old stuck-row problem and not a new
+ * one.
+ *
+ * @returns {Promise<Array<Object>>} The rows put back, [] when none or unknown
+ */
+async function recoverAbandonedClaims(db, subject) {
+  try {
+    const result = await db.recoverStaleClaims(subject, STALE_CLAIM_MINUTES);
+    if (result.recovered.length) {
+      console.log(`[post] ${subject}: put ${result.recovered.length} abandoned claim(s) back in the queue ` +
+        `(${result.recovered.map((r) => r.question_id || `row ${r.row}`).join(', ')})`);
+    }
+    return result.recovered;
+  } catch (err) {
+    if (err.staleScript) {
+      console.warn(`[post] ${subject}: this sheet's Apps Script cannot recover abandoned claims — redeploy it.`);
+    } else {
+      console.error(`[post] ${subject}: could not recover abandoned claims: ${err.message}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * holdForChecking — marks a row whose poll may be in the channel, so it is
+ * never posted again automatically and never handed back by
+ * recoverAbandonedClaims. Best effort: the row is already claimed either way.
+ */
+async function holdForChecking(db, subject, row, note) {
+  try {
+    await db.holdQuestions(subject, [row], note);
+  } catch (err) {
+    if (!err.staleScript) console.error(`[post] could not hold row ${row} for checking: ${err.message}`);
+  }
+}
+
 async function describeShortfall(db, subject, asked, eligible, requireApproved) {
   try {
     const page = await db.listQuestions({ subject, pageSize: 500 });
     const all = page.questions || [];
 
     const posted = all.filter((q) => String(q.posted).toUpperCase() === 'YES').length;
-    const sending = all.filter((q) => q.claimed).length;
+    const sending = all.filter((q) => q.claimed && !q.held).length;
+    const held = all.filter((q) => q.held).length;
     const draft = all.filter((q) =>
       String(q.posted).toUpperCase() !== 'YES' && !q.claimed &&
       !['Approved', 'Scheduled', 'Rejected', 'Archived'].includes(q.status)).length;
@@ -891,7 +943,8 @@ async function describeShortfall(db, subject, asked, eligible, requireApproved) 
     if (posted) parts.push(`${posted} already posted`);
     if (draft) parts.push(`${draft} not approved yet`);
     if (refused) parts.push(`${refused} rejected or archived`);
-    if (sending) parts.push(`${sending} held as "Sending"`);
+    if (sending) parts.push(`${sending} being sent right now`);
+    if (held) parts.push(`${held} held for checking`);
 
     if (!parts.length) return `"${subject}" has nothing else to send.`;
     return `The rest of "${subject}": ${parts.join(', ')}.` +
@@ -2470,10 +2523,47 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       return true;
     }
     postsInFlight.add(lockKey);
+
+    // ---- Live progress --------------------------------------------------
+    // A batch runs for minutes — every question is a Telegram send plus a
+    // sheet write, and Apps Script alone can take 10s a call. Answering once
+    // at the end left the page showing "Posting…" with no way to tell a slow
+    // run from a dead one. With `stream: true` the answer is NDJSON: one line
+    // per step and per question, then a final "done" line carrying exactly
+    // the payload the non-streaming answer has.
+    const streaming = body.stream === true;
+    let clientGone = false;
+    const emit = (event) => {
+      if (!streaming || res.writableEnded) return;
+      try { res.write(JSON.stringify(event) + '\n'); } catch (err) { clientGone = true; }
+    };
+    const finish = (status, payload) => {
+      if (!streaming) { sendJSON(res, status, payload); return; }
+      emit(Object.assign({ type: 'done', status }, payload));
+      res.end();
+    };
+    if (streaming) {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no'
+      });
+      // Stop pressed, tab closed, connection lost: nobody is watching any more,
+      // so stop after the question in hand and put the rest back.
+      res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+    }
+
     try {
+      emit({ type: 'stage', text: 'Checking for questions an interrupted run left behind…' });
+      // A run that was killed mid-batch leaves its unsent rows claimed. They
+      // were never posted, and without this they never could be: they are not
+      // eligible, and no one can clear them from the dashboard. Put them back
+      // before deciding what to send, so "post the rest" is just posting again.
+      const recovered = await recoverAbandonedClaims(db, subject.value);
+      emit({ type: 'stage', text: `Reading the next ${count} eligible question(s) from the sheet…` });
       const questions = await db.getUnpostedQuestions(subject.value, count, requireApproved);
       if (!questions.length) {
-        sendJSON(res, 200, {
+        finish(200, {
           success: true,
           postedCount: 0,
           requestedCount: count,
@@ -2492,18 +2582,21 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       // every subsequent run — two of them were stuck in that loop. Claiming
       // first means the worst case is a question that needs a human to resolve,
       // never one that is posted twice.
+      emit({ type: 'stage', text: `Reserving ${questions.length} question(s) so none can go out twice…` });
       const rowsWanted = questions.map((q) => sheets.sheetRowOf(q));
       const claim = await db.claimQuestions(subject.value, rowsWanted);
       const claimedRows = new Set(claim.claimed);
 
       const results = [];
+      // Every outcome is also streamed the moment it is known.
+      const record = (item) => { results.push(item); emit(Object.assign({ type: 'result' }, item)); };
       const postedRowIndices = [];
       const strandedRows = [];
 
       // Anything another run took first is reported, not silently dropped.
       for (const skip of claim.skipped || []) {
         const q = questions.find((item) => sheets.sheetRowOf(item) === Number(skip.row));
-        results.push({
+        record({
           questionId: q ? q.question_id : `row ${skip.row}`,
           ok: false,
           error: `Skipped — ${skip.reason}.`,
@@ -2512,6 +2605,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       }
 
       const toSend = questions.filter((q) => claimedRows.has(sheets.sheetRowOf(q)));
+      emit({ type: 'plan', total: toSend.length, eligible: questions.length, skipped: (claim.skipped || []).length });
 
       for (let i = 0; i < toSend.length; i++) {
         const q = toSend[i];
@@ -2519,21 +2613,28 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
 
         // Stop cleanly while there is still time to record what has been sent,
         // and hand back what was never attempted.
-        if (Date.now() > deadline) {
+        if (Date.now() > deadline || clientGone) {
           const untouched = toSend.slice(i).map((rest) => sheets.sheetRowOf(rest));
           try {
             await db.releaseQuestions(subject.value, untouched, q.status);
           } catch (releaseErr) {
             console.error('[post] could not release unsent rows:', releaseErr.message);
           }
-          toSend.slice(i).forEach((rest) => results.push({
+          toSend.slice(i).forEach((rest) => record({
             questionId: rest.question_id,
             ok: false,
-            error: 'Stopped before the request timed out — run again to post the rest.',
+            error: clientGone
+              ? 'Not sent — posting was stopped. It is back in the queue.'
+              : 'Stopped before the request timed out — run again to post the rest.',
             preview: rest.question_text.slice(0, 80)
           }));
           break;
         }
+
+        emit({
+          type: 'sending', index: i + 1, total: toSend.length,
+          questionId: q.question_id, preview: String(q.question_text || '').slice(0, 80)
+        });
 
         try {
           const sent = await telegram.sendQuizPoll(subjectConfig.topic_thread_id, q);
@@ -2548,17 +2649,19 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
               subject.value, [sheetRow], messageId, subjectConfig.topic_thread_id, pollIds
             );
             postedRowIndices.push(sheetRow);
-            results.push({ questionId: q.question_id, ok: true, preview: q.question_text.slice(0, 80) });
+            record({ questionId: q.question_id, ok: true, preview: q.question_text.slice(0, 80) });
           } catch (markErr) {
             // The poll is public and the row is still claimed, so it cannot go
             // out again. It needs a person, and says so.
             console.error(`[post] row ${sheetRow} posted but not marked:`, markErr.message);
             strandedRows.push(sheetRow);
-            results.push({
+            await holdForChecking(db, subject.value, sheetRow,
+              `Posted to Telegram${messageId ? ` (message ${messageId})` : ''} but the sheet write failed: ${markErr.message}`);
+            record({
               questionId: q.question_id,
               ok: false,
               error: `Posted to Telegram, but the sheet did not record it (${markErr.message}). ` +
-                     `Row ${sheetRow} is held as "Sending" so it cannot be posted twice — mark it Posted by hand.`,
+                     `Row ${sheetRow} is held for checking so it cannot be posted twice — mark it Posted by hand.`,
               preview: q.question_text.slice(0, 80)
             });
           }
@@ -2572,17 +2675,19 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
             } catch (releaseErr) {
               console.error(`[post] could not release row ${sheetRow}:`, releaseErr.message);
             }
-            results.push({
+            record({
               questionId: q.question_id, ok: false,
               error: `Telegram refused it: ${err.message}`,
               preview: q.question_text.slice(0, 80)
             });
           } else {
             strandedRows.push(sheetRow);
-            results.push({
+            await holdForChecking(db, subject.value, sheetRow,
+              `No answer from Telegram when posting: ${err.message}. It may or may not have gone out.`);
+            record({
               questionId: q.question_id, ok: false,
               error: `No answer from Telegram (${err.message}). It may or may not have gone out, ` +
-                     `so row ${sheetRow} is held as "Sending" rather than risking a duplicate. Check the channel.`,
+                     `so row ${sheetRow} is held for checking rather than risking a duplicate. Check the channel.`,
               preview: q.question_text.slice(0, 80)
             });
           }
@@ -2602,20 +2707,25 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       // what the rest are, so the answer is not "the poster is broken".
       let message = `${postedCount} of ${questions.length} question(s) posted to "${subject.value}"`;
       if (questions.length < count) {
+        emit({ type: 'stage', text: 'Checking why fewer questions were ready than asked for…' });
         const shortfall = await describeShortfall(db, subject.value, count, questions.length, requireApproved);
         message += ` — you asked for ${count}, and ${questions.length} ${questions.length === 1 ? 'was' : 'were'} ready. ${shortfall}`;
       } else if (remaining) {
         message += ` — run again to send the remaining ${remaining}`;
       }
+      if (recovered.length) {
+        message += ` ♻️ ${recovered.length} question(s) left claimed by an interrupted run were put back in the queue first.`;
+      }
       if (strandedRows.length) {
-        message += ` ⚠️ ${strandedRows.length} row(s) are held as "Sending" and need checking.`;
+        message += ` ⚠️ ${strandedRows.length} row(s) are held for checking — they may be in the channel.`;
       }
 
-      sendJSON(res, 200, {
+      finish(200, {
         success: true,
         postedCount,
         requestedCount: count,
         eligibleCount: questions.length,
+        recoveredRows: recovered.map((r) => r.row),
         strandedRows,
         failedCount: questions.length - postedCount,
         results,
@@ -2623,6 +2733,13 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       });
       return true;
 
+    } catch (err) {
+      // Once streaming, the status line has gone out, so a failure has to be
+      // reported in the stream rather than thrown to the generic handler.
+      if (!streaming) throw err;
+      console.error(`[post] ${subject.value} failed:`, err.message);
+      finish(err.statusCode || 500, { success: false, error: err.message });
+      return true;
     } finally {
       postsInFlight.delete(lockKey);
     }

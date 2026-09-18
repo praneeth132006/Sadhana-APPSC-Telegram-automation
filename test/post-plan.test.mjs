@@ -92,9 +92,10 @@ test('an unknown choice is refused', () => {
 // ---------------------------------------------------------------------------
 
 test('duration estimate reads naturally', () => {
-  assert.equal(estimateDuration(5), 'under a minute');
-  assert.equal(estimateDuration(20), 'about 1 minute');
-  assert.equal(estimateDuration(682), 'about 35 minutes');
+  assert.equal(estimateDuration(4), 'under a minute');
+  assert.equal(estimateDuration(5), 'about 1 minute');
+  assert.equal(estimateDuration(20), 'about 4 minutes');
+  assert.equal(estimateDuration(682), 'about 2 hours 17 minutes');
 });
 
 // ---------------------------------------------------------------------------

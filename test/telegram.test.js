@@ -155,3 +155,30 @@ test('buildQuizPost sends a question with more than two line breaks as a message
   const twoBreaks = buildQuizPost({ ...base, question_text: 'Consider:\n1. Alpha\n2. Beta' });
   assert.equal(twoBreaks.leadMessage, null);
 });
+
+test('a quiz explanation with < or & is escaped, so Telegram accepts the poll', async () => {
+  // Telegram parses the explanation as HTML. A raw "<" or "&" — "rainfall < 50 cm",
+  // "NDMA & SDMA" — made it refuse the whole poll with "can't parse entities".
+  const TelegramBot = require('node-telegram-bot-api');
+  const telegram = require('../src/telegram');
+  const seen = {};
+  const original = { sendPoll: TelegramBot.prototype.sendPoll, sendMessage: TelegramBot.prototype.sendMessage };
+  TelegramBot.prototype.sendPoll = async function (chat, q, options, config) {
+    seen.config = config;
+    return { message_id: 7, poll: { id: 'p' } };
+  };
+  TelegramBot.prototype.sendMessage = async function () { return { message_id: 8 }; };
+  try {
+    telegram.init('123:test', '-1001');
+    await telegram.sendQuizPoll(5, {
+      question_text: 'విపత్తు నిర్వహణ చట్టం ఏ సంవత్సరంలో వచ్చింది?',
+      option_a: '2005', option_b: '2004', option_c: '2010', option_d: '2001',
+      correct_answer: 'A',
+      explanation: 'NDMA & SDMA; rainfall < 50 cm'
+    });
+    assert.equal(seen.config.explanation, 'NDMA &amp; SDMA; rainfall &lt; 50 cm');
+    assert.equal(seen.config.explanation_parse_mode, 'HTML');
+  } finally {
+    Object.assign(TelegramBot.prototype, original);
+  }
+});

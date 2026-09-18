@@ -11,11 +11,11 @@
 // ============================================================================
 
 import {
-  initDashboard, api, el, replaceChildren, statCard, emptyState, pill,
+  initDashboard, api, apiStream, el, replaceChildren, statCard, emptyState, pill,
   num, showToast, $, SUBJECTS
 } from './shared.js';
 import {
-  availableToPost, resolvePostCount, estimateDuration, runPostBatches, SERVER_BATCH_LIMIT
+  availableToPost, resolvePostCount, estimateDuration, runPostBatches
 } from './post-plan.js';
 
 /** Latest analytics payload, used for runway and pending counts. */
@@ -24,7 +24,7 @@ let analytics = null;
 /** True while a posting run is in progress. */
 let posting = false;
 
-/** Set by the Stop button; checked between batches. */
+/** Set by the Stop button. */
 let stopRequested = false;
 
 /** Telegram bot connection state from /api/telegram/status. */
@@ -137,11 +137,8 @@ function renderPostCount() {
     hint.style.color = choice === 'custom' && custom.value === '' ? '' : 'var(--accent-danger)';
   } else {
     hint.style.color = '';
-    const batches = Math.ceil(resolved.count / SERVER_BATCH_LIMIT);
     hint.textContent = choice === 'all' || choice === 'custom'
-      ? `Will post ${num(resolved.count)} of ${num(available)} eligible question(s)` +
-        (batches > 1 ? ` in ${batches} batches of up to ${SERVER_BATCH_LIMIT}` : '') +
-        ` — ${estimateDuration(resolved.count)}.`
+      ? `Will post ${num(resolved.count)} of ${num(available)} eligible question(s) — ${estimateDuration(resolved.count)}.`
       : '';
   }
 
@@ -220,11 +217,96 @@ function renderCliList() {
 // Actions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Posting progress
+// ---------------------------------------------------------------------------
+// A run is minutes of Telegram sends and sheet writes. The server streams a
+// line for every step and every question, and this panel turns them into a
+// bar, a count, the step in progress, elapsed time and an estimate of what is
+// left — so a slow run is visibly moving and a stuck one is visibly stuck.
+
+/** Questions asked of the server per request. Twelve seconds each keeps a
+ *  request well inside the server's four-minute posting budget. */
+const POST_REQUEST_SIZE = 10;
+
+const progress = { total: 0, done: 0, posted: 0, failed: 0, startedAt: 0, timer: null };
+
+/** m:ss for the elapsed / remaining readout. */
+function clock(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function renderProgress() {
+  const { total, done, posted, failed, startedAt } = progress;
+  const pctDone = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  $('postProgressCount').textContent =
+    `${num(posted)} of ${num(total)} posted` + (failed ? ` · ${num(failed)} failed` : '');
+  $('postProgressFill').style.width = pctDone + '%';
+  $('postProgressFill').classList.toggle('has-failures', failed > 0);
+  $('postProgressTrack').setAttribute('aria-valuenow', String(pctDone));
+
+  const elapsed = Date.now() - startedAt;
+  let time = `${clock(elapsed)} elapsed`;
+  if (done > 0 && done < total) {
+    time += ` · ~${clock((elapsed / done) * (total - done))} left`;
+  }
+  $('postProgressTime').textContent = time;
+}
+
+function setStage(text, { indeterminate } = {}) {
+  $('postProgressStage').textContent = text;
+  if (indeterminate !== undefined) {
+    $('postProgressTrack').classList.toggle('indeterminate', indeterminate);
+  }
+}
+
+function startProgress(total, subject) {
+  Object.assign(progress, { total, done: 0, posted: 0, failed: 0, startedAt: Date.now() });
+  $('postProgress').hidden = false;
+  $('postProgressTitle').textContent = `Posting to "${subject}"`;
+  setStage('Connecting to the sheet…', { indeterminate: true });
+  renderProgress();
+  clearInterval(progress.timer);
+  progress.timer = setInterval(renderProgress, 1000);
+}
+
+function endProgress(title, stage) {
+  clearInterval(progress.timer);
+  progress.timer = null;
+  $('postProgressTitle').textContent = title;
+  setStage(stage, { indeterminate: false });
+  renderProgress();
+  $('postProgressTime').textContent = `took ${clock(Date.now() - progress.startedAt)}`;
+}
+
+/** Applies one streamed line from /api/telegram/post. */
+function onPostEvent(event) {
+  if (event.type === 'stage') {
+    // Only the pre-send steps leave the bar without a percentage.
+    setStage(event.text, { indeterminate: progress.done === 0 });
+  } else if (event.type === 'sending') {
+    setStage(`Sending ${num(progress.done + 1)} of ${num(progress.total)}: ${event.questionId} — ${event.preview}`,
+      { indeterminate: false });
+  } else if (event.type === 'result') {
+    progress.done++;
+    if (event.ok) progress.posted++; else progress.failed++;
+    log('postLog',
+      (event.ok ? '✅ ' : '❌ ') + (event.questionId || '') + ' — ' + (event.ok ? event.preview : event.error),
+      event.ok ? 'ok' : 'fail');
+    renderProgress();
+  }
+}
+
+/** Set while a run is in flight; Stop aborts it. */
+let postAbort = null;
+
 /**
  * Posts the selected number of questions to Telegram after an explicit
- * confirmation. The server takes at most SERVER_BATCH_LIMIT per request (and a
- * request must finish inside the function timeout), so "All" and large custom
- * numbers run as consecutive batches that stop on the first failure.
+ * confirmation. Large runs go as consecutive requests of POST_REQUEST_SIZE that
+ * stop on the first failure. Stop takes effect after the question in hand: the
+ * server puts every question it had not reached back in the queue.
  */
 async function postNow() {
   if (posting) return;
@@ -250,12 +332,11 @@ async function postNow() {
   }
 
   // Posting is public and irreversible, so it always asks first.
-  const batches = Math.ceil(count / SERVER_BATCH_LIMIT);
   const confirmed = window.confirm(
     (choice === 'all'
       ? `Post ALL ${count} eligible question(s) from "${subject}" to Telegram now?`
       : `Post up to ${count} question(s) from "${subject}" to Telegram now?`) +
-    (batches > 1 ? `\n\nThis runs as ${batches} batches and takes ${estimateDuration(count)}. Keep this tab open.` : '') +
+    `\n\nThis takes ${estimateDuration(count)}. You can watch each question go out, and stop at any time.` +
     '\n\n' +
     (requireApproved
       ? 'Only Approved or Scheduled questions will be sent.'
@@ -265,72 +346,79 @@ async function postNow() {
   if (!confirmed) return;
 
   clearLog('postLog');
-  log('postLog', `Requesting ${count} question(s) from "${subject}"…`);
-  // Telegram rate-limits a bot to roughly 20 messages a minute into one group,
-  // so a batch is paced rather than fired off at once. Say so, or a run that is
-  // working normally looks like a hang.
-  if (count > 3) {
-    log('postLog', `Pacing for Telegram's rate limit — ${estimateDuration(count)}. Leave this tab open.`, 'muted');
-  }
+  startProgress(count, subject);
 
-  let postedSoFar = 0;
   posting = true;
   stopRequested = false;
+  postAbort = new AbortController();
   button.disabled = true;
-  button.textContent = batches > 1 ? `Posting… (batch 1 of ${batches})` : 'Posting…';
-  stopButton.hidden = batches <= 1;
+  button.textContent = 'Posting…';
+  stopButton.hidden = false;
   stopButton.disabled = false;
-  stopButton.textContent = '⏹ Stop after this batch';
+  stopButton.textContent = '⏹ Stop posting';
 
+  let outcome = null;
+  let failure = null;
   try {
-    const outcome = await runPostBatches({
+    outcome = await runPostBatches({
       total: count,
+      batchLimit: POST_REQUEST_SIZE,
       shouldStop: () => stopRequested,
-      postBatch: async (size) => {
-        button.textContent = batches > 1
-          ? `Posting… (${num(postedSoFar)} of ${num(count)} sent)`
-          : 'Posting…';
-        return api('/api/telegram/post', {
-          method: 'POST',
-          body: { subject, count: size, requireApproved }
-        });
-      },
-      onBatch: (result, info) => {
-        postedSoFar = info.postedSoFar;
-        if (batches > 1) log('postLog', `Batch ${info.batch}:`, 'muted');
-        (result.results || []).forEach((r) => {
+      postBatch: (size) => apiStream('/api/telegram/post', {
+        body: { subject, count: size, requireApproved },
+        signal: postAbort.signal,
+        onEvent: onPostEvent
+      }),
+      onBatch: (result) => {
+        if ((result.recoveredRows || []).length) {
           log('postLog',
-            (r.ok ? '✅ ' : '❌ ') + (r.questionId || '') + ' — ' + (r.ok ? r.preview : r.error),
-            r.ok ? 'ok' : 'fail');
-        });
+            `♻️ ${result.recoveredRows.length} question(s) left behind by an interrupted run were put back in the queue.`,
+            'muted');
+        }
         log('postLog', result.message, result.failedCount ? 'fail' : (result.postedCount ? 'ok' : 'muted'));
       }
     });
+  } catch (err) {
+    failure = err;
+  }
 
-    const summary = {
+  const stoppedByUser = stopRequested && (!failure || failure.name === 'AbortError');
+  let title;
+  let summary;
+  let tone;
+  if (stoppedByUser) {
+    title = 'Stopped';
+    summary = `Stopped as asked — ${progress.posted} of ${count} question(s) posted to "${subject}". ` +
+      'The question being sent when you pressed Stop may still go out; the rest are back in the queue.';
+    tone = 'info';
+  } else if (failure) {
+    title = 'Posting failed';
+    summary = `Failed after ${progress.posted} posted: ${failure.message}`;
+    tone = 'error';
+  } else {
+    summary = {
       done: `Done — ${outcome.posted} of ${count} question(s) posted to "${subject}".`,
       stopped: `Stopped as asked — ${outcome.posted} of ${count} question(s) posted to "${subject}".`,
       failed: `Stopped after a failure — ${outcome.posted} of ${count} posted. Check the errors above before posting more.`,
       exhausted: `Queue empty — ${outcome.posted} of ${count} question(s) posted; nothing else was eligible.`
     }[outcome.stopReason];
-
-    if (batches > 1 || outcome.stopReason !== 'done') log('postLog', summary, outcome.stopReason === 'failed' ? 'fail' : 'ok');
-    const tone = outcome.stopReason === 'failed' ? 'warn'
-      : outcome.posted === 0 ? 'info' : 'success';
-    showToast(tone, summary);
-  } catch (err) {
-    log('postLog', `Failed after ${postedSoFar} posted: ` + err.message, 'fail');
-    showToast('error', err.message, 9000);
-  } finally {
-    posting = false;
-    button.disabled = false;
-    button.textContent = '🚀 Post to Telegram';
-    stopButton.hidden = true;
-    // Refresh the counts so runway, pending totals and the custom cap reflect
-    // what just went out. renderPostCount() re-applies the button state.
-    try { await loadAnalytics(); } catch (refreshErr) { console.error(refreshErr); }
-    renderPostCount();
+    title = { done: 'Done', stopped: 'Stopped', failed: 'Stopped after a failure', exhausted: 'Queue empty' }[outcome.stopReason];
+    tone = outcome.stopReason === 'failed' ? 'warn' : outcome.posted === 0 ? 'info' : 'success';
   }
+
+  endProgress(title, summary);
+  log('postLog', summary, tone === 'error' || tone === 'warn' ? 'fail' : 'ok');
+  showToast(tone, summary, tone === 'error' ? 9000 : 5000);
+
+  posting = false;
+  postAbort = null;
+  button.disabled = false;
+  button.textContent = '🚀 Post to Telegram';
+  stopButton.hidden = true;
+  // Refresh the counts so runway, pending totals and the custom cap reflect
+  // what just went out. renderPostCount() re-applies the button state.
+  try { await loadAnalytics(); } catch (refreshErr) { console.error(refreshErr); }
+  renderPostCount();
 }
 
 /**
@@ -501,7 +589,11 @@ initDashboard({
     $('postStopBtn').addEventListener('click', () => {
       stopRequested = true;
       $('postStopBtn').disabled = true;
-      $('postStopBtn').textContent = 'Stopping after this batch…';
+      $('postStopBtn').textContent = 'Stopping…';
+      setStage('Stopping — finishing the question in hand, then putting the rest back in the queue…');
+      // Closing the stream is the signal: the server stops after the current
+      // question and releases everything it had not reached.
+      if (postAbort) postAbort.abort();
     });
     ['postSubject', 'requireApproved', 'postCount'].forEach((id) =>
       $(id).addEventListener('change', renderPostCount));

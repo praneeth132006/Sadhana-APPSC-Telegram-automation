@@ -10,7 +10,7 @@
 // Group id : appsc_news_te
 // Subjects : 16
 //            History, AP History, Geography, AP Geography, Economy, AP Economy, Polity, Society, Current Affairs, Science and Technology, Biology, Chemistry, Physics, Environment, General Studies, Disaster Management
-// Built    : 2026-09-17T18:47:59.086Z
+// Built    : 2026-09-17T19:35:23.748Z
 // ==========================================================================
 
 // ============================================================================
@@ -652,6 +652,20 @@ function doPost(e) {
       return jsonResponse({ success: true, claimed: claim.claimed, skipped: claim.skipped });
     }
 
+    if (action === 'recoverStaleClaims') {
+      if (!payload.subject) {
+        return jsonResponse({ success: false, error: 'Missing subject' });
+      }
+      return jsonResponse({ success: true, data: recoverStaleClaims(payload.subject, payload.minutes) });
+    }
+
+    if (action === 'holdQuestions') {
+      if (!payload.subject || !(payload.rowNumbers || []).length) {
+        return jsonResponse({ success: false, error: 'Missing subject or rowNumbers' });
+      }
+      return jsonResponse({ success: true, heldCount: holdQuestionRows(payload.subject, payload.rowNumbers, payload.note) });
+    }
+
     if (action === 'releaseQuestions') {
       if (!payload.subject || !(payload.rowNumbers || []).length) {
         return jsonResponse({ success: false, error: 'Missing subject or rowNumbers' });
@@ -942,8 +956,10 @@ function isPostedValue(value) {
 /**
  * isClaimedValue — is this row mid-send?
  *
- * The Posted column holds "SENDING | <when>" between the moment a question is
- * handed to Telegram and the moment delivery is confirmed. Telegram can accept
+ * The Posted column holds "SENDING | <when> | <status>" between the moment a
+ * question is handed to Telegram and the moment delivery is confirmed, and
+ * "CHECK | <when>" once a run has given up on it. Both mean the row is not
+ * available; only the first is ever handed back automatically. Telegram can accept
  * a poll and still leave the caller with a timeout or a dropped connection, so
  * a row that is only marked AFTER a confirmed send can be delivered and left
  * looking unposted — which is what put two questions into an endless re-post
@@ -956,7 +972,31 @@ function isPostedValue(value) {
  * @returns {boolean}
  */
 function isClaimedValue(value) {
-  return /^\s*sending\b/i.test(String(value === null || value === undefined ? '' : value));
+  return /^\s*(sending|check)\b/i.test(String(value === null || value === undefined ? '' : value));
+}
+
+/**
+ * isHeldValue — is this row waiting for a person?
+ *
+ * "CHECK | <when>" means the poll may well be in the channel: Telegram never
+ * answered, or it answered and the sheet write failed. Such a row is never
+ * handed back automatically, because posting it again could double-post it.
+ */
+function isHeldValue(value) {
+  return /^\s*check\b/i.test(String(value === null || value === undefined ? '' : value));
+}
+
+/** The "<when>" of a "SENDING | <when> | <status>" marker, or ''. */
+function claimedAtFrom(value) {
+  var parts = String(value === null || value === undefined ? '' : value).split('|');
+  return parts.length > 1 ? String(parts[1]).trim() : '';
+}
+
+/** The status a claim interrupted, from its marker. Defaults to Approved. */
+function claimedStatusFrom(value) {
+  var parts = String(value === null || value === undefined ? '' : value).split('|');
+  var stored = parts.length > 2 ? String(parts[2]).trim() : '';
+  return normaliseChoice(stored, STATUS_VALUES, 'Approved');
 }
 
 /**
@@ -1043,6 +1083,8 @@ function rowToQuestion(row, map, subject, dataIndex) {
     posted: isPostedValue(cell(row, map, 'Posted')) ? 'YES' : 'NO',
     // Mid-send: neither posted nor available. See isClaimedValue.
     claimed: isClaimedValue(cell(row, map, 'Posted')),
+    // Waiting for a person: the poll may be in the channel. See isHeldValue.
+    held: isHeldValue(cell(row, map, 'Posted')),
     posted_raw: cell(row, map, 'Posted'),
     posted_at: cell(row, map, 'Posted At'),
     scheduled_for: cell(row, map, 'Scheduled For'),
@@ -1465,8 +1507,10 @@ function listPostedQuestions(subject) {
 /**
  * claimQuestionRows — reserves rows for sending, before anything is sent.
  *
- * Writes "SENDING | <when>" into Posted so the row stops being eligible the
+ * Writes "SENDING | <when> | <status>" into Posted so the row stops being
+ * eligible the
  * moment it is handed to Telegram, rather than when delivery is confirmed.
+ * The status is kept so an abandoned claim can be undone exactly.
  * Telegram can accept a poll and still leave the sender with a timeout or a
  * dropped connection; a row marked only on confirmation is then delivered and
  * still looks unposted, and goes out again on the next run — forever. Two
@@ -1511,7 +1555,13 @@ function claimQuestionRows(subject, rowNumbers) {
       if (isPostedValue(current)) { skipped.push({ row: rowNumber, reason: 'already posted' }); continue; }
       if (isClaimedValue(current)) { skipped.push({ row: rowNumber, reason: 'already sending' }); continue; }
 
-      sheet.getRange(rowNumber, colNum(map, 'Posted')).setValue('SENDING | ' + now);
+      // The status the row had is written into the marker, so a claim left
+      // behind by a run that never finished can be undone exactly (see
+      // recoverStaleClaims) instead of guessing "Approved".
+      var previous = normaliseChoice(sheet.getRange(rowNumber, colNum(map, 'Status')).getValue(),
+        STATUS_VALUES, 'Approved');
+      if (previous === 'Sending' || previous === 'Posted') previous = 'Approved';
+      sheet.getRange(rowNumber, colNum(map, 'Posted')).setValue('SENDING | ' + now + ' | ' + previous);
       sheet.getRange(rowNumber, colNum(map, 'Status')).setValue('Sending');
       claimed.push(rowNumber);
     }
@@ -1555,6 +1605,108 @@ function releaseQuestionRows(subject, rowNumbers, status) {
       released++;
     }
     return released;
+  });
+}
+
+/**
+ * recoverStaleClaims — puts rows back in the queue when the run that claimed
+ * them never finished.
+ *
+ * A claim is only meaningful while a posting run is alive. A run killed
+ * mid-batch — a serverless timeout, a closed laptop, a dropped deploy — used to
+ * leave its unsent rows marked "Sending" for ever: they were not posted, and
+ * they could never be posted again either. Anything claimed longer ago than
+ * `minutes` is therefore handed back to the status it had.
+ *
+ * Rows HELD for checking ("CHECK | …") are left alone: those may be in the
+ * channel, and only a person can say.
+ *
+ * @param {string} subject Sheet tab
+ * @param {number} minutes How old a claim must be to count as abandoned
+ * @returns {Object} { recovered: [{row, question_id, status, claimed_at}], held: n }
+ */
+function recoverStaleClaims(subject, minutes) {
+  var sheet = book().getSheetByName(subject);
+  if (!sheet) throw new Error('Sheet tab "' + subject + '" not found.');
+
+  var olderThan = Math.max(1, Number(minutes) || 15);
+
+  return withScriptLock(function () {
+    var map = headerMap(sheet);
+    var lastRow = sheet.getLastRow();
+    var recovered = [];
+    var held = 0;
+    if (lastRow <= 1) return { recovered: recovered, held: held };
+
+    var postedColNum = colNum(map, 'Posted');
+    var statusColNum = colNum(map, 'Status');
+    var postedCol = sheet.getRange(2, postedColNum, lastRow - 1, 1).getValues();
+    var idCol = sheet.getRange(2, colNum(map, 'Question ID'), lastRow - 1, 1).getValues();
+    var cutoff = Date.now() - olderThan * 60 * 1000;
+
+    for (var i = 0; i < postedCol.length; i++) {
+      var value = postedCol[i][0];
+      if (!isClaimedValue(value)) continue;
+      if (isHeldValue(value)) { held++; continue; }
+
+      // An unreadable stamp is treated as old: the alternative is a row that
+      // can never be posted again. Claims are written by the script itself, so
+      // this should not happen.
+      var claimedAt = parseIstDate(claimedAtFrom(value));
+      if (claimedAt && claimedAt.getTime() > cutoff) continue;
+
+      var rowNumber = i + 2;
+      var restore = claimedStatusFrom(value);
+      sheet.getRange(rowNumber, postedColNum).setValue('NO');
+      sheet.getRange(rowNumber, statusColNum).setValue(restore);
+      recovered.push({
+        row: rowNumber,
+        question_id: String(idCol[i][0] || '').trim(),
+        status: restore,
+        claimed_at: claimedAtFrom(value)
+      });
+    }
+    return { recovered: recovered, held: held };
+  });
+}
+
+/**
+ * holdQuestionRows — marks rows that need a person before anything else
+ * happens to them: the poll may be in the channel, but the sheet does not say
+ * so. They stay out of the queue and are never recovered automatically.
+ *
+ * @param {string} subject Sheet tab
+ * @param {Array<number>} rowNumbers 1-based sheet rows
+ * @param {string} [note] What happened, for the Review Notes column
+ * @returns {number} Rows held
+ */
+function holdQuestionRows(subject, rowNumbers, note) {
+  var sheet = book().getSheetByName(subject);
+  if (!sheet) throw new Error('Sheet tab "' + subject + '" not found.');
+
+  return withScriptLock(function () {
+    var map = headerMap(sheet);
+    var lastRow = sheet.getLastRow();
+    var now = istNow();
+    var held = 0;
+
+    for (var i = 0; i < rowNumbers.length; i++) {
+      var rowNumber = Number(rowNumbers[i]);
+      if (!isFinite(rowNumber) || rowNumber < 2 || rowNumber > lastRow) continue;
+      // Never touch a row that reached Posted in the meantime.
+      if (isPostedValue(sheet.getRange(rowNumber, colNum(map, 'Posted')).getValue())) continue;
+
+      sheet.getRange(rowNumber, colNum(map, 'Posted')).setValue('CHECK | ' + now);
+      sheet.getRange(rowNumber, colNum(map, 'Status')).setValue('Sending');
+      if (note) {
+        var notesCol = colNum(map, 'Review Notes');
+        var existing = String(sheet.getRange(rowNumber, notesCol).getValue() || '').trim();
+        var line = '[' + now + '] ' + note;
+        sheet.getRange(rowNumber, notesCol).setValue(safeCell(existing ? existing + '\n' + line : line));
+      }
+      held++;
+    }
+    return held;
   });
 }
 
