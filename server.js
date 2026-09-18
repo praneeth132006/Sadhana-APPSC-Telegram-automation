@@ -2760,7 +2760,9 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
         strandedRows,
         failedCount: questions.length - postedCount,
         results,
-        message
+        message,
+        // Which route reached the sheet, so a deploy can be checked at a glance.
+        sheetAccess: db.direct ? 'sheets-api' : 'apps-script'
       });
       return true;
 

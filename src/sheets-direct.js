@@ -1,0 +1,605 @@
+// ============================================================================
+// Direct Google Sheets client (src/sheets-direct.js)
+// ============================================================================
+// Talks to the Google Sheets API with a service account instead of going
+// through each sheet's Apps Script Web App.
+//
+// Why: the Web App took 3–35s a call, now and then answered a good request
+// with a 404 for minutes at a time, and every fix meant pasting a script into
+// five sheets. The Sheets API answers in well under a second and needs nothing
+// pasted anywhere. This file covers the posting path — the part that has to be
+// fast and reliable — and writes exactly what the Apps Script writes, to the
+// same columns, so either can read what the other wrote:
+//
+//   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions,
+//   markAsPosted, holdQuestions, recoverStaleClaims, listPosted,
+//   unpostQuestions
+//
+// Everything else (uploads, analytics, members, support) still goes through
+// the Apps Script, unchanged.
+//
+// Setup: GOOGLE_SERVICE_ACCOUNT_JSON holds the service account key (the JSON
+// itself, or the same base64-encoded), each sheet is shared with the service
+// account's email as Editor, and SHEET_ID_<PREFIX> holds each sheet's id.
+// No new dependencies: the token is a JWT signed with node:crypto.
+// ============================================================================
+
+const crypto = require('crypto');
+
+const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const API = 'https://sheets.googleapis.com/v4/spreadsheets';
+const REQUEST_TIMEOUT_MS = 20000;
+const ATTEMPTS = 3;
+
+/** The 30 canonical question columns, in order (A..AD). Mirrors QUESTION_HEADERS. */
+const QUESTION_HEADERS = [
+  'S.No', 'Question ID', 'Date', 'Newspaper', 'Subject', 'Topic', 'Question',
+  'Option A', 'Option B', 'Option C', 'Option D', 'Correct Answer', 'Explanation',
+  'Difficulty', 'Tags', 'Source URL', 'Status', 'Posted', 'Posted At',
+  'Scheduled For', 'Thread ID', 'Telegram Msg ID', 'Poll ID', 'Times Posted',
+  'Added At', 'Added By', 'Updated At', 'Updated By', 'Dup Hash', 'Review Notes'
+];
+
+/** Other names a column may carry in an older sheet. Mirrors headerAliases. */
+const HEADER_ALIASES = {
+  'S.No': ['s no', 'sno', 'sl no', 'serial'],
+  'Question ID': ['question id', 'qid', 'id'],
+  'Date': ['date'],
+  'Newspaper': ['newspaper', 'source'],
+  'Subject': ['subject'],
+  'Topic': ['topic', 'sub topic', 'subtopic'],
+  'Question': ['question', 'question text', 'prompt'],
+  'Option A': ['option a', 'opt a'],
+  'Option B': ['option b', 'opt b'],
+  'Option C': ['option c', 'opt c'],
+  'Option D': ['option d', 'opt d'],
+  'Correct Answer': ['correct answer', 'answer', 'correct'],
+  'Explanation': ['explanation', 'exp'],
+  'Difficulty': ['difficulty', 'level'],
+  'Tags': ['tags', 'keywords'],
+  'Source URL': ['source url', 'url', 'link', 'reference'],
+  'Status': ['status', 'workflow'],
+  'Posted': ['posted'],
+  'Posted At': ['posted at'],
+  'Scheduled For': ['scheduled for', 'schedule at'],
+  'Thread ID': ['thread id', 'topic thread id'],
+  'Telegram Msg ID': ['telegram msg id', 'message id', 'msg id'],
+  'Poll ID': ['poll id'],
+  'Times Posted': ['times posted', 'post count'],
+  'Added At': ['added at'],
+  'Added By': ['added by', 'uploader'],
+  'Updated At': ['updated at', 'modified at'],
+  'Updated By': ['updated by', 'modified by'],
+  'Dup Hash': ['dup hash', 'hash', 'fingerprint'],
+  'Review Notes': ['review notes', 'notes', 'remarks']
+};
+
+const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Credentials and transport
+// ---------------------------------------------------------------------------
+
+let cachedKey;
+
+/** The service account key from the environment, or null when not set up. */
+function serviceAccount() {
+  if (cachedKey !== undefined) return cachedKey;
+  const raw = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+  cachedKey = null;
+  if (!raw) return null;
+  try {
+    const text = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const key = JSON.parse(text);
+    if (key.client_email && key.private_key) {
+      // Some tools store the key with literal "\n" sequences.
+      key.private_key = String(key.private_key).replace(/\\n/g, '\n');
+      cachedKey = key;
+    }
+  } catch (err) {
+    console.error('[sheets-direct] GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON:', err.message);
+  }
+  return cachedKey;
+}
+
+/** True when the service account is configured. */
+function isConfigured() {
+  return Boolean(serviceAccount());
+}
+
+/** The address each sheet has to be shared with. */
+function serviceAccountEmail() {
+  const key = serviceAccount();
+  return key ? key.client_email : null;
+}
+
+let token = { value: null, expiresAt: 0 };
+
+/** An OAuth access token for the service account, cached until near expiry. */
+async function accessToken() {
+  if (token.value && Date.now() < token.expiresAt - 60000) return token.value;
+  const key = serviceAccount();
+  if (!key) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not set.');
+
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const tokenUri = key.token_uri || 'https://oauth2.googleapis.com/token';
+  const unsigned = b64({ alg: 'RS256', typ: 'JWT' }) + '.' +
+    b64({ iss: key.client_email, scope: SCOPE, aud: tokenUri, iat: now, exp: now + 3600 });
+  const signature = crypto.sign('RSA-SHA256', Buffer.from(unsigned), key.private_key).toString('base64url');
+
+  const res = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: `${unsigned}.${signature}`
+    })
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.access_token) {
+    throw new Error('Google refused the service account sign-in: ' +
+      (body.error_description || body.error || `HTTP ${res.status}`));
+  }
+  token = { value: body.access_token, expiresAt: Date.now() + (Number(body.expires_in) || 3600) * 1000 };
+  return token.value;
+}
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * One Sheets API call. Every call this file makes is safe to repeat — reads,
+ * and writes of absolute values to fixed cells — so 429 and 5xx are retried.
+ */
+async function call(method, path, body) {
+  let lastError;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(API + path, {
+        method,
+        headers: {
+          Authorization: 'Bearer ' + (await accessToken()),
+          ...(body ? { 'Content-Type': 'application/json' } : {})
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) return json;
+
+      const message = (json.error && json.error.message) || `HTTP ${res.status}`;
+      if (res.status === 403 || res.status === 404) {
+        throw Object.assign(new Error(
+          `Google Sheets API: ${message}. Share the sheet with ${serviceAccountEmail()} as Editor, ` +
+          'and check SHEET_ID_<GROUP> is the id from the sheet\'s link.'
+        ), { permanent: true });
+      }
+      if (res.status === 401) token = { value: null, expiresAt: 0 };
+      lastError = new Error(`Google Sheets API: ${message}`);
+      if (res.status < 500 && res.status !== 429 && res.status !== 401) throw Object.assign(lastError, { permanent: true });
+    } catch (err) {
+      if (err.permanent) throw err;
+      lastError = err.name === 'AbortError'
+        ? new Error(`Google Sheets API did not answer within ${REQUEST_TIMEOUT_MS / 1000}s`)
+        : err;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt < ATTEMPTS) await sleepMs(500 * attempt * attempt);
+  }
+  throw lastError;
+}
+
+// ---------------------------------------------------------------------------
+// Sheet helpers (mirrors of the Apps Script ones)
+// ---------------------------------------------------------------------------
+
+/** 'Tab name' quoted for A1 notation. */
+function quoteTab(tab) {
+  return `'${String(tab).replace(/'/g, "''")}'`;
+}
+
+/** 1 → A, 27 → AA. */
+function columnLetter(n) {
+  let s = '';
+  for (let x = n; x > 0; x = Math.floor((x - 1) / 26)) s = String.fromCharCode(65 + ((x - 1) % 26)) + s;
+  return s;
+}
+
+function normaliseHeader(h) {
+  return String(h || '').trim().toLowerCase().replace(/[\s._-]+/g, ' ');
+}
+
+/** Canonical header → 0-based column, found by name. -1 when absent. */
+function headerMap(headerRow) {
+  const normalised = (headerRow || []).map(normaliseHeader);
+  const map = {};
+  QUESTION_HEADERS.forEach((canonical) => {
+    let found = -1;
+    for (const alias of HEADER_ALIASES[canonical]) {
+      found = normalised.indexOf(alias);
+      if (found !== -1) break;
+    }
+    map[canonical] = found;
+  });
+  return map;
+}
+
+/** 1-based column to write a header to: where it is, or where it belongs. */
+function colNum(map, header) {
+  const idx = map[header];
+  return (idx === undefined || idx < 0 ? QUESTION_HEADERS.indexOf(header) : idx) + 1;
+}
+
+/** Columns a curator may hold as real date cells rather than text. */
+const DATE_COLUMNS = new Set(['Date', 'Posted At', 'Scheduled For', 'Added At', 'Updated At']);
+
+/** A Sheets date serial (days since 30-12-1899) as dd-MM-yyyy. */
+function serialToDate(serial) {
+  const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(serial) * 86400000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth() + 1)}-${d.getUTCFullYear()}`;
+}
+
+/**
+ * One cell as the Apps Script's cell() returns it. Values are read
+ * unformatted, as getValues() does, and a date cell (which arrives as a
+ * serial number) becomes dd-MM-yyyy — what the Apps Script produced from the
+ * Date object, and what the #Date hashtags are built from.
+ */
+function cell(row, map, header) {
+  const idx = map[header];
+  if (idx === undefined || idx < 0 || idx >= row.length) return '';
+  const v = row[idx];
+  if (typeof v === 'number' && DATE_COLUMNS.has(header) && v > 20000 && v < 80000) return serialToDate(v);
+  return String(v === null || v === undefined ? '' : v).trim();
+}
+
+const isPostedValue = (v) => /^\s*yes\b/i.test(String(v == null ? '' : v));
+const isClaimedValue = (v) => /^\s*(sending|check)\b/i.test(String(v == null ? '' : v));
+const isHeldValue = (v) => /^\s*check\b/i.test(String(v == null ? '' : v));
+
+function normaliseChoice(value, allowed, fallback) {
+  const v = String(value || '').trim().toLowerCase();
+  return allowed.find((a) => a.toLowerCase() === v) || fallback;
+}
+
+const claimedAtFrom = (v) => {
+  const parts = String(v == null ? '' : v).split('|');
+  return parts.length > 1 ? parts[1].trim() : '';
+};
+const claimedStatusFrom = (v) => {
+  const parts = String(v == null ? '' : v).split('|');
+  return normaliseChoice(parts.length > 2 ? parts[2].trim() : '', STATUS_VALUES, 'Approved');
+};
+
+/** "18-09-2026, 03:16:05 PM IST" — the exact stamp istNow() writes. */
+function istNow(date = new Date()) {
+  const d = new Date(date.getTime() + IST_OFFSET_MS);
+  const pad = (n) => String(n).padStart(2, '0');
+  const h24 = d.getUTCHours();
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+  return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth() + 1)}-${d.getUTCFullYear()}, ` +
+    `${pad(h12)}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} ${h24 < 12 ? 'AM' : 'PM'} IST`;
+}
+
+/** Reads an istNow() stamp back as a Date. Mirrors parseIstDate. */
+function parseIstDate(value) {
+  const m = String(value || '').trim()
+    .match(/^(\d{2})-(\d{2})-(\d{4})(?:,\s*(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM))?/i);
+  if (!m) return null;
+  let hour = m[4] ? parseInt(m[4], 10) : 23;
+  const minute = m[5] ? parseInt(m[5], 10) : 59;
+  const second = m[6] ? parseInt(m[6], 10) : 59;
+  if (m[7]) {
+    const mer = m[7].toUpperCase();
+    if (mer === 'PM' && hour < 12) hour += 12;
+    if (mer === 'AM' && hour === 12) hour = 0;
+  }
+  return new Date(Date.UTC(+m[3], +m[2] - 1, +m[1], hour, minute, second) - IST_OFFSET_MS);
+}
+
+function rowToQuestion(row, map, subject, dataIndex) {
+  const c = (h) => cell(row, map, h);
+  return {
+    s_no: c('S.No') || (dataIndex + 1),
+    question_id: c('Question ID'),
+    date: c('Date'),
+    newspaper: c('Newspaper'),
+    subject: c('Subject') || subject,
+    topic: c('Topic'),
+    question_text: c('Question'),
+    option_a: c('Option A'),
+    option_b: c('Option B'),
+    option_c: c('Option C'),
+    option_d: c('Option D'),
+    correct_answer: c('Correct Answer').toUpperCase() || 'A',
+    explanation: c('Explanation'),
+    difficulty: c('Difficulty') || 'Medium',
+    tags: c('Tags'),
+    source_url: c('Source URL'),
+    status: c('Status') || 'Draft',
+    posted: isPostedValue(c('Posted')) ? 'YES' : 'NO',
+    claimed: isClaimedValue(c('Posted')),
+    held: isHeldValue(c('Posted')),
+    posted_raw: c('Posted'),
+    posted_at: c('Posted At'),
+    scheduled_for: c('Scheduled For'),
+    thread_id: c('Thread ID'),
+    telegram_msg_id: c('Telegram Msg ID'),
+    poll_id: c('Poll ID'),
+    times_posted: Number(c('Times Posted')) || 0,
+    added_at: c('Added At'),
+    added_by: c('Added By'),
+    updated_at: c('Updated At'),
+    updated_by: c('Updated By'),
+    dup_hash: c('Dup Hash'),
+    review_notes: c('Review Notes'),
+    row_index: dataIndex,
+    excel_row: dataIndex + 2
+  };
+}
+
+/** Reads one tab: its header map and every data row. */
+async function readTab(ctx, tab) {
+  const range = encodeURIComponent(`${quoteTab(tab)}!A1:AZ`);
+  let body;
+  try {
+    body = await call('GET', `/${ctx.spreadsheetId}/values/${range}` +
+      '?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=SERIAL_NUMBER');
+  } catch (err) {
+    if (/Unable to parse range/i.test(err.message)) throw new Error(`Sheet tab "${tab}" not found.`);
+    throw err;
+  }
+  const values = body.values || [];
+  return { map: headerMap(values[0] || []), rows: values.slice(1) };
+}
+
+/** Writes single cells. `cells` is [{ tab, row, col, value }], 1-based. */
+async function writeCells(ctx, cells) {
+  if (!cells.length) return;
+  await call('POST', `/${ctx.spreadsheetId}/values:batchUpdate`, {
+    // RAW: stored exactly as given, so "SENDING | …" or a leading "=" is never
+    // interpreted.
+    valueInputOption: 'RAW',
+    data: cells.map((c) => ({
+      range: `${quoteTab(c.tab)}!${columnLetter(c.col)}${c.row}`,
+      values: [[c.value]]
+    }))
+  });
+}
+
+/** Valid, de-duplicated data row numbers for a tab of `rowCount` data rows. */
+function validRows(rowNumbers, rowCount) {
+  const seen = new Set();
+  const out = [];
+  for (const r of rowNumbers || []) {
+    const n = Number(r);
+    if (!Number.isInteger(n) || n < 2 || n > rowCount + 1 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The posting path
+// ---------------------------------------------------------------------------
+
+async function readConfig(ctx) {
+  const range = encodeURIComponent(`${quoteTab('Config')}!A2:F`);
+  const body = await call('GET', `/${ctx.spreadsheetId}/values/${range}?valueRenderOption=UNFORMATTED_VALUE`);
+  return (body.values || [])
+    .map((row) => ({
+      subject: String(row[0] || '').trim(),
+      emoji: String(row[1] || '').trim(),
+      topic_thread_id: Number(row[2]) || null,
+      schedule_cron: String(row[3] || '').trim(),
+      questions_per_batch: Number(row[4]) || 5,
+      active: String(row[5] || '').trim().toUpperCase() === 'YES'
+    }))
+    .filter((item) => item.subject.length > 0);
+}
+
+async function getUnpostedQuestions(ctx, subject, count = 1, requireApproved = true) {
+  const limit = Math.min(Math.max(Number(count) || 1, 1), 100);
+  const { map, rows } = await readTab(ctx, subject);
+  const out = [];
+  for (let i = 0; i < rows.length && out.length < limit; i++) {
+    const q = rowToQuestion(rows[i], map, subject, i);
+    if (!q.question_text) continue;
+    if (q.posted === 'YES' || q.claimed) continue;
+    if (q.status === 'Rejected' || q.status === 'Archived') continue;
+    if (requireApproved && q.status !== 'Approved' && q.status !== 'Scheduled') continue;
+    out.push(q);
+  }
+  return out;
+}
+
+/**
+ * Reserves rows before anything is sent. The Apps Script did this under a
+ * script lock; the API has none, so each claim carries a run token and is read
+ * back — a row whose marker is not ours was taken by a run that wrote after
+ * us, and is reported skipped instead of being sent twice.
+ */
+async function claimQuestions(ctx, subject, rowNumbers) {
+  const { map, rows } = await readTab(ctx, subject);
+  const postedCol = colNum(map, 'Posted');
+  const statusCol = colNum(map, 'Status');
+  const now = istNow();
+  const run = crypto.randomBytes(4).toString('hex');
+  const skipped = [];
+  const wanted = [];
+  const cells = [];
+
+  for (const r of rowNumbers || []) {
+    const n = Number(r);
+    if (!Number.isInteger(n) || n < 2 || n > rows.length + 1) skipped.push({ row: r, reason: 'no such row' });
+  }
+  for (const n of validRows(rowNumbers, rows.length)) {
+    const row = rows[n - 2];
+    const current = row[postedCol - 1];
+    if (isPostedValue(current)) { skipped.push({ row: n, reason: 'already posted' }); continue; }
+    if (isClaimedValue(current)) { skipped.push({ row: n, reason: 'already sending' }); continue; }
+    let previous = normaliseChoice(row[statusCol - 1], STATUS_VALUES, 'Approved');
+    if (previous === 'Sending' || previous === 'Posted') previous = 'Approved';
+    wanted.push(n);
+    cells.push({ tab: subject, row: n, col: postedCol, value: `SENDING | ${now} | ${previous} | ${run}` });
+    cells.push({ tab: subject, row: n, col: statusCol, value: 'Sending' });
+  }
+  await writeCells(ctx, cells);
+
+  const claimed = [];
+  if (wanted.length) {
+    const after = await readTab(ctx, subject);
+    for (const n of wanted) {
+      const value = String((after.rows[n - 2] || [])[postedCol - 1] || '');
+      if (value.includes(`| ${run}`)) claimed.push(n);
+      else skipped.push({ row: n, reason: 'already sending' });
+    }
+  }
+  return { claimed, skipped };
+}
+
+async function releaseQuestions(ctx, subject, rowNumbers, status) {
+  const { map, rows } = await readTab(ctx, subject);
+  const postedCol = colNum(map, 'Posted');
+  const statusCol = colNum(map, 'Status');
+  const restore = normaliseChoice(status || 'Approved', STATUS_VALUES, 'Approved');
+  const cells = [];
+  let released = 0;
+  for (const n of validRows(rowNumbers, rows.length)) {
+    // Never clear a row that reached Posted in the meantime.
+    if (!isClaimedValue(rows[n - 2][postedCol - 1])) continue;
+    cells.push({ tab: subject, row: n, col: postedCol, value: 'NO' });
+    cells.push({ tab: subject, row: n, col: statusCol, value: restore });
+    released++;
+  }
+  await writeCells(ctx, cells);
+  return released;
+}
+
+async function markAsPosted(ctx, subject, rowIndices, messageId = null, threadId = null, pollIds = null) {
+  if (!rowIndices || !rowIndices.length) return 0;
+  const { map, rows } = await readTab(ctx, subject);
+  const now = istNow();
+  const cells = [];
+  let updated = 0;
+  for (const n of validRows(rowIndices, rows.length)) {
+    const prior = Number(cell(rows[n - 2], map, 'Times Posted')) || 0;
+    const set = (header, value) => cells.push({ tab: subject, row: n, col: colNum(map, header), value });
+    set('Posted', 'YES');
+    set('Posted At', now);
+    set('Status', 'Posted');
+    set('Times Posted', prior + 1);
+    if (threadId) set('Thread ID', Number(threadId) || String(threadId));
+    if (messageId) set('Telegram Msg ID', Number(messageId) || String(messageId));
+    if (pollIds && pollIds[String(n)]) set('Poll ID', String(pollIds[String(n)]));
+    updated++;
+  }
+  await writeCells(ctx, cells);
+  if (!updated) {
+    throw new Error(
+      `The sheet marked none of row(s) ${rowIndices.join(', ')} in "${subject}" as posted — ` +
+      'the row numbers may no longer exist in that tab.'
+    );
+  }
+  return updated;
+}
+
+async function holdQuestions(ctx, subject, rowNumbers, note) {
+  if (!rowNumbers || !rowNumbers.length) return 0;
+  const { map, rows } = await readTab(ctx, subject);
+  const now = istNow();
+  const cells = [];
+  let held = 0;
+  for (const n of validRows(rowNumbers, rows.length)) {
+    const row = rows[n - 2];
+    if (isPostedValue(row[colNum(map, 'Posted') - 1])) continue;
+    cells.push({ tab: subject, row: n, col: colNum(map, 'Posted'), value: `CHECK | ${now}` });
+    cells.push({ tab: subject, row: n, col: colNum(map, 'Status'), value: 'Sending' });
+    if (note) {
+      const existing = cell(row, map, 'Review Notes');
+      const line = `[${now}] ${note}`;
+      cells.push({ tab: subject, row: n, col: colNum(map, 'Review Notes'), value: existing ? `${existing}\n${line}` : line });
+    }
+    held++;
+  }
+  await writeCells(ctx, cells);
+  return held;
+}
+
+async function recoverStaleClaims(ctx, subject, minutes) {
+  const olderThan = Math.max(1, Number(minutes) || 15);
+  const { map, rows } = await readTab(ctx, subject);
+  const postedCol = colNum(map, 'Posted');
+  const cutoff = Date.now() - olderThan * 60 * 1000;
+  const recovered = [];
+  const cells = [];
+  let held = 0;
+  rows.forEach((row, i) => {
+    const value = row[postedCol - 1];
+    if (!isClaimedValue(value)) return;
+    if (isHeldValue(value)) { held++; return; }
+    const claimedAt = parseIstDate(claimedAtFrom(value));
+    if (claimedAt && claimedAt.getTime() > cutoff) return;
+    const n = i + 2;
+    const restore = claimedStatusFrom(value);
+    cells.push({ tab: subject, row: n, col: postedCol, value: 'NO' });
+    cells.push({ tab: subject, row: n, col: colNum(map, 'Status'), value: restore });
+    recovered.push({ row: n, question_id: cell(row, map, 'Question ID'), status: restore, claimed_at: claimedAtFrom(value) });
+  });
+  await writeCells(ctx, cells);
+  return { recovered, held };
+}
+
+async function listPosted(ctx, subject) {
+  const { map, rows } = await readTab(ctx, subject);
+  const out = [];
+  rows.forEach((row, i) => {
+    const q = rowToQuestion(row, map, subject, i);
+    if (!q.question_text || q.posted !== 'YES' || !q.telegram_msg_id) return;
+    out.push({ row: q.excel_row, question_id: q.question_id, message_id: q.telegram_msg_id, status: q.status });
+  });
+  return out;
+}
+
+async function unpostQuestions(ctx, subject, rowNumbers, status) {
+  if (!rowNumbers || !rowNumbers.length) return 0;
+  const { map, rows } = await readTab(ctx, subject);
+  const restore = normaliseChoice(status || 'Approved', STATUS_VALUES, 'Approved');
+  const cells = [];
+  const targets = validRows(rowNumbers, rows.length);
+  for (const n of targets) {
+    const set = (header, value) => cells.push({ tab: subject, row: n, col: colNum(map, header), value });
+    set('Posted', 'NO');
+    set('Status', restore);
+    set('Posted At', '');
+    set('Telegram Msg ID', '');
+    set('Poll ID', '');
+  }
+  await writeCells(ctx, cells);
+  return targets.length;
+}
+
+/** The operations served directly when a group is set up for it. */
+const DIRECT = {
+  readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions
+};
+
+/** Operations that change the sheet (they clear the Apps Script read cache). */
+const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
+  'recoverStaleClaims', 'unpostQuestions']);
+
+module.exports = {
+  DIRECT,
+  WRITES,
+  isConfigured,
+  serviceAccountEmail,
+  // Exposed for tests.
+  _internal: { istNow, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
+};

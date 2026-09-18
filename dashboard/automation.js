@@ -376,6 +376,11 @@ async function postNow() {
             'muted');
         }
         log('postLog', result.message, result.failedCount ? 'fail' : (result.postedCount ? 'ok' : 'muted'));
+        if (result.sheetAccess) {
+          log('postLog', result.sheetAccess === 'sheets-api'
+            ? 'Sheet reached directly through the Google Sheets API.'
+            : 'Sheet reached through its Apps Script (slower).', 'muted');
+        }
       }
     });
   } catch (err) {

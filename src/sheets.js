@@ -29,6 +29,7 @@ const RETRY_BASE_DELAY_MS = Number(process.env.SHEET_RETRY_DELAY_MS) >= 0 && pro
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 const groups = require('./groups');
+const direct = require('./sheets-direct');
 
 /** Every operation a sheets client exposes. */
 /**
@@ -109,7 +110,8 @@ function contextFor(groupId) {
     groupId: group.id,
     label: group.displayName,
     url: validateWebAppUrl(group.sheetUrl, group.displayName),
-    token: group.sheetToken
+    token: group.sheetToken,
+    spreadsheetId: group.sheetId || null
   };
 }
 
@@ -124,12 +126,28 @@ function contextFor(groupId) {
  */
 function forGroup(groupId) {
   const ctx = contextFor(groupId);
+  // With a sheet id and a service account, the posting path talks to the
+  // Sheets API directly: under a second a call instead of 3–35s, and none of
+  // the Web App's intermittent 404s. Everything else stays on the Apps Script.
+  const useDirect = Boolean(ctx.spreadsheetId) && direct.isConfigured();
   const bound = {};
   API_NAMES.forEach((name) => {
-    bound[name] = (...args) => module.exports[`_${name}`](ctx, ...args);
+    if (useDirect && direct.DIRECT[name]) {
+      bound[name] = async (...args) => {
+        try {
+          return await direct.DIRECT[name](ctx, ...args);
+        } finally {
+          // Dashboard reads cached from the Apps Script must not outlive a write.
+          if (direct.WRITES.has(name)) invalidateReads(ctx);
+        }
+      };
+    } else {
+      bound[name] = (...args) => module.exports[`_${name}`](ctx, ...args);
+    }
   });
   bound.groupId = ctx.groupId;
   bound.label = ctx.label;
+  bound.direct = useDirect;
   return bound;
 }
 
