@@ -13,9 +13,9 @@
 //
 //   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions,
 //   markAsPosted, holdQuestions, recoverStaleClaims, listPosted,
-//   unpostQuestions
+//   unpostQuestions, and addQuestions (the dashboard's "Send to Sheet")
 //
-// Everything else (uploads, analytics, members, support) still goes through
+// Everything else (analytics, members, support) still goes through
 // the Apps Script, unchanged.
 //
 // Setup: GOOGLE_SERVICE_ACCOUNT_JSON holds the service account key (the JSON
@@ -585,15 +585,223 @@ async function unpostQuestions(ctx, subject, rowNumbers, status) {
   return targets.length;
 }
 
+// ---------------------------------------------------------------------------
+// Adding questions
+// ---------------------------------------------------------------------------
+
+/** Characters the duplicate check ignores. Mirrors COSMETIC_CHARS. */
+const COSMETIC_CHARS = /[\s!-\/:-@\[-`{-~ «»।॥‐-⁞　-〿！-／：-＠]+/g;
+const LEGACY_HASH_MIN_CHARS = 24;
+const DIFFICULTY_VALUES = ['Easy', 'Medium', 'Hard'];
+
+/** First 8 bytes of a SHA-256 as hex — the shape of every Dup Hash. */
+const shortDigest = (text) => crypto.createHash('sha256').update(String(text), 'utf8').digest('hex').slice(0, 16);
+
+function hashQuestion(text) {
+  let normalised = String(text || '').toLowerCase().replace(COSMETIC_CHARS, '').substring(0, 4000);
+  if (!normalised) normalised = String(text || '').toLowerCase().substring(0, 4000);
+  return shortDigest(normalised);
+}
+
+function legacyHashQuestion(text) {
+  const normalised = String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '').substring(0, 4000);
+  return normalised.length < LEGACY_HASH_MIN_CHARS ? '' : shortDigest(normalised);
+}
+
+/** The three-letter code in a Question ID. Mirrors subjectCode's fallback. */
+function subjectCode(subject, rows, map) {
+  // The Apps Script can take codes from a SUBJECTS_JSON property this side
+  // cannot read, so the tab's own ids win: new ones then match the old.
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const m = cell(rows[i], map, 'Question ID').match(/^([A-Z]{1,6})-\d{8}-\d+$/);
+    if (m) return m[1];
+  }
+  return String(subject || 'GEN').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 3) || 'GEN';
+}
+
+/** yyyyMMdd in IST. */
+function istStamp(date = new Date()) {
+  return new Date(date.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+/** Creates a missing subject tab with the canonical header row. */
+async function createTab(ctx, tab) {
+  await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
+    requests: [{ addSheet: { properties: { title: tab, gridProperties: { frozenRowCount: 1 } } } }]
+  });
+  await call('PUT', `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}?valueInputOption=RAW`,
+    { values: [QUESTION_HEADERS] });
+}
+
+/**
+ * Adds a batch of questions — what the Apps Script's appendQuestionsToSheet
+ * does, row for row: same Question IDs, same Dup Hash, same duplicate rules.
+ * Rows are appended with values:append, so two uploads at once never write
+ * over each other; ids are checked afterwards and any collision is re-issued.
+ */
+async function addQuestions(ctx, subject, questions, addedBy, skipDuplicates = true) {
+  let tab;
+  try {
+    tab = await readTab(ctx, subject);
+  } catch (err) {
+    if (!/not found/.test(err.message)) throw err;
+    await createTab(ctx, subject);
+    tab = { map: headerMap(QUESTION_HEADERS), rows: [] };
+  }
+  const { map, rows } = tab;
+  // A tab laid out without the canonical columns needs the Apps Script's
+  // migration first; writing blind would put values in the wrong columns.
+  const missing = ['Question', 'Question ID', 'Dup Hash', 'Status', 'Posted'].filter((h) => map[h] < 0);
+  if (missing.length) {
+    throw Object.assign(new Error(`The "${subject}" tab has no ${missing.join(', ')} column.`), { needsAppsScript: true });
+  }
+
+  const broken = shortDigest('');
+  const existingHashes = new Set();
+  const existingIds = new Set();
+  const repairs = [];
+  rows.forEach((row, i) => {
+    let h = cell(row, map, 'Dup Hash');
+    if (h === broken) {
+      // Written while non-Latin text hashed to nothing — recompute, as the Apps Script does.
+      const text = cell(row, map, 'Question');
+      if (text) {
+        h = hashQuestion(text);
+        repairs.push({ tab: subject, row: i + 2, col: colNum(map, 'Dup Hash'), value: h });
+      }
+    }
+    if (h) existingHashes.add(h);
+    // Stored hashes were made by whichever script version wrote the row, and
+    // not all of them can be reproduced here. Hashing the question text itself
+    // catches a repeat regardless of how its stored hash was made.
+    const text = cell(row, map, 'Question');
+    if (text) existingHashes.add(hashQuestion(text));
+    const id = cell(row, map, 'Question ID');
+    if (id) existingIds.add(id);
+  });
+  const isKnown = (text) => existingHashes.has(hashQuestion(text)) ||
+    Boolean(legacyHashQuestion(text) && existingHashes.has(legacyHashQuestion(text)));
+
+  const lastSNo = rows.length ? Number(cell(rows[rows.length - 1], map, 'S.No')) : 0;
+  let nextSNo = (lastSNo || rows.length) + 1;
+  const now = istNow();
+  const uploader = String(addedBy || 'Dashboard User').trim();
+  const code = subjectCode(subject, rows, map);
+  const stamp = istStamp();
+  const width = Math.max(QUESTION_HEADERS.length, ...Object.values(map).map((i) => i + 1));
+
+  const out = [];
+  const ids = [];
+  const skipped = [];
+  const seen = new Set();
+  const makeId = (n) => `${code}-${stamp}-${String(n).padStart(4, '0')}`;
+
+  for (const q of questions || []) {
+    const text = String((q && (q.question || q.question_text)) || '').trim();
+    if (!text) continue;
+    const hash = hashQuestion(text);
+    if (skipDuplicates && (seen.has(hash) || isKnown(text))) {
+      skipped.push({ question: text.substring(0, 90), reason: 'duplicate' });
+      continue;
+    }
+    seen.add(hash);
+
+    let sNo = nextSNo;
+    while (existingIds.has(makeId(sNo))) sNo++;
+    const id = makeId(sNo);
+    existingIds.add(id);
+    ids.push(id);
+    nextSNo = sNo + 1;
+
+    const row = new Array(width).fill('');
+    const put = (h, v) => { row[colNum(map, h) - 1] = v; };
+    const s = (v) => String(v || '').trim();
+    put('S.No', sNo);
+    put('Question ID', id);
+    put('Date', s(q.date));
+    put('Newspaper', s(q.newspaper));
+    put('Subject', subject);
+    put('Topic', s(q.topic));
+    put('Question', text);
+    put('Option A', s(q.option_a));
+    put('Option B', s(q.option_b));
+    put('Option C', s(q.option_c));
+    put('Option D', s(q.option_d));
+    put('Correct Answer', (s(q.correct_answer) || 'A').toUpperCase());
+    put('Explanation', s(q.explanation));
+    put('Difficulty', normaliseChoice(q.difficulty, DIFFICULTY_VALUES, 'Medium'));
+    put('Tags', s(q.tags));
+    put('Source URL', s(q.source_url || q.sourceUrl));
+    put('Status', normaliseChoice(q.status, STATUS_VALUES, 'Approved'));
+    put('Posted', 'NO');
+    put('Scheduled For', s(q.scheduled_for));
+    put('Times Posted', 0);
+    put('Added At', now);
+    put('Added By', uploader);
+    put('Updated At', now);
+    put('Updated By', uploader);
+    put('Dup Hash', hash);
+    put('Review Notes', s(q.review_notes));
+    out.push(row);
+  }
+
+  await writeCells(ctx, repairs);
+  if (out.length) {
+    const range = encodeURIComponent(`${quoteTab(subject)}!A1`);
+    // RAW: a question starting with "=" is stored as text, never run as a formula.
+    const appended = await call('POST', `/${ctx.spreadsheetId}/values/${range}:append` +
+      '?valueInputOption=RAW&insertDataOption=INSERT_ROWS', { values: out });
+    const firstRow = Number(((appended.updates || {}).updatedRange || '').match(/![A-Z]+(\d+)/)?.[1]);
+    if (firstRow) await reissueCollidingIds(ctx, subject, firstRow, out.length, code, stamp, ids);
+  }
+
+  return {
+    addedCount: out.length,
+    skippedCount: skipped.length,
+    skipped,
+    ids,
+    message: `${out.length} question(s) added to "${subject}"` + (skipped.length ? `, ${skipped.length} duplicate(s) skipped` : '')
+  };
+}
+
+/**
+ * Another upload running at the same moment read the same last S.No and may
+ * have issued the same ids. Every edit and delete finds a question by its id,
+ * so a repeat must not stand: ours step past anything already taken.
+ */
+async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, ids) {
+  const { map, rows } = await readTab(ctx, subject);
+  const idIdx = map['Question ID'];
+  const ours = new Set();
+  for (let r = firstRow; r < firstRow + count; r++) ours.add(r);
+  const taken = new Set();
+  rows.forEach((row, i) => { if (!ours.has(i + 2)) taken.add(String(row[idIdx] || '').trim()); });
+  if (!ids.some((id) => taken.has(id))) return;
+
+  const used = new Set([...taken, ...ids]);
+  let n = Math.max(...[...used].map((id) => Number(String(id).split('-')[2]) || 0)) + 1;
+  const cells = [];
+  for (let r = firstRow; r < firstRow + count; r++) {
+    const k = r - firstRow;
+    if (!taken.has(ids[k])) continue;
+    while (used.has(`${code}-${stamp}-${String(n).padStart(4, '0')}`)) n++;
+    ids[k] = `${code}-${stamp}-${String(n).padStart(4, '0')}`;
+    used.add(ids[k]);
+    cells.push({ tab: subject, row: r, col: idIdx + 1, value: ids[k] });
+    cells.push({ tab: subject, row: r, col: colNum(map, 'S.No'), value: n });
+  }
+  await writeCells(ctx, cells);
+}
+
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
-  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
-  'recoverStaleClaims', 'unpostQuestions']);
+  'recoverStaleClaims', 'unpostQuestions', 'addQuestions']);
 
 module.exports = {
   DIRECT,
@@ -601,5 +809,5 @@ module.exports = {
   isConfigured,
   serviceAccountEmail,
   // Exposed for tests.
-  _internal: { istNow, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
+  _internal: { istNow, hashQuestion, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
 };
