@@ -493,6 +493,44 @@ async function reconcileChannel() {
 }
 
 /**
+ * repairFormatting — puts every subject tab back to the standard layout.
+ *
+ * Rows appended through the Sheets API inherit the formatting of the row above
+ * them, and the row above the first upload is the header. Tabs filled before
+ * that was fixed are bold white on navy top to bottom; this is the way back
+ * without anyone editing a sheet by hand.
+ */
+async function repairFormatting() {
+  const button = $('formatBtn');
+
+  clearLog('formatLog');
+  button.disabled = true;
+  button.textContent = 'Repairing…';
+
+  try {
+    log('formatLog', 'Putting every subject tab back to the standard layout…');
+    log('formatLog', 'Formatting only — no question is read, changed or moved.', 'muted');
+
+    const result = await api('/api/questions/format', {
+      method: 'POST', body: { allSubjects: true }
+    });
+
+    (result.results || []).forEach((r) => log('formatLog',
+      r.ok ? `✅ ${r.subject} — ${r.rows} row(s) restyled` : `⚠️ ${r.subject} — ${r.error}`,
+      r.ok ? 'ok' : 'fail'));
+
+    log('formatLog', result.message, result.formattedCount ? 'ok' : 'fail');
+    showToast(result.formattedCount ? 'success' : 'error', result.message);
+  } catch (err) {
+    log('formatLog', 'Failed: ' + err.message, 'fail');
+    showToast('error', err.message, 9000);
+  } finally {
+    button.disabled = false;
+    button.textContent = '🎨 Repair sheet formatting';
+  }
+}
+
+/**
  * reportQueueChange — turns a queue write's answer into lines a curator can act on.
  *
  * This used to print "📅 <id> → Scheduled" for every id it had SENT, then the
@@ -851,6 +889,7 @@ initDashboard({
       if (posting) { e.preventDefault(); e.returnValue = ''; }
     });
     $('reconcileBtn').addEventListener('click', reconcileChannel);
+    $('formatBtn').addEventListener('click', repairFormatting);
     $('scheduleBtn').addEventListener('click', queueForLater);
     $('unqueueBtn').addEventListener('click', unqueue);
     $('autoStartBtn').addEventListener('click', startAutopilot);

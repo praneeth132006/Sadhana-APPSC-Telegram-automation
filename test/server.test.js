@@ -57,6 +57,11 @@ process.env.HOST = '127.0.0.1';
 // Stubs
 // ---------------------------------------------------------------------------
 
+// The suite makes more requests in a minute than one curator's browser ever
+// would, and a 429 halfway through says nothing about the route under test.
+// The limiter has its own test below, which does not rely on this.
+process.env.RATE_LIMIT_MAX = '100000';
+
 const auth = require('../src/auth');
 const sheets = require('../src/sheets');
 const telegram = require('../src/telegram');
@@ -101,6 +106,7 @@ stub(sheets, 'recoverStaleClaims', { recovered: [], held: 0 });
 stub(sheets, 'holdQuestions', 1);
 stub(sheets, 'listPosted', []);
 stub(sheets, 'unpostQuestions', 0);
+stub(sheets, 'formatQuestions', (subject) => ({ subject, rows: 12 }));
 
 // Telegram: pretend the bot is healthy and every send succeeds.
 telegram.init = () => {};
@@ -306,6 +312,7 @@ test('every data route refuses an unauthenticated caller', async () => {
     ['POST', '/api/questions'], ['POST', '/api/questions/update'],
     ['POST', '/api/questions/delete'], ['POST', '/api/questions/status'],
     ['POST', '/api/questions/schedule'], ['POST', '/api/questions/unschedule'],
+    ['POST', '/api/questions/format'],
     ['POST', '/api/telegram/post'], ['POST', '/api/telegram/reconcile'],
     ['GET', '/api/automation/autopilot'], ['POST', '/api/automation/autopilot'],
     ['POST', '/api/automation/autopilot/stop'],
@@ -2381,6 +2388,12 @@ test('GET /api/support/stats returns the sheet\'s analysis for the chosen period
 // ---- Rate limiting ----------------------------------------------------------
 
 test('signed webhooks are never rate limited, so a busy minute cannot drop a payment', async () => {
+  // Back to a real ceiling: with the suite-wide limit in force, 260 requests
+  // would prove nothing about whether the exemption is there.
+  const limit = process.env.RATE_LIMIT_MAX;
+  process.env.RATE_LIMIT_MAX = '240';
+  test.after(() => { process.env.RATE_LIMIT_MAX = limit; });
+
   const statuses = new Set();
   const body = JSON.stringify({ event: 'noop' });
   const requests = [];
@@ -2392,6 +2405,36 @@ test('signed webhooks are never rate limited, so a busy minute cannot drop a pay
   await Promise.all(requests);
   assert.ok(!statuses.has(429), 'the payment webhook was rate limited');
   assert.ok(statuses.has(401));
+});
+
+test('the scheduled routes are never rate limited, so a run is never silently skipped', async () => {
+  // A 429 to Vercel Cron is not a retry — that run simply does not happen, and
+  // nothing says why. Each of these is refused without CRON_SECRET anyway, so
+  // the limiter is not what is protecting them.
+  const original = process.env.CRON_SECRET;
+  const limit = process.env.RATE_LIMIT_MAX;
+  process.env.CRON_SECRET = 'cron-secret';
+  process.env.RATE_LIMIT_MAX = '240';
+  const statuses = new Set();
+
+  try {
+    const requests = [];
+    for (const route of ['/api/cron/sweep', '/api/cron/autopilot', '/api/cron/reconcile']) {
+      for (let i = 0; i < 120; i++) {
+        requests.push(fetch(baseUrl + route, {
+          method: 'POST', headers: { Authorization: 'Bearer wrong' }
+        }).then((r) => statuses.add(r.status)));
+      }
+    }
+    await Promise.all(requests);
+
+    assert.ok(!statuses.has(429), 'a scheduled route was rate limited');
+    assert.ok(statuses.has(401), 'and the wrong secret is still refused');
+  } finally {
+    process.env.RATE_LIMIT_MAX = limit;
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
+  }
 });
 
 test('behind Vercel the client address comes from the platform headers, elsewhere from the socket', () => {
@@ -2726,5 +2769,81 @@ test('a partial deleted-poll sweep says how much is left rather than implying it
   } finally {
     clientStubs.listPosted = originalPosted;
     telegram.pollStillExists = originalExists;
+  }
+});
+
+// ===========================================================================
+// Repairing a tab's formatting
+// ===========================================================================
+// Rows appended through the Sheets API inherit the formatting of the row above
+// them, and the row above the first upload is the header. Sheets filled before
+// that was fixed are bold white on navy from top to bottom.
+
+test('repairing formatting covers every subject in the group', async () => {
+  calls.length = 0;
+  const res = await authed('/api/questions/format', {
+    method: 'POST', body: { allSubjects: true }
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.formattedCount, 1, 'the stubbed Config tab holds one subject');
+  assert.deepEqual(res.json.results, [{ subject: 'Polity', ok: true, rows: 12 }]);
+  assert.equal(calls.filter((c) => c.name === 'formatQuestions').length, 1);
+});
+
+test('repairing one subject validates it like every other route', async () => {
+  const ok = await authed('/api/questions/format', {
+    method: 'POST', body: { subject: 'Polity' }
+  });
+  assert.equal(ok.json.formattedCount, 1);
+
+  const bad = await authed('/api/questions/format', {
+    method: 'POST', body: { subject: '../../etc/passwd' }
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.json.success, false);
+});
+
+test('one tab that cannot be repaired does not abandon the others', async () => {
+  // A curator asking for the whole group wants every tab it could reach fixed,
+  // not the run stopped at the first missing one.
+  const originalConfig = clientStubs.readConfig;
+  const originalFormat = clientStubs.formatQuestions;
+  clientStubs.readConfig = async () => ([
+    { subject: 'Polity' }, { subject: 'History' }, { subject: 'Geography' }
+  ]);
+  clientStubs.formatQuestions = async (subject) => {
+    if (subject === 'History') throw new Error('Sheet tab "History" not found.\nSecond line');
+    return { subject, rows: 4 };
+  };
+
+  try {
+    const res = await authed('/api/questions/format', {
+      method: 'POST', body: { allSubjects: true }
+    });
+
+    assert.equal(res.status, 200, 'one missing tab must not fail the whole request');
+    assert.equal(res.json.formattedCount, 2);
+    const failed = res.json.results.find((r) => !r.ok);
+    assert.equal(failed.subject, 'History');
+    assert.equal(failed.error, 'Sheet tab "History" not found.', 'only the first line reaches the browser');
+    assert.match(res.json.message, /2 of 3/);
+  } finally {
+    clientStubs.readConfig = originalConfig;
+    clientStubs.formatQuestions = originalFormat;
+  }
+});
+
+test('repairing a group with no configured subjects says so', async () => {
+  const original = clientStubs.readConfig;
+  clientStubs.readConfig = async () => [];
+  try {
+    const res = await authed('/api/questions/format', {
+      method: 'POST', body: { allSubjects: true }
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.json.error, /No subjects are configured/);
+  } finally {
+    clientStubs.readConfig = original;
   }
 });

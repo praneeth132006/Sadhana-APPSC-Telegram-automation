@@ -241,6 +241,22 @@ ever.
 
 ---
 
+## Sheet formatting
+
+Rows appended through the Sheets API inherit the formatting of the row above them —
+the same thing inserting a row in the UI does. The row above the first upload is the
+header, so a tab filled this way came out bold white on `#1a237e` from top to bottom,
+one upload inheriting from the last.
+
+Appended rows are now put back to the body style straight after the append, and a tab
+this client creates is styled as it is created. **🎨 Repair sheet formatting** on the
+Automation page is the way back for a tab that is already navy: it restores the header
+style, column widths, frozen panes, row height, the dropdowns and the colour coding
+for `Status`, `Posted` and `Difficulty`, across every subject in the group. It changes
+formatting only — not one question is read, moved or altered.
+
+---
+
 ## Queueing, and taking it back
 
 **Queue for Later** sets `Status = Scheduled` and fills `Scheduled For`, so the next

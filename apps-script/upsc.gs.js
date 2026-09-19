@@ -10,7 +10,7 @@
 // Group id : upsc
 // Subjects : 12
 //            Ancient India, Medieval India, Modern India, Physical Geography, Indian Geography, Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Art and Culture
-// Built    : 2026-09-20T11:50:24.227Z
+// Built    : 2026-09-20T12:04:26.755Z
 // ==========================================================================
 
 // ============================================================================
@@ -537,7 +537,7 @@ function doGet(e) {
  * doPost — mutating API surface.
  * Actions: addQuestions, markPosted, updateConfig, updateQuestion,
  *          deleteQuestion, bulkDelete, bulkStatus, scheduleQuestions,
- *          unscheduleQuestions,
+ *          unscheduleQuestions, formatQuestions,
  *          claimQuestions, releaseQuestions, unpostQuestions.
  */
 function doPost(e) {
@@ -803,6 +803,17 @@ function doPost(e) {
       return jsonResponse({
         success: true, updatedCount: scheduled.updatedCount,
         notFound: scheduled.notFound, skipped: scheduled.skipped
+      });
+    }
+
+    if (action === 'formatQuestions') {
+      if (!payload.subject) return jsonResponse({ success: false, error: 'Missing subject' });
+      var target = book().getSheetByName(payload.subject);
+      if (!target) return jsonResponse({ success: false, error: 'Sheet tab "' + payload.subject + '" not found.' });
+      formatSheetHeaders(target);
+      return jsonResponse({
+        success: true,
+        data: { subject: payload.subject, rows: Math.max(target.getLastRow() - 1, 0) }
       });
     }
 

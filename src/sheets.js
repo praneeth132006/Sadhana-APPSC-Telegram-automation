@@ -52,7 +52,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -740,6 +740,18 @@ async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, update
 }
 
 /**
+ * formatQuestions — puts one subject tab back to the canonical layout.
+ *
+ * The way back for a tab an upload turned navy from top to bottom. On the
+ * Apps Script route this is formatSheetHeaders, which has always been there —
+ * it simply had no way to be asked for from outside the script editor.
+ */
+async function formatQuestions(ctx, subject) {
+  const result = await request(ctx, 'POST', { action: 'formatQuestions', subject });
+  return result.data || { subject, rows: 0 };
+}
+
+/**
  * unscheduleQuestions — the reverse of scheduleQuestions.
  *
  * A sheet whose Apps Script predates this action still has to be able to
@@ -986,7 +998,8 @@ const IMPLEMENTATIONS = {
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   recoverStaleClaims, holdQuestions,
-  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, unscheduleQuestions, getSubscriber,
+  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, unscheduleQuestions,
+  formatQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,

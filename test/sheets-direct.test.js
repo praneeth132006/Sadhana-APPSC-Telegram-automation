@@ -51,7 +51,19 @@ function fakeSheets(book) {
     const u = String(url);
     const reply = (status, body) => ({ ok: status < 300, status, json: async () => body });
     if (u.startsWith('https://oauth2.googleapis.com/token')) return reply(200, { access_token: 'tok', expires_in: 3600 });
-    const path = u.replace(/^https:\/\/sheets\.googleapis\.com\/v4\/spreadsheets\/[^/:]+/, '');
+    // Sheet metadata: every formatting request needs the numeric sheetId. It
+    // hangs off the spreadsheet itself, so it is matched before the path is
+    // stripped — there is no path left once the id is taken off.
+    if (init.method !== 'POST' && /\?fields=sheets/.test(u)) {
+      log.metaReads = (log.metaReads || 0) + 1;
+      return reply(200, {
+        sheets: Object.keys(book).map((title, i) => ({
+          properties: { sheetId: i + 100, title },
+          conditionalFormats: log.existingRules || []
+        }))
+      });
+    }
+    const path = u.replace(/^https:\/\/sheets\.googleapis\.com\/v4\/spreadsheets\/[^/:?]+/, '');
     if (init.method === 'POST' && path.startsWith('/values:batchUpdate')) {
       const body = JSON.parse(init.body);
       assert.equal(body.valueInputOption, 'RAW');
@@ -66,8 +78,10 @@ function fakeSheets(book) {
       return reply(200, {});
     }
     if (init.method === 'POST' && path.startsWith(':batchUpdate')) {
-      const add = JSON.parse(init.body).requests[0].addSheet;
-      book[add.properties.title] = [];
+      const requests = JSON.parse(init.body).requests;
+      log.formatRequests = (log.formatRequests || []).concat(requests);
+      const add = requests[0].addSheet;
+      if (add) book[add.properties.title] = [];
       return reply(200, {});
     }
     const append = path.match(/^\/values\/([^?:]+):append/);
@@ -361,4 +375,159 @@ test('a queue write with nothing to do touches the sheet not at all', async () =
   assert.equal(res.updatedCount, 0);
   assert.deepEqual(res.notFound, ['NOPE']);
   assert.equal(log.writes.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+// The bug these cover: a tab filled through this client came out solid navy,
+// bold white, top to bottom. `values:append` with insertDataOption=INSERT_ROWS
+// does what inserting a row in the UI does — the new row inherits the
+// formatting of the row above. The row above the first upload is the header.
+
+/** Every repeatCell in a batch that sets a background, as [row range, colour]. */
+function backgroundWrites(requests) {
+  return (requests || [])
+    .filter((r) => r.repeatCell && r.repeatCell.cell.userEnteredFormat.backgroundColor)
+    .map((r) => ({
+      startRowIndex: r.repeatCell.range.startRowIndex,
+      endRowIndex: r.repeatCell.range.endRowIndex,
+      background: r.repeatCell.cell.userEnteredFormat.backgroundColor,
+      bold: r.repeatCell.cell.userEnteredFormat.textFormat.bold
+    }));
+}
+
+test('appended rows are put back to the body style instead of inheriting the header', async () => {
+  const book = { Physics: [HEADERS] };
+  const log = fakeSheets(book);
+
+  await DIRECT.addQuestions(ctx, 'Physics', [
+    { question: 'New one?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd', correct_answer: 'a' }
+  ], 'Tester', true);
+
+  const reset = backgroundWrites(log.formatRequests).find((w) => w.startRowIndex === 1);
+  assert.ok(reset, 'the appended row was left with whatever formatting it inherited');
+  assert.deepEqual(reset.background, { red: 1, green: 1, blue: 1 }, 'the row must go back to white');
+  assert.equal(reset.bold, false);
+  assert.equal(reset.endRowIndex, 2, 'exactly the one row that was appended');
+});
+
+test('the reset covers every appended row and no row that was already there', async () => {
+  const book = { Physics: [HEADERS, question(1), question(2)] };
+  const log = fakeSheets(book);
+
+  await DIRECT.addQuestions(ctx, 'Physics', [
+    { question: 'Third?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' },
+    { question: 'Fourth?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }
+  ], 'Tester', true);
+
+  const reset = backgroundWrites(log.formatRequests).find((w) => w.background.red === 1);
+  assert.equal(reset.startRowIndex, 3, 'rows 4 and 5, which is where the append landed');
+  assert.equal(reset.endRowIndex, 5);
+});
+
+test('an upload still succeeds when the formatting reset fails', async () => {
+  // The questions are already safely in the sheet. Refusing an upload that
+  // worked because its rows came out the wrong colour is the worse failure.
+  const book = { Physics: [HEADERS] };
+  const log = fakeSheets(book);
+  const realFetchInner = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (/\?fields=sheets/.test(String(url))) throw new Error('metadata unavailable');
+    return realFetchInner(url, init);
+  };
+
+  const res = await DIRECT.addQuestions(ctx, 'Physics', [
+    { question: 'Still added?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }
+  ], 'Tester', true);
+
+  assert.equal(res.addedCount, 1);
+  assert.equal(book.Physics[1][col('Question')], 'Still added?');
+  assert.ok(log.appends === 1);
+});
+
+test('a new tab is styled as it is created, not left plain', async () => {
+  const book = {};
+  const log = fakeSheets(book);
+  await DIRECT.addQuestions(ctx, 'Art and Culture',
+    [{ question: 'New?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }], 'T', true);
+
+  const header = backgroundWrites(log.formatRequests)
+    .find((w) => w.startRowIndex === 0 && w.endRowIndex === 1);
+  assert.ok(header, 'the header row was never styled');
+  assert.equal(header.bold, true);
+  assert.deepEqual(header.background, _internal.rgb('#1a237e'));
+});
+
+test('repairing a tab restores the header, the widths, the panes and the colour coding', async () => {
+  const book = { Physics: [HEADERS, question(1), question(2)] };
+  const log = fakeSheets(book);
+
+  const res = await DIRECT.formatQuestions(ctx, 'Physics');
+  assert.deepEqual(res, { subject: 'Physics', rows: 2 });
+
+  const requests = log.formatRequests;
+  const kinds = new Set(requests.map((r) => Object.keys(r)[0]));
+  assert.ok(kinds.has('updateSheetProperties'), 'the frozen panes were not restored');
+  assert.ok(kinds.has('updateDimensionProperties'), 'the column widths were not restored');
+  assert.ok(kinds.has('setDataValidation'), 'the dropdowns were not restored');
+  assert.ok(kinds.has('addConditionalFormatRule'), 'the colour coding was not restored');
+
+  const frozen = requests.find((r) => r.updateSheetProperties).updateSheetProperties.properties;
+  assert.equal(frozen.gridProperties.frozenRowCount, 1);
+  assert.equal(frozen.gridProperties.frozenColumnCount, 2, 'S.No and Question ID stay visible');
+
+  const widths = requests.filter((r) => r.updateDimensionProperties &&
+    r.updateDimensionProperties.range.dimension === 'COLUMNS');
+  assert.equal(widths.length, 30, 'every one of the 30 columns gets its width');
+
+  // The body must come back white and unbold — the whole point of the repair.
+  const body = backgroundWrites(requests).find((w) => w.startRowIndex === 1);
+  assert.deepEqual(body.background, { red: 1, green: 1, blue: 1 });
+  assert.equal(body.bold, false);
+
+  // The rules a curator reads state by: Posted, Status and Difficulty.
+  const rules = requests.filter((r) => r.addConditionalFormatRule)
+    .map((r) => r.addConditionalFormatRule.rule.booleanRule.condition.values[0].userEnteredValue);
+  assert.deepEqual(rules, ['YES', 'NO', 'Approved', 'Posted', 'Scheduled', 'Review',
+    'Rejected', 'Archived', 'Easy', 'Medium', 'Hard']);
+});
+
+test('repairing twice does not leave two of every colour rule behind', async () => {
+  const book = { Physics: [HEADERS, question(1)] };
+  const log = fakeSheets(book);
+  // What the sheet already carries from the first repair.
+  log.existingRules = new Array(11).fill({});
+
+  await DIRECT.formatQuestions(ctx, 'Physics');
+
+  const deletes = log.formatRequests.filter((r) => r.deleteConditionalFormatRule);
+  assert.equal(deletes.length, 11, 'the rules already there were not cleared first');
+  // Highest index first: deleting index 0 first would renumber the rest.
+  assert.deepEqual(deletes.map((d) => d.deleteConditionalFormatRule.index),
+    [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+});
+
+test('an empty tab is still styled rather than skipped for having no rows', async () => {
+  const book = { Physics: [HEADERS] };
+  const log = fakeSheets(book);
+  const res = await DIRECT.formatQuestions(ctx, 'Physics');
+  assert.equal(res.rows, 0);
+  assert.ok(log.formatRequests.some((r) => r.setDataValidation),
+    'a tab with no questions yet still needs its dropdowns');
+});
+
+test('the long-form columns wrap and the rest stay on one line', async () => {
+  // Without this every row would grow to the height of its longest cell.
+  const requests = _internal.bodyFormatRequests(100, 2, 10);
+  const wrapped = requests
+    .filter((r) => r.repeatCell.cell.userEnteredFormat.wrapStrategy === 'WRAP')
+    .map((r) => r.repeatCell.range.startColumnIndex + 1);
+  assert.deepEqual(wrapped, [7, 8, 9, 10, 11, 13, 30], 'Question, the four options, Explanation, Review Notes');
+  assert.equal(requests[0].repeatCell.cell.userEnteredFormat.wrapStrategy, 'CLIP');
+});
+
+test('repairing a tab that is not there says which one', async () => {
+  fakeSheets({ Physics: [HEADERS] });
+  await assert.rejects(DIRECT.formatQuestions(ctx, 'Nope'), /Sheet tab "Nope" not found/);
 });

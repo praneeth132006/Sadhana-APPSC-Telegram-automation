@@ -123,9 +123,13 @@ function sheetVersionIsCurrent(version) {
   return Number.isFinite(major) && major >= REQUIRED_SHEET_MAJOR;
 }
 
-/** Rate limit: requests allowed per IP inside the window. */
-const RATE_LIMIT_MAX = 240;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+/** Rate limit: requests allowed per IP inside the window.
+ *  Configurable because a curation team behind one office NAT shares an
+ *  address, and the whole team then shares one bucket. Read per request rather
+ *  than captured at load, so a test can lower it around the few cases that are
+ *  about the limiter and leave the rest of the suite unthrottled. */
+const rateLimitMax = () => Number(process.env.RATE_LIMIT_MAX) || 240;
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60 * 1000;
 
 /** Extensions we are willing to serve, mapped to their content types. */
 const MIME_TYPES = {
@@ -182,7 +186,7 @@ function checkRateLimit(ip) {
     return true;
   }
   bucket.count++;
-  return bucket.count <= RATE_LIMIT_MAX;
+  return bucket.count <= rateLimitMax();
 }
 
 // Drop expired buckets periodically so the map cannot grow without bound.
@@ -3020,6 +3024,54 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     return true;
   }
 
+  // ---- Repair a tab's formatting -------------------------------------------
+  // Rows appended through the Sheets API inherit the formatting of the row
+  // above them, and the row above the first upload is the header. Sheets
+  // filled before that was fixed are bold white on navy from top to bottom
+  // and unreadable. This is the way back, without anyone editing a sheet by
+  // hand or pasting a script.
+  if (pathname === '/api/questions/format' && method === 'POST') {
+    const body = await readJsonBody(req);
+
+    // One subject, or the whole group's Config tab in one go — which is what
+    // a curator whose sheet is already navy actually needs.
+    let subjects;
+    if (body.allSubjects === true) {
+      subjects = (await db.readConfig()).map((c) => c.subject).filter(Boolean);
+    } else {
+      const subject = validateSubject(body.subject);
+      if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
+      subjects = [subject.value];
+    }
+
+    if (!subjects.length) {
+      sendJSON(res, 400, { success: false, error: 'No subjects are configured for this group.' });
+      return true;
+    }
+
+    const results = [];
+    for (const subject of subjects) {
+      try {
+        const done = await db.formatQuestions(subject);
+        results.push({ subject, ok: true, rows: done.rows || 0 });
+      } catch (err) {
+        // One missing tab must not abandon the others: a curator asking for
+        // the whole group wants every tab it could reach fixed.
+        results.push({ subject, ok: false, error: err.message.split('\n')[0] });
+      }
+    }
+
+    const fixed = results.filter((r) => r.ok).length;
+    console.log(`[questions] ${actor} restored the formatting of ${fixed} tab(s)`);
+    sendJSON(res, 200, {
+      success: true,
+      results,
+      formattedCount: fixed,
+      message: `${fixed} of ${results.length} tab(s) put back to the standard layout.`
+    });
+    return true;
+  }
+
   // ---- Autopilot -----------------------------------------------------------
   // "Every 5 minutes, post the next 20 questions until there are none left."
   // Before this the only unattended posting was a cron expression in the
@@ -3145,8 +3197,12 @@ const server = http.createServer(async (req, res) => {
   // Signed machine-to-machine deliveries are authenticated by their own
   // secrets, and a 429 to Razorpay or Telegram delays a payment or a reply.
   const rawPath = String(req.url || '').split('?')[0];
+  // Every /api/cron/* route is one of these: each is refused without
+  // CRON_SECRET, and a 429 to Vercel Cron does not become a retry — it
+  // silently skips that run, so the sweep, the autopilot batch or the
+  // deleted-poll check simply does not happen and nothing says why.
   const signedDelivery = rawPath === '/api/payments/webhook' ||
-    rawPath.startsWith('/api/telegram/bot/') || rawPath === '/api/cron/sweep';
+    rawPath.startsWith('/api/telegram/bot/') || rawPath.startsWith('/api/cron/');
   if (!signedDelivery && !checkRateLimit(clientAddress(req))) {
     res.setHeader('Retry-After', '60');
     sendJSON(res, 429, { success: false, error: 'Too many requests — slow down.' });
