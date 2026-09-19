@@ -10,7 +10,7 @@
 // Group id : appsc_q_te
 // Subjects : 16
 //            Ancient India, Medieval India, Modern India, AP History, Physical Geography, Indian Geography, AP Geography, Indian Economy, AP Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Indian Society, Disaster Management
-// Built    : 2026-09-17T19:35:23.751Z
+// Built    : 2026-09-20T11:50:24.226Z
 // ==========================================================================
 
 // ============================================================================
@@ -541,6 +541,7 @@ function doGet(e) {
  * doPost — mutating API surface.
  * Actions: addQuestions, markPosted, updateConfig, updateQuestion,
  *          deleteQuestion, bulkDelete, bulkStatus, scheduleQuestions,
+ *          unscheduleQuestions,
  *          claimQuestions, releaseQuestions, unpostQuestions.
  */
 function doPost(e) {
@@ -678,11 +679,14 @@ function doPost(e) {
       if (!payload.subject || !(payload.questionIds || []).length || !payload.status) {
         return jsonResponse({ success: false, error: 'Missing subject, questionIds or status' });
       }
-      var count = bulkSetStatus(
+      var changed = bulkSetStatus(
         payload.subject, payload.questionIds, payload.status,
         payload.updated_by || 'Dashboard User'
       );
-      return jsonResponse({ success: true, updatedCount: count });
+      return jsonResponse({
+        success: true, updatedCount: changed.updatedCount,
+        notFound: changed.notFound, skipped: changed.skipped
+      });
     }
 
     // ---- Membership writes -------------------------------------------------
@@ -800,7 +804,24 @@ function doPost(e) {
         payload.subject, payload.questionIds, payload.scheduledFor || '',
         payload.updated_by || 'Dashboard User'
       );
-      return jsonResponse({ success: true, updatedCount: scheduled });
+      return jsonResponse({
+        success: true, updatedCount: scheduled.updatedCount,
+        notFound: scheduled.notFound, skipped: scheduled.skipped
+      });
+    }
+
+    if (action === 'unscheduleQuestions') {
+      if (!payload.subject || !(payload.questionIds || []).length) {
+        return jsonResponse({ success: false, error: 'Missing subject or questionIds' });
+      }
+      var unscheduled = unscheduleQuestionRows(
+        payload.subject, payload.questionIds, payload.status || 'Approved',
+        payload.updated_by || 'Dashboard User'
+      );
+      return jsonResponse({
+        success: true, updatedCount: unscheduled.updatedCount,
+        notFound: unscheduled.notFound, skipped: unscheduled.skipped
+      });
     }
 
     return jsonResponse({ success: false, error: 'Unknown POST action: ' + action });
@@ -2083,18 +2104,66 @@ function bulkSetStatus(subject, questionIds, status, updatedBy) {
     );
   }
 
+  return writeQueueChange(sheet, map, questionIds, clean, null, updatedBy, false);
+}
+
+/**
+ * writeQueueChange — the one body behind bulkStatus, queueing and unqueueing.
+ *
+ * It answers with the ids it could not find and the rows it deliberately left
+ * alone, not just a count. A bare 0 is the least useful answer this script can
+ * give: the dashboard printed a line per id as though the change had worked,
+ * then "0 question(s) queued" underneath, and nothing said which of the two
+ * possible causes — an id that is not in this tab, or a row the poster is
+ * holding — was the real one.
+ *
+ * @param {Sheet} sheet Subject tab
+ * @param {Object} map Header map for that tab
+ * @param {string[]} questionIds Ids to change
+ * @param {string} status Status to write
+ * @param {string|null} scheduledFor Text for Scheduled For, or null to leave it
+ * @param {string} updatedBy Attribution
+ * @param {boolean} skipPosted Whether an already-posted row is off limits
+ * @returns {{updatedCount: number, notFound: string[], skipped: Array}}
+ */
+function writeQueueChange(sheet, map, questionIds, status, scheduledFor, updatedBy, skipPosted) {
   var now = istNow();
+  var by = String(updatedBy || 'Dashboard User');
+  var notFound = [];
+  var skipped = [];
+  var seen = {};
   var count = 0;
 
   for (var i = 0; i < questionIds.length; i++) {
-    var rowNumber = findRowByQuestionId(sheet, map, questionIds[i]);
-    if (rowNumber === -1) continue;
-    sheet.getRange(rowNumber, colNum(map, 'Status')).setValue(clean);
+    var id = String(questionIds[i] || '').trim();
+    if (!id) continue;
+
+    var rowNumber = findRowByQuestionId(sheet, map, id);
+    if (rowNumber === -1) { notFound.push(id); continue; }
+    if (seen[rowNumber]) continue;
+    seen[rowNumber] = true;
+
+    // A claimed row is mid-flight: a posting run is holding it and will write
+    // the Posted column itself, so changing Status underneath races a public
+    // channel. A posted row only blocks queueing — marking it Scheduled would
+    // set it up to go out twice — while archiving one is ordinary curation.
+    var posted = sheet.getRange(rowNumber, colNum(map, 'Posted')).getValue();
+    var reason = null;
+    if (isHeldValue(posted)) reason = 'held for checking';
+    else if (isClaimedValue(posted)) reason = 'being sent right now';
+    else if (skipPosted && isPostedValue(posted)) reason = 'already posted';
+    if (reason) { skipped.push({ questionId: id, row: rowNumber, reason: reason }); continue; }
+
+    if (scheduledFor !== null) {
+      sheet.getRange(rowNumber, colNum(map, 'Scheduled For')).setValue(String(scheduledFor));
+    }
+    sheet.getRange(rowNumber, colNum(map, 'Status')).setValue(status);
     sheet.getRange(rowNumber, colNum(map, 'Updated At')).setValue(now);
-    sheet.getRange(rowNumber, colNum(map, 'Updated By')).setValue(String(updatedBy || 'Dashboard User'));
+    sheet.getRange(rowNumber, colNum(map, 'Updated By')).setValue(by);
     count++;
   }
-  return count;
+
+  return { updatedCount: count, notFound: notFound, skipped: skipped };
 }
 
 /** Stamps Scheduled For and flips Status to Scheduled for the given questions. */
@@ -2102,20 +2171,27 @@ function scheduleQuestionRows(subject, questionIds, scheduledFor, updatedBy) {
   var sheet = book().getSheetByName(subject);
   if (!sheet) throw new Error('Sheet tab "' + subject + '" not found.');
 
-  var map = headerMap(sheet);
-  var now = istNow();
-  var count = 0;
+  return writeQueueChange(
+    sheet, headerMap(sheet), questionIds, 'Scheduled',
+    String(scheduledFor || ''), updatedBy, true
+  );
+}
 
-  for (var i = 0; i < questionIds.length; i++) {
-    var rowNumber = findRowByQuestionId(sheet, map, questionIds[i]);
-    if (rowNumber === -1) continue;
-    sheet.getRange(rowNumber, colNum(map, 'Scheduled For')).setValue(String(scheduledFor || ''));
-    sheet.getRange(rowNumber, colNum(map, 'Status')).setValue('Scheduled');
-    sheet.getRange(rowNumber, colNum(map, 'Updated At')).setValue(now);
-    sheet.getRange(rowNumber, colNum(map, 'Updated By')).setValue(String(updatedBy || 'Dashboard User'));
-    count++;
+/**
+ * unscheduleQuestionRows — takes questions back out of the queue.
+ *
+ * Clearing Scheduled For is the point: leaving yesterday's target time on a
+ * row that is no longer queued is how a sheet starts lying about its own plan.
+ */
+function unscheduleQuestionRows(subject, questionIds, status, updatedBy) {
+  var sheet = book().getSheetByName(subject);
+  if (!sheet) throw new Error('Sheet tab "' + subject + '" not found.');
+
+  var clean = normaliseChoice(status || 'Approved', STATUS_VALUES, 'Approved');
+  if (MACHINE_OWNED_STATUSES.indexOf(clean) !== -1) {
+    throw new Error('"' + clean + '" is set by the poster, not by hand.');
   }
-  return count;
+  return writeQueueChange(sheet, headerMap(sheet), questionIds, clean, '', updatedBy, true);
 }
 
 /** Writes topic thread ids back into the Config tab after `node setup.js`. */

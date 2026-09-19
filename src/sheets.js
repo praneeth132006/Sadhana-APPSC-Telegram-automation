@@ -52,7 +52,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -700,28 +700,70 @@ async function deleteQuestion(ctx, subject, questionId, rowNumber, verifyText) {
   });
 }
 
+/**
+ * queueResult — the one shape every queue write answers with.
+ *
+ * These three used to return a bare count, and a bare 0 is the least useful
+ * answer this app can give: the dashboard printed a line per id as though it
+ * had worked and then "0 question(s) queued" underneath. `notFound` and
+ * `skipped` are what turn that into a sentence a curator can act on. An older
+ * Apps Script sends neither, so both default to empty rather than undefined.
+ */
+function queueResult(result) {
+  return {
+    updatedCount: Number(result && result.updatedCount) || 0,
+    notFound: Array.isArray(result && result.notFound) ? result.notFound : [],
+    skipped: Array.isArray(result && result.skipped) ? result.skipped : []
+  };
+}
+
 /** Sets Status on many questions at once. */
 async function bulkStatus(ctx, subject, questionIds, status, updatedBy) {
-  const result = await request(ctx, 'POST', {
+  return queueResult(await request(ctx, 'POST', {
     action: 'bulkStatus',
     subject,
     questionIds,
     status,
     updated_by: updatedBy
-  });
-  return result.updatedCount || 0;
+  }));
 }
 
 /** Stamps Scheduled For and flips Status to Scheduled. */
 async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, updatedBy) {
-  const result = await request(ctx, 'POST', {
+  return queueResult(await request(ctx, 'POST', {
     action: 'scheduleQuestions',
     subject,
     questionIds,
     scheduledFor,
     updated_by: updatedBy
-  });
-  return result.updatedCount || 0;
+  }));
+}
+
+/**
+ * unscheduleQuestions — the reverse of scheduleQuestions.
+ *
+ * A sheet whose Apps Script predates this action still has to be able to
+ * unqueue, so the fallback is a plain bulkStatus. That restores the status but
+ * leaves Scheduled For as it was, which is said out loud in `partial` rather
+ * than left for the curator to discover in the sheet.
+ */
+async function unscheduleQuestions(ctx, subject, questionIds, status, updatedBy) {
+  try {
+    return queueResult(await request(ctx, 'POST', {
+      action: 'unscheduleQuestions',
+      subject,
+      questionIds,
+      status,
+      updated_by: updatedBy
+    }));
+  } catch (err) {
+    if (!err.staleScript) throw err;
+    const fallback = await bulkStatus(ctx, subject, questionIds, status || 'Approved', updatedBy);
+    return Object.assign(fallback, {
+      partial: 'This sheet\'s Apps Script is too old to clear the "Scheduled For" column, so the ' +
+        'status was changed but the old target time is still in the sheet.'
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -944,7 +986,7 @@ const IMPLEMENTATIONS = {
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   recoverStaleClaims, holdQuestions,
-  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, getSubscriber,
+  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, unscheduleQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,

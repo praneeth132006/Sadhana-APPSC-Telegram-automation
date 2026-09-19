@@ -13,7 +13,8 @@
 //
 //   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions,
 //   markAsPosted, holdQuestions, recoverStaleClaims, listPosted,
-//   unpostQuestions, and addQuestions (the dashboard's "Send to Sheet")
+//   unpostQuestions, addQuestions (the dashboard's "Send to Sheet"), and the
+//   curation queue: scheduleQuestions, unscheduleQuestions, bulkStatus
 //
 // Everything else (analytics, members, support) still goes through
 // the Apps Script, unchanged.
@@ -75,6 +76,9 @@ const HEADER_ALIASES = {
 };
 
 const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+
+/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script. */
+const MACHINE_OWNED_STATUSES = ['Posted', 'Sending'];
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -586,6 +590,151 @@ async function unpostQuestions(ctx, subject, rowNumbers, status) {
 }
 
 // ---------------------------------------------------------------------------
+// The curation queue
+// ---------------------------------------------------------------------------
+// Queueing, unqueueing and bulk status changes used to be the Apps Script's
+// job. They were also the operations most likely to answer "0 updated" with
+// no explanation: a stale deployment, a renamed tab, or an id that is simply
+// not in this subject all look identical from the dashboard. Doing them here
+// makes them fast, and — because the ids that matched nothing are named —
+// makes a zero say why it is a zero.
+
+/** Question ID (trimmed, case-insensitive) → 1-based row number. */
+function rowsByQuestionId(map, rows) {
+  const index = new Map();
+  rows.forEach((row, i) => {
+    const id = cell(row, map, 'Question ID').toLowerCase();
+    // First match wins: a duplicated id is a sheet problem, and silently
+    // preferring the later row would edit whichever one the reader cannot see.
+    if (id && !index.has(id)) index.set(id, i + 2);
+  });
+  return index;
+}
+
+/**
+ * resolveIds — splits the ids asked for into rows that exist and ids that do not.
+ *
+ * @returns {{targets: Array<{id: string, row: number}>, notFound: string[]}}
+ */
+function resolveIds(map, rows, questionIds) {
+  const index = rowsByQuestionId(map, rows);
+  const targets = [];
+  const notFound = [];
+  const seen = new Set();
+  for (const raw of questionIds || []) {
+    const id = String(raw == null ? '' : raw).trim();
+    if (!id) continue;
+    const row = index.get(id.toLowerCase());
+    if (!row) { notFound.push(id); continue; }
+    if (seen.has(row)) continue;
+    seen.add(row);
+    targets.push({ id, row });
+  }
+  return { targets, notFound };
+}
+
+/**
+ * queueSkipReason — why this row must not be re-statused from the dashboard.
+ *
+ * A claimed row is mid-flight: a posting run is holding it and will write the
+ * Posted column itself, so changing Status underneath is a race with a public
+ * channel on the other end. A row that is already posted only blocks
+ * *queueing* — marking a posted question Scheduled would set it up to go out
+ * a second time — while archiving or rejecting one is an ordinary thing to do.
+ *
+ * @param {boolean} skipPosted Whether an already-posted row is off limits
+ */
+function queueSkipReason(row, map, skipPosted) {
+  const posted = row[colNum(map, 'Posted') - 1];
+  if (isHeldValue(posted)) return 'held for checking';
+  if (isClaimedValue(posted)) return 'being sent right now';
+  if (skipPosted && isPostedValue(posted)) return 'already posted';
+  return null;
+}
+
+/**
+ * writeQueueChange — the one body behind queueing, unqueueing and bulkStatus.
+ *
+ * @param {string} status Status to write
+ * @param {string|null} scheduledFor Text for Scheduled For, or null to leave it
+ * @returns {Promise<{updatedCount: number, notFound: string[], skipped: Array}>}
+ */
+async function writeQueueChange(ctx, subject, questionIds, { status, scheduledFor, updatedBy, skipPosted }) {
+  const { map, rows } = await readTab(ctx, subject);
+  const { targets, notFound } = resolveIds(map, rows, questionIds);
+  const now = istNow();
+  const cells = [];
+  const skipped = [];
+  let updated = 0;
+
+  for (const target of targets) {
+    const row = rows[target.row - 2];
+    const reason = queueSkipReason(row, map, skipPosted !== false);
+    if (reason) { skipped.push({ questionId: target.id, row: target.row, reason }); continue; }
+
+    const set = (header, value) => cells.push({ tab: subject, row: target.row, col: colNum(map, header), value });
+    set('Status', status);
+    if (scheduledFor !== null) set('Scheduled For', scheduledFor);
+    set('Updated At', now);
+    set('Updated By', String(updatedBy || 'Dashboard User'));
+    updated++;
+  }
+
+  await writeCells(ctx, cells);
+  return { updatedCount: updated, notFound, skipped };
+}
+
+/** Stamps Scheduled For and flips Status to Scheduled. */
+async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, updatedBy) {
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: 'Scheduled',
+    scheduledFor: String(scheduledFor == null ? '' : scheduledFor),
+    updatedBy
+  });
+}
+
+/**
+ * unscheduleQuestions — takes questions back out of the queue.
+ *
+ * Clearing Scheduled For is the point: leaving yesterday's target time on a
+ * row that is no longer queued is how a sheet starts lying about its own plan.
+ */
+async function unscheduleQuestions(ctx, subject, questionIds, status, updatedBy) {
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: normaliseChoice(status || 'Approved', STATUS_VALUES, 'Approved'),
+    scheduledFor: '',
+    updatedBy
+  });
+}
+
+/**
+ * Sets Status on many questions at once, leaving Scheduled For alone.
+ *
+ * Posted and Sending are refused for the same reason the Apps Script refuses
+ * them: they are written by the poster alongside the Posted column, the
+ * message id and the poll id. Setting one by hand leaves Status saying
+ * "Posted" while Posted still says NO, so the question stays eligible and
+ * goes out again with the dashboard insisting it was already sent.
+ */
+async function bulkStatus(ctx, subject, questionIds, status, updatedBy) {
+  const clean = normaliseChoice(status, STATUS_VALUES, 'Draft');
+  if (MACHINE_OWNED_STATUSES.includes(clean)) {
+    throw new Error(
+      `"${clean}" is set by the poster, not by hand. Use the Automation page ` +
+      'to post, or "Check the channel for deleted polls" to undo one.'
+    );
+  }
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: clean,
+    scheduledFor: null,
+    updatedBy,
+    // Archiving or rejecting a question that has already gone out is ordinary
+    // curation, so unlike queueing this does not refuse a posted row.
+    skipPosted: false
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Adding questions
 // ---------------------------------------------------------------------------
 
@@ -796,12 +945,14 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
-  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions,
+  scheduleQuestions, unscheduleQuestions, bulkStatus
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
-  'recoverStaleClaims', 'unpostQuestions', 'addQuestions']);
+  'recoverStaleClaims', 'unpostQuestions', 'addQuestions',
+  'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus']);
 
 module.exports = {
   DIRECT,
@@ -809,5 +960,5 @@ module.exports = {
   isConfigured,
   serviceAccountEmail,
   // Exposed for tests.
-  _internal: { istNow, hashQuestion, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
+  _internal: { istNow, hashQuestion, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resolveIds, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
 };

@@ -1072,7 +1072,12 @@ test('bulk status still applies every status a curator owns', () => {
   const id = String(sheet.values[1][map['Question ID']]);
 
   for (const status of ['Draft', 'Review', 'Approved', 'Scheduled', 'Rejected', 'Archived']) {
-    assert.equal(script.bulkSetStatus('Polity', [id], status, 'Curator'), 1);
+    // The script runs in its own realm, so its objects are compared field by
+    // field rather than with deepEqual, which insists on the same prototype.
+    const changed = script.bulkSetStatus('Polity', [id], status, 'Curator');
+    assert.equal(changed.updatedCount, 1);
+    assert.equal(changed.notFound.length, 0);
+    assert.equal(changed.skipped.length, 0);
     assert.equal(sheet.values[1][map['Status']], status);
   }
 });
@@ -2305,4 +2310,120 @@ test('findPaymentRecord finds a payment in the log first, then on a member row',
   assert.equal(script.findPaymentRecord('pay_ONROW0000001').source, 'Subscribers');
   assert.equal(script.findPaymentRecord('pay_NOWHERE00001'), null);
   assert.equal(script.findPaymentRecord(''), null);
+});
+
+// ===========================================================================
+// The curation queue
+// ===========================================================================
+// The Apps Script and the direct Sheets client share every sheet, so a curator
+// on one route must not see different behaviour from a curator on the other.
+// These mirror the cases in test/sheets-direct.test.js one for one.
+
+/** A subject tab holding `n` questions, and the script that reads it. */
+function tabWithQuestions(n, overrides = []) {
+  const s = freshScript();
+  const sheet = new FakeSheet('Polity', [s.QUESTION_HEADERS.slice()]);
+  const script = loadScript(new FakeSpreadsheet([sheet]));
+
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    rows.push({
+      question: `Q${i + 1}?`, option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd',
+      correct_answer: 'A'
+    });
+  }
+  script.appendQuestionsToSheet('Polity', rows, 'Curator', true);
+
+  const map = script.headerMap(sheet);
+  overrides.forEach((patch, i) => {
+    Object.entries(patch).forEach(([header, value]) => { sheet.values[i + 1][map[header]] = value; });
+  });
+
+  const ids = sheet.values.slice(1).map((row) => String(row[map['Question ID']]));
+  return { script, sheet, map, ids };
+}
+
+test('queueing marks the rows Scheduled, stamps the time, and names what it missed', () => {
+  const { script, sheet, map, ids } = tabWithQuestions(2);
+
+  const res = script.scheduleQuestionRows('Polity', [ids[0], ids[1], 'POL-9999'],
+    '07-09-2026 09:00 IST', 'Curator (c@x)');
+
+  assert.equal(res.updatedCount, 2);
+  assert.deepEqual([...res.notFound], ['POL-9999']);
+  assert.equal(res.skipped.length, 0);
+  assert.equal(sheet.values[1][map['Status']], 'Scheduled');
+  assert.equal(sheet.values[1][map['Scheduled For']], '07-09-2026 09:00 IST');
+  assert.equal(sheet.values[1][map['Updated By']], 'Curator (c@x)');
+});
+
+test('queueing refuses a posted, sending or held row, exactly as the direct client does', () => {
+  const { script, sheet, map, ids } = tabWithQuestions(4, [
+    { Posted: 'YES', Status: 'Posted' },
+    { Posted: 'SENDING | x | Approved', Status: 'Sending' },
+    { Posted: 'CHECK | x', Status: 'Sending' }
+  ]);
+
+  const res = script.scheduleQuestionRows('Polity', ids, '', 'Curator');
+
+  assert.equal(res.updatedCount, 1);
+  assert.deepEqual([...res.skipped].map((s) => s.reason),
+    ['already posted', 'being sent right now', 'held for checking']);
+  assert.equal(sheet.values[1][map['Status']], 'Posted');
+  assert.equal(sheet.values[4][map['Status']], 'Scheduled');
+});
+
+test('unqueueing restores the status and clears the target time', () => {
+  const { script, sheet, map, ids } = tabWithQuestions(1, [
+    { Status: 'Scheduled', 'Scheduled For': '07-09-2026 09:00 IST' }
+  ]);
+
+  const res = script.unscheduleQuestionRows('Polity', [ids[0]], 'Approved', 'Curator');
+
+  assert.equal(res.updatedCount, 1);
+  assert.equal(sheet.values[1][map['Status']], 'Approved');
+  assert.equal(sheet.values[1][map['Scheduled For']], '');
+});
+
+test('unqueueing will not hand a row one of the statuses the poster owns', () => {
+  const { script, ids } = tabWithQuestions(1, [{ Status: 'Scheduled' }]);
+  assert.throws(() => script.unscheduleQuestionRows('Polity', [ids[0]], 'Posted', 'C'),
+    /set by the poster/);
+});
+
+test('bulkStatus may archive a posted question but never re-queue one', () => {
+  const { script, sheet, map, ids } = tabWithQuestions(1, [{ Posted: 'YES', Status: 'Posted' }]);
+
+  assert.equal(script.bulkSetStatus('Polity', [ids[0]], 'Archived', 'C').updatedCount, 1);
+  assert.equal(sheet.values[1][map['Status']], 'Archived');
+
+  // Back to posted, then ask to queue it: that is the one the queue refuses.
+  sheet.values[1][map['Status']] = 'Posted';
+  const queued = script.scheduleQuestionRows('Polity', [ids[0]], '', 'C');
+  assert.equal(queued.updatedCount, 0);
+  assert.equal(queued.skipped[0].reason, 'already posted');
+});
+
+test('an id repeated in one request is written once', () => {
+  const { script, ids } = tabWithQuestions(1);
+  const res = script.scheduleQuestionRows('Polity', [ids[0], ids[0], ' ' + ids[0] + ' '], '', 'C');
+  assert.equal(res.updatedCount, 1);
+});
+
+test('the queue actions are reachable over POST and answer with what they missed', () => {
+  const { script, ids } = tabWithQuestions(2);
+  const post = (payload) => JSON.parse(script.doPost({ postData: { contents: JSON.stringify(payload) } }).text);
+
+  const queued = post({ action: 'scheduleQuestions', subject: 'Polity', questionIds: [ids[0], 'NOPE'], scheduledFor: 'soon' });
+  assert.equal(queued.success, true);
+  assert.equal(queued.updatedCount, 1);
+  assert.deepEqual([...queued.notFound], ['NOPE']);
+
+  const undone = post({ action: 'unscheduleQuestions', subject: 'Polity', questionIds: [ids[0]] });
+  assert.equal(undone.success, true);
+  assert.equal(undone.updatedCount, 1);
+
+  const missing = post({ action: 'unscheduleQuestions', subject: 'Polity', questionIds: [] });
+  assert.equal(missing.success, false);
+  assert.match(missing.error, /Missing subject or questionIds/);
 });

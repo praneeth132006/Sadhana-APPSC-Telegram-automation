@@ -27,3 +27,7 @@ npm-debug.log*
 # What it brings: Completely prevents secrets, tokens, and keys from being accidentally committed
 # Where changes can be seen: Git status and commit trees
 .env*
+
+# Which subjects autopilot was posting when the server last stopped. Local
+# runtime state, rebuilt from the dashboard — never shared between machines.
+.autopilot-state.json

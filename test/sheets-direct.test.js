@@ -255,3 +255,110 @@ test('adding to a subject with no tab creates it', async () => {
   assert.match(res.ids[0], /^ART-\d{8}-0001$/);
   assert.equal(book['Art and Culture'][1][col('Question')], 'New?');
 });
+
+// ---------------------------------------------------------------------------
+// The curation queue
+// ---------------------------------------------------------------------------
+// The bug these cover: the dashboard printed a line per question saying it had
+// been queued, then "0 question(s) queued" underneath. A count on its own
+// cannot tell an id that is not in the tab from a row the poster is holding,
+// so both are now named.
+
+test('queueing marks the rows Scheduled, stamps the time, and names what it missed', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { 'Question ID': 'POL-0001' }),
+    question(2, { 'Question ID': 'POL-0002', Status: 'Draft' })] };
+  fakeSheets(book);
+
+  const res = await DIRECT.scheduleQuestions(
+    ctx, 'Physics', ['POL-0001', 'POL-0002', 'POL-9999'], '07-09-2026 09:00 IST', 'Curator (c@x)');
+
+  assert.equal(res.updatedCount, 2);
+  assert.deepEqual(res.notFound, ['POL-9999'], 'an id that is not in this tab is named, not counted as done');
+  assert.deepEqual(res.skipped, []);
+
+  assert.equal(book.Physics[1][col('Status')], 'Scheduled');
+  assert.equal(book.Physics[1][col('Scheduled For')], '07-09-2026 09:00 IST');
+  assert.equal(book.Physics[1][col('Updated By')], 'Curator (c@x)');
+  assert.match(book.Physics[1][col('Updated At')], /IST$/);
+  assert.equal(book.Physics[2][col('Status')], 'Scheduled', 'a Draft can be queued');
+});
+
+test('queueing refuses a posted, sending or held row rather than setting it up to go out twice', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { 'Question ID': 'A', Posted: 'YES', Status: 'Posted' }),
+    question(2, { 'Question ID': 'B', Posted: 'SENDING | x | Approved', Status: 'Sending' }),
+    question(3, { 'Question ID': 'C', Posted: 'CHECK | x', Status: 'Sending' }),
+    question(4, { 'Question ID': 'D' })] };
+  fakeSheets(book);
+
+  const res = await DIRECT.scheduleQuestions(ctx, 'Physics', ['A', 'B', 'C', 'D'], '', 'Curator');
+
+  assert.equal(res.updatedCount, 1);
+  assert.deepEqual(
+    res.skipped.map((s) => [s.questionId, s.reason]),
+    [['A', 'already posted'], ['B', 'being sent right now'], ['C', 'held for checking']]
+  );
+  assert.equal(book.Physics[1][col('Status')], 'Posted', 'the posted row is untouched');
+  assert.equal(book.Physics[4][col('Status')], 'Scheduled');
+});
+
+test('unqueueing restores the status and clears the target time', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { 'Question ID': 'A', Status: 'Scheduled', 'Scheduled For': '07-09-2026 09:00 IST' })] };
+  fakeSheets(book);
+
+  const res = await DIRECT.unscheduleQuestions(ctx, 'Physics', ['A'], 'Approved', 'Curator');
+
+  assert.equal(res.updatedCount, 1);
+  assert.equal(book.Physics[1][col('Status')], 'Approved');
+  assert.equal(book.Physics[1][col('Scheduled For')], '',
+    'a stale target time left behind is how a sheet starts lying about its own plan');
+});
+
+test('unqueueing falls back to Approved for a status that is not a real one', async () => {
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A', Status: 'Scheduled' })] };
+  fakeSheets(book);
+  await DIRECT.unscheduleQuestions(ctx, 'Physics', ['A'], 'Nonsense', 'Curator');
+  assert.equal(book.Physics[1][col('Status')], 'Approved');
+});
+
+test('bulkStatus refuses the statuses the poster owns, and leaves Scheduled For alone', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { 'Question ID': 'A', Status: 'Scheduled', 'Scheduled For': 'keep me' })] };
+  fakeSheets(book);
+
+  await assert.rejects(DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Posted', 'C'), /set by the poster/);
+  await assert.rejects(DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Sending', 'C'), /set by the poster/);
+
+  const res = await DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Archived', 'C');
+  assert.equal(res.updatedCount, 1);
+  assert.equal(book.Physics[1][col('Status')], 'Archived');
+  assert.equal(book.Physics[1][col('Scheduled For')], 'keep me');
+});
+
+test('bulkStatus may archive a question that has already been posted', async () => {
+  // Unlike queueing: archiving something that went out is ordinary curation,
+  // while marking it Scheduled would set it up to be sent a second time.
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A', Posted: 'YES', Status: 'Posted' })] };
+  fakeSheets(book);
+  assert.equal((await DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Archived', 'C')).updatedCount, 1);
+  assert.equal(book.Physics[1][col('Status')], 'Archived');
+});
+
+test('an id repeated in one request is written once', async () => {
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A' })] };
+  const log = fakeSheets(book);
+  const res = await DIRECT.scheduleQuestions(ctx, 'Physics', ['A', 'a', ' A '], '', 'C');
+  assert.equal(res.updatedCount, 1, 'ids match case-insensitively and a repeat is not counted twice');
+  assert.equal(log.writes.filter((w) => w.header === 'Status').length, 1);
+});
+
+test('a queue write with nothing to do touches the sheet not at all', async () => {
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A' })] };
+  const log = fakeSheets(book);
+  const res = await DIRECT.scheduleQuestions(ctx, 'Physics', ['NOPE'], '', 'C');
+  assert.equal(res.updatedCount, 0);
+  assert.deepEqual(res.notFound, ['NOPE']);
+  assert.equal(log.writes.length, 0);
+});

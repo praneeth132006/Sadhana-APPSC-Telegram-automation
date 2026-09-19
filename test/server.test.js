@@ -87,9 +87,10 @@ stub(sheets, 'readConfig', [{ subject: 'Polity', topic_thread_id: 12, active: tr
 stub(sheets, 'addQuestions', { addedCount: 1, skippedCount: 0, ids: ['POL-20260905-0001'], message: '1 added' });
 stub(sheets, 'updateQuestion', { message: 'updated' });
 stub(sheets, 'deleteQuestion', { message: 'deleted' });
-stub(sheets, 'bulkStatus', 2);
+stub(sheets, 'bulkStatus', { updatedCount: 2, notFound: [], skipped: [] });
 stub(sheets, 'bulkDelete', { deletedCount: 2, notFound: [] });
-stub(sheets, 'scheduleQuestions', 3);
+stub(sheets, 'scheduleQuestions', { updatedCount: 3, notFound: [], skipped: [] });
+stub(sheets, 'unscheduleQuestions', { updatedCount: 3, notFound: ['POL-9'], skipped: [] });
 stub(sheets, 'getUnpostedQuestions', [
   { question_id: 'POL-1', question_text: 'Q1', row_index: 0, excel_row: 2 }
 ]);
@@ -304,7 +305,10 @@ test('every data route refuses an unauthenticated caller', async () => {
     ['GET', '/api/subjects'], ['GET', '/api/health'], ['GET', '/api/telegram/status'],
     ['POST', '/api/questions'], ['POST', '/api/questions/update'],
     ['POST', '/api/questions/delete'], ['POST', '/api/questions/status'],
-    ['POST', '/api/questions/schedule'], ['POST', '/api/telegram/post'],
+    ['POST', '/api/questions/schedule'], ['POST', '/api/questions/unschedule'],
+    ['POST', '/api/telegram/post'], ['POST', '/api/telegram/reconcile'],
+    ['GET', '/api/automation/autopilot'], ['POST', '/api/automation/autopilot'],
+    ['POST', '/api/automation/autopilot/stop'],
     ['POST', '/api/send']
   ];
 
@@ -2435,5 +2439,292 @@ test('the daily job posts a support summary to each bot\'s support chat, and can
       if (before[key] === undefined) delete process.env[env];
       else process.env[env] = before[key];
     }
+  }
+});
+
+// ===========================================================================
+// Taking questions back out of the queue
+// ===========================================================================
+
+test('unqueue restores the status and reports the ids it could not find', async () => {
+  calls.length = 0;
+  const res = await authed('/api/questions/unschedule', {
+    method: 'POST', body: { subject: 'Polity', questionIds: ['POL-1', 'POL-2'] }
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.updatedCount, 3);
+  // A count on its own cannot tell an id that is not in the tab from a row the
+  // poster is holding, which is what made "0 question(s) queued" unexplainable.
+  assert.deepEqual(res.json.notFound, ['POL-9']);
+
+  const [subject, ids, status, actor] = calls.find((c) => c.name === 'unscheduleQuestions').args;
+  assert.equal(subject, 'Polity');
+  assert.deepEqual(ids, ['POL-1', 'POL-2']);
+  assert.equal(status, 'Approved', 'a question ready enough to queue is still ready');
+  assert.match(actor, /curator@example\.com/, 'the sheet records who did it, from the token');
+});
+
+test('unqueue passes through a status the curator chose', async () => {
+  calls.length = 0;
+  await authed('/api/questions/unschedule', {
+    method: 'POST', body: { subject: 'Polity', questionIds: ['POL-1'], status: 'Draft' }
+  });
+  assert.equal(calls.find((c) => c.name === 'unscheduleQuestions').args[2], 'Draft');
+});
+
+test('unqueue refuses an empty, oversized or subject-less selection', async () => {
+  const empty = await authed('/api/questions/unschedule', {
+    method: 'POST', body: { subject: 'Polity', questionIds: [] }
+  });
+  assert.equal(empty.status, 400);
+
+  const tooMany = await authed('/api/questions/unschedule', {
+    method: 'POST',
+    body: { subject: 'Polity', questionIds: Array.from({ length: 201 }, (_, i) => `POL-${i}`) }
+  });
+  assert.equal(tooMany.status, 400);
+  assert.match(tooMany.json.error, /max 200/);
+
+  const noSubject = await authed('/api/questions/unschedule', {
+    method: 'POST', body: { questionIds: ['POL-1'] }
+  });
+  assert.equal(noSubject.status, 400);
+});
+
+test('queueing answers with what it skipped as well as what it changed', async () => {
+  const original = clientStubs.scheduleQuestions;
+  clientStubs.scheduleQuestions = async () => ({
+    updatedCount: 1, notFound: ['POL-404'],
+    skipped: [{ questionId: 'POL-2', row: 3, reason: 'already posted' }]
+  });
+  try {
+    const res = await authed('/api/questions/schedule', {
+      method: 'POST', body: { subject: 'Polity', questionIds: ['POL-1', 'POL-2', 'POL-404'] }
+    });
+    assert.equal(res.json.updatedCount, 1);
+    assert.deepEqual(res.json.notFound, ['POL-404']);
+    assert.equal(res.json.skipped[0].reason, 'already posted');
+  } finally {
+    clientStubs.scheduleQuestions = original;
+  }
+});
+
+// ===========================================================================
+// Autopilot
+// ===========================================================================
+
+/** Stops whatever a test started, so the next one begins from nothing. */
+async function stopAutopilot(subject) {
+  await authed('/api/automation/autopilot/stop', { method: 'POST', body: { subject } });
+}
+
+test('autopilot starts, reports itself, and stops', async () => {
+  const started = await authed('/api/automation/autopilot', {
+    method: 'POST',
+    body: { subject: 'Polity', intervalMinutes: 5, batchSize: 20, reconcileEveryRuns: 5 }
+  });
+
+  try {
+    assert.equal(started.status, 200);
+    assert.equal(started.json.data.running, true);
+    assert.equal(started.json.data.settings.intervalMinutes, 5);
+    assert.equal(started.json.data.settings.batchSize, 20);
+    assert.match(started.json.data.startedBy, /curator@example\.com/);
+
+    const listed = await authed('/api/automation/autopilot');
+    const job = listed.json.data.jobs.find((j) => j.subject === 'Polity');
+    assert.ok(job, 'the job it just started is not in the list');
+    assert.equal(listed.json.data.maxBatch, 20);
+    assert.equal(typeof listed.json.data.persistent, 'boolean');
+
+    const stopped = await authed('/api/automation/autopilot/stop', {
+      method: 'POST', body: { subject: 'Polity' }
+    });
+    assert.equal(stopped.status, 200);
+    assert.equal(stopped.json.data.running, false);
+    assert.match(stopped.json.data.stoppedReason, /curator@example\.com/);
+  } finally {
+    await stopAutopilot('Polity');
+  }
+});
+
+test('autopilot clamps a batch larger than one request may post', async () => {
+  try {
+    const res = await authed('/api/automation/autopilot', {
+      method: 'POST', body: { subject: 'Polity', intervalMinutes: 5, batchSize: 5000 }
+    });
+    assert.equal(res.json.data.settings.batchSize, 20);
+  } finally {
+    await stopAutopilot('Polity');
+  }
+});
+
+test('autopilot refuses a subject that is not in the configured list', async () => {
+  const res = await authed('/api/automation/autopilot', {
+    method: 'POST', body: { subject: '../../etc/passwd', intervalMinutes: 5, batchSize: 1 }
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.json.success, false);
+});
+
+test('stopping a job that is not running says so rather than pretending', async () => {
+  const res = await authed('/api/automation/autopilot/stop', {
+    method: 'POST', body: { subject: 'History' }
+  });
+  assert.equal(res.status, 404);
+  assert.match(res.json.error, /Nothing is running/);
+});
+
+test('one group never sees another group\'s autopilot jobs', async () => {
+  await authed('/api/automation/autopilot', {
+    method: 'POST', body: { subject: 'Polity', intervalMinutes: 60, batchSize: 1 }
+  });
+  try {
+    const other = await call(`/api/automation/autopilot?group=appsc_q_en`, { token: 'valid-token' });
+    assert.equal(other.status, 200);
+    assert.equal(other.json.data.jobs.length, 0,
+      'another group\'s job is not this curator\'s business');
+  } finally {
+    await stopAutopilot('Polity');
+  }
+});
+
+// ===========================================================================
+// Scheduled routes
+// ===========================================================================
+
+test('the autopilot and deleted-poll crons refuse an unauthorised caller', async () => {
+  const original = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'cron-secret';
+  try {
+    for (const route of ['/api/cron/autopilot', '/api/cron/reconcile']) {
+      const none = await call(route, { method: 'POST' });
+      assert.equal(none.status, 401, `${route} ran without a secret`);
+
+      const wrong = await call(route, {
+        method: 'POST', headers: { Authorization: 'Bearer nope' }
+      });
+      assert.equal(wrong.status, 401, `${route} accepted the wrong secret`);
+    }
+  } finally {
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
+  }
+});
+
+test('the scheduled routes refuse to run at all when no secret is set', async () => {
+  const original = process.env.CRON_SECRET;
+  delete process.env.CRON_SECRET;
+  try {
+    for (const route of ['/api/cron/autopilot', '/api/cron/reconcile', '/api/cron/sweep']) {
+      const res = await call(route, { method: 'POST' });
+      assert.equal(res.status, 503, `${route} ran with no secret configured`);
+      assert.match(res.json.error, /CRON_SECRET/);
+    }
+  } finally {
+    if (original !== undefined) process.env.CRON_SECRET = original;
+  }
+});
+
+test('the autopilot cron runs the due jobs and reports them', async () => {
+  const original = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'cron-secret';
+  const cron = { method: 'POST', headers: { Authorization: 'Bearer cron-secret' } };
+
+  try {
+    // Every 12 hours, so only the immediate first run is ever due here.
+    await authed('/api/automation/autopilot', {
+      method: 'POST', body: { subject: 'Polity', intervalMinutes: 720, batchSize: 1 }
+    });
+
+    const first = await call('/api/cron/autopilot', cron);
+    assert.equal(first.status, 200);
+    assert.equal(first.json.data.ran.length, 1);
+    assert.equal(first.json.data.ran[0].subject, 'Polity');
+    assert.equal(first.json.data.ran[0].run.posted, 1, 'the stubbed batch posted its one question');
+
+    const second = await call('/api/cron/autopilot', cron);
+    assert.equal(second.json.data.ran.length, 0, 'the next run is not due for twelve hours');
+  } finally {
+    await stopAutopilot('Polity');
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
+  }
+});
+
+test('the deleted-poll cron puts questions back across every ready group', async () => {
+  const original = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'cron-secret';
+  const originalPosted = clientStubs.listPosted;
+  const originalUnpost = clientStubs.unpostQuestions;
+  const originalExists = telegram.pollStillExists;
+
+  clientStubs.listPosted = async () => ([
+    { row: 4, question_id: 'POL-4', message_id: '904', status: 'Posted' }
+  ]);
+  telegram.pollStillExists = async () => false;
+  const unposted = [];
+  clientStubs.unpostQuestions = async (...args) => { unposted.push(args); return 1; };
+
+  try {
+    const res = await call('/api/cron/reconcile', {
+      method: 'POST', headers: { Authorization: 'Bearer cron-secret' }
+    });
+
+    assert.equal(res.status, 200);
+    assert.ok(res.json.data.restored >= 1, 'a deleted poll was not put back in the queue');
+    assert.ok(unposted.length >= 1);
+    assert.equal(unposted[0][2], 'Approved', 'it comes back ready to post, not as a Draft');
+  } finally {
+    clientStubs.listPosted = originalPosted;
+    clientStubs.unpostQuestions = originalUnpost;
+    telegram.pollStillExists = originalExists;
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
+  }
+});
+
+test('a partial deleted-poll sweep says how much is left rather than implying it checked everything', async () => {
+  const originalPosted = clientStubs.listPosted;
+  const originalExists = telegram.pollStillExists;
+  clientStubs.listPosted = async () => Array.from({ length: 6 }, (_, i) => ({
+    row: i + 2, question_id: `POL-${i}`, message_id: String(900 + i), status: 'Posted'
+  }));
+  const asked = [];
+  telegram.pollStillExists = async (messageId) => { asked.push(String(messageId)); return true; };
+
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', limit: 2 }
+    });
+    assert.equal(res.json.checked, 2);
+    assert.equal(res.json.totalPosted, 6);
+    assert.equal(res.json.complete, false);
+    assert.match(res.json.message, /4 more will be checked on the next pass/);
+    assert.deepEqual(asked, ['900', '901']);
+
+    // Each later pass continues where the last one stopped. Without the
+    // cursor, every automatic sweep re-checked these same first rows for ever
+    // and the newest posts — the ones most likely to have just been deleted —
+    // were never reached at all.
+    asked.length = 0;
+    await authed('/api/telegram/reconcile', { method: 'POST', body: { subject: 'Polity', limit: 2 } });
+    assert.deepEqual(asked, ['902', '903']);
+
+    asked.length = 0;
+    const last = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', limit: 2 }
+    });
+    assert.deepEqual(asked, ['904', '905']);
+
+    // Having reached the end, the next pass starts again from the top.
+    asked.length = 0;
+    await authed('/api/telegram/reconcile', { method: 'POST', body: { subject: 'Polity', limit: 2 } });
+    assert.deepEqual(asked, ['900', '901']);
+    assert.equal(last.json.checked, 2);
+  } finally {
+    clientStubs.listPosted = originalPosted;
+    telegram.pollStillExists = originalExists;
   }
 });

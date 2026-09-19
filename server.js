@@ -38,6 +38,7 @@ const plans = require('./src/plans');
 const botapp = require('./src/botapp');
 const support = require('./src/support');
 const pricing = require('./src/pricing');
+const autopilotFactory = require('./src/autopilot');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -89,6 +90,18 @@ const STALE_CLAIM_MINUTES = Math.max(10, Math.ceil((POST_BUDGET_MS / 60000) * 2)
 /** Most questions one request will post. Anything larger is better split
  *  across runs than raced against the function timeout. */
 const MAX_POST_BATCH = 20;
+
+/** Wall-clock budget for one autopilot batch. Shorter than a manual run's:
+ *  nobody is watching, and a run that overruns its own interval is worse than
+ *  one that stops early and sends the rest next time. */
+const AUTOPILOT_RUN_BUDGET_MS = Number(process.env.AUTOPILOT_RUN_BUDGET_MS) || 120000;
+
+/** Posted rows the autopilot's deleted-poll check looks at in one pass, and
+ *  how long it may spend. Each row is a Telegram call plus a rate-limit pause,
+ *  so a whole channel cannot be swept at once — the cursor in
+ *  reconcileChannel carries the rest to the following passes. */
+const AUTOPILOT_RECONCILE_LIMIT = Number(process.env.AUTOPILOT_RECONCILE_LIMIT) || 40;
+const AUTOPILOT_RECONCILE_BUDGET_MS = Number(process.env.AUTOPILOT_RECONCILE_BUDGET_MS) || 60000;
 
 /** Largest JSON body we accept. A full batch of questions is far below this. */
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -982,6 +995,460 @@ async function describeShortfall(db, subject, asked, eligible, requireApproved) 
   }
 }
 
+/**
+ * authoriseCron — the shared gate on every scheduled route.
+ *
+ * These routes are public in the routing sense only. Vercel Cron sends
+ * `Authorization: Bearer $CRON_SECRET`; without a matching secret they refuse
+ * to run, because anyone who found the URL could otherwise remove paying
+ * members or publish to the channel.
+ *
+ * Answers the request itself when it refuses, so a caller is one `if` away
+ * from being safe — three routes each re-deriving this is three chances to
+ * get one of them wrong.
+ *
+ * @returns {boolean} true when the route may proceed
+ */
+function authoriseCron(req, res) {
+  const secret = String(process.env.CRON_SECRET || '').trim();
+  if (!secret) {
+    sendJSON(res, 503, {
+      success: false,
+      error: 'CRON_SECRET is not set, so the scheduled routes refuse to run.'
+    });
+    return false;
+  }
+
+  // Constant-time compare: a timing oracle on a secret that can remove paying
+  // members is not worth saving three lines over.
+  const offered = Buffer.from(String(req.headers.authorization || ''));
+  const expected = Buffer.from(`Bearer ${secret}`);
+  if (offered.length !== expected.length || !crypto.timingSafeEqual(offered, expected)) {
+    sendJSON(res, 401, { success: false, error: 'Unauthorised' });
+    return false;
+  }
+  return true;
+}
+
+/** Which subject each group's deleted-poll cron checks next. groupId -> index. */
+const cronReconcileTurn = new Map();
+
+/**
+ * The autopilot: unattended "every N minutes, post M questions" runs.
+ *
+ * Built here rather than inside src/autopilot.js because the work it does is
+ * this file's — postBatch and reconcileChannel, with the same claiming, the
+ * same locking and the same sheet client the dashboard button uses. The module
+ * only decides WHEN, which is what makes it testable without Telegram.
+ *
+ * `sheets.forGroup` is resolved per run, not captured once: a group whose
+ * configuration is fixed while a job is running should be picked up by the
+ * next run rather than needing the job restarted.
+ */
+const autopilot = autopilotFactory.createAutopilot({
+  maxBatch: MAX_POST_BATCH,
+  postBatch: async ({ groupId, subject, count, requireApproved }) => {
+    const outcome = await postBatch({
+      db: sheets.forGroup(groupId),
+      groupId,
+      subject,
+      count,
+      requireApproved,
+      // Well inside one interval, so a long batch cannot still be running when
+      // its own next run comes due.
+      budgetMs: Math.min(POST_BUDGET_MS, AUTOPILOT_RUN_BUDGET_MS)
+    });
+    // A refusal (no topic configured, bot unreachable, a batch already in
+    // flight) is a failure of this run, not a quiet zero: the job has to be
+    // able to report it, and must not read it as "the queue is empty" and
+    // switch itself off.
+    if (!outcome.payload || outcome.payload.success !== true) {
+      throw new Error((outcome.payload && outcome.payload.error) || 'The posting run failed.');
+    }
+    return outcome.payload;
+  },
+  reconcile: async ({ groupId, subject }) => {
+    const outcome = await reconcileChannel({
+      db: sheets.forGroup(groupId),
+      groupId,
+      subject,
+      apply: true,
+      limit: AUTOPILOT_RECONCILE_LIMIT,
+      budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
+      actor: 'autopilot'
+    });
+    if (!outcome.payload || outcome.payload.success !== true) {
+      throw new Error((outcome.payload && outcome.payload.error) || 'The deleted-poll check failed.');
+    }
+    return outcome.payload;
+  }
+});
+
+/**
+ * Where the last deleted-poll sweep for each group+subject stopped.
+ *
+ * Checking a poll is one Telegram call and a pause for the rate limit, so a
+ * subject with 500 posted questions cannot be swept inside one run. Without a
+ * cursor, every automatic sweep re-checked the same first rows for ever and
+ * the newest posts — the ones most likely to have just been deleted — were
+ * never reached at all. `${group}::${subject}` -> the row it stopped after.
+ */
+const reconcileCursor = new Map();
+
+/**
+ * reconcileChannel — finds posted questions whose poll is gone from Telegram.
+ *
+ * Telegram never tells a bot that a message was deleted, so a poll removed
+ * from the channel left the sheet claiming it was posted for ever: the
+ * question could never be re-sent and the counts were wrong. This walks the
+ * posted rows, checks each poll is still there, and (with `apply`) puts the
+ * deleted ones back in the queue.
+ *
+ * Shared by the dashboard button, the autopilot's periodic check and the cron
+ * route, so all three agree on what "deleted" means.
+ *
+ * @param {Object} options
+ * @param {boolean} options.apply Write the changes, rather than only report
+ * @param {number} [options.limit] Most rows to check in this pass
+ * @returns {Promise<{status: number, payload: Object}>}
+ */
+async function reconcileChannel(options) {
+  const { db, groupId, subject, apply, actor } = options;
+
+  let chatId;
+  try {
+    ensureTelegram();
+    chatId = telegramChatFor(groupId);
+  } catch (err) {
+    return { status: 400, payload: { success: false, error: err.message } };
+  }
+
+  const budgetMs = Number(options.budgetMs) || POST_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
+  const limit = Math.max(0, Number(options.limit) || 0);
+
+  const posted = await db.listPosted(subject);
+  const cursorKey = `${groupId}::${subject}`;
+
+  // Start after wherever the last sweep stopped, then wrap around. Sorting by
+  // row first makes "after" mean the same thing on every pass, whatever order
+  // the sheet client happened to return.
+  const ordered = posted.slice().sort((a, b) => Number(a.row) - Number(b.row));
+  const resumeAfter = Number(reconcileCursor.get(cursorKey)) || 0;
+  const resumeAt = ordered.findIndex((row) => Number(row.row) > resumeAfter);
+  const queue = resumeAt <= 0 ? ordered : ordered.slice(resumeAt).concat(ordered.slice(0, resumeAt));
+
+  const missing = [];
+  const unknown = [];
+  let checked = 0;
+  let lastRow = resumeAfter;
+
+  for (const row of queue) {
+    if (Date.now() > deadline) break;
+    if (limit && checked >= limit) break;
+    checked++;
+    lastRow = Number(row.row);
+
+    const exists = await telegram.pollStillExists(row.message_id, chatId);
+    if (exists === false) missing.push(row);
+    else if (exists === null) unknown.push(row.question_id);
+
+    // Telegram rate-limits edits like anything else.
+    await sleep(400);
+  }
+
+  // A sweep that reached the end starts again from the top next time.
+  reconcileCursor.set(cursorKey, checked >= ordered.length ? 0 : lastRow);
+
+  let restored = 0;
+  if (apply && missing.length) {
+    restored = await db.unpostQuestions(subject, missing.map((m) => m.row), 'Approved');
+    console.log(`[reconcile] ${actor || 'autopilot'} returned ${restored} deleted poll(s) ` +
+      `to the queue in "${subject}"`);
+  }
+
+  const swept = checked >= ordered.length;
+  return {
+    status: 200,
+    payload: {
+      success: true,
+      applied: Boolean(apply),
+      checked,
+      totalPosted: ordered.length,
+      missing: missing.map((m) => ({ questionId: m.question_id, row: m.row, messageId: m.message_id })),
+      // Named, so "3 could not be checked" is actionable rather than ominous.
+      unknown,
+      restored,
+      // A partial sweep has to say so, or "0 deleted" sounds like the whole
+      // channel was checked when only the first few rows were.
+      complete: swept,
+      message: apply
+        ? `${restored} deleted poll(s) put back in the queue for "${subject}".`
+        : `${missing.length} of ${checked} checked poll(s) are no longer in the channel.` +
+          (swept ? '' : ` ${ordered.length - checked} more will be checked on the next pass.`) +
+          (missing.length ? ' Run again with Apply to put them back in the queue.' : '')
+    }
+  };
+}
+
+/**
+ * postBatch — sends the next `count` eligible questions of one subject.
+ *
+ * This is the whole posting run: recover abandoned claims, read the queue,
+ * reserve the rows, send each poll, mark each row, and hand back anything it
+ * did not reach. It used to live inside the HTTP handler, which meant the only
+ * way to post was for someone to be holding a browser tab open. It is a
+ * function now because three callers need exactly this behaviour and must not
+ * each grow their own copy of it: the dashboard button, the autopilot, and the
+ * cron route.
+ *
+ * It never throws for an ordinary failure — the outcome is the return value,
+ * because half a batch that posted is still news worth reporting precisely.
+ *
+ * @param {Object} options
+ * @param {Object} options.db Group-bound sheets client
+ * @param {string} options.groupId Which group is posting
+ * @param {string} options.subject Subject tab (already validated)
+ * @param {number} options.count How many to send, capped at MAX_POST_BATCH
+ * @param {boolean} options.requireApproved Exclude Drafts
+ * @param {number} [options.budgetMs] Wall-clock ceiling for the run
+ * @param {Function} [options.emit] Called with each progress event
+ * @param {Function} [options.stopping] Returns true to stop after the question in hand
+ * @returns {Promise<{status: number, payload: Object}>}
+ */
+async function postBatch(options) {
+  const db = options.db;
+  const groupId = options.groupId;
+  const subject = options.subject;
+  const count = Math.min(Math.max(parseInt(options.count, 10) || 1, 1), MAX_POST_BATCH);
+  const requireApproved = options.requireApproved !== false;
+  const emit = options.emit || (() => {});
+  const stopping = options.stopping || (() => false);
+  const deadline = Date.now() + (Number(options.budgetMs) || POST_BUDGET_MS);
+  const done = (status, payload) => ({ status, payload });
+
+  let chatId;
+  try {
+    ensureTelegram();
+    chatId = telegramChatFor(groupId);
+  } catch (err) {
+    return done(400, { success: false, error: err.message });
+  }
+
+  // Resolve the forum topic for this subject from the Config tab.
+  const config = await db.readConfig();
+  const subjectConfig = config.find((c) => c.subject === subject);
+  if (!subjectConfig) {
+    return done(400, { success: false, error: `"${subject}" is not in the Config tab` });
+  }
+  if (!subjectConfig.topic_thread_id) {
+    return done(400, {
+      success: false,
+      error: `No Telegram topic thread configured for "${subject}". Run: node setup.js`
+    });
+  }
+
+  const lockKey = `${groupId}::${subject}`;
+  if (postsInFlight.has(lockKey)) {
+    return done(409, {
+      success: false,
+      error: `A posting batch for "${subject}" is already running. Wait for it to finish — ` +
+        'starting a second one would post the same questions twice.'
+    });
+  }
+  postsInFlight.add(lockKey);
+
+  try {
+    emit({ type: 'stage', text: 'Checking for questions an interrupted run left behind…' });
+    // A run that was killed mid-batch leaves its unsent rows claimed. They
+    // were never posted, and without this they never could be: they are not
+    // eligible, and no one can clear them from the dashboard. Put them back
+    // before deciding what to send, so "post the rest" is just posting again.
+    const recovered = await recoverAbandonedClaims(db, subject);
+    emit({ type: 'stage', text: `Reading the next ${count} eligible question(s) from the sheet…` });
+    const questions = await db.getUnpostedQuestions(subject, count, requireApproved);
+    if (!questions.length) {
+      return done(200, {
+        success: true,
+        postedCount: 0,
+        requestedCount: count,
+        eligibleCount: 0,
+        failedCount: 0,
+        results: [],
+        message: requireApproved
+          ? `No Approved or Scheduled questions waiting in "${subject}"`
+          : `No unposted questions left in "${subject}"`
+      });
+    }
+
+    // ---- Claim before sending ------------------------------------------
+    // A poll can reach Telegram and still leave this process with a timeout
+    // or a dropped connection. Marking only after a confirmed send therefore
+    // left delivered questions looking unposted, and they went out again on
+    // every subsequent run — two of them were stuck in that loop. Claiming
+    // first means the worst case is a question that needs a human to resolve,
+    // never one that is posted twice.
+    emit({ type: 'stage', text: `Reserving ${questions.length} question(s) so none can go out twice…` });
+    const rowsWanted = questions.map((q) => sheets.sheetRowOf(q));
+    const claim = await db.claimQuestions(subject, rowsWanted);
+    const claimedRows = new Set(claim.claimed);
+
+    const results = [];
+    // Every outcome is also streamed the moment it is known.
+    const record = (item) => { results.push(item); emit(Object.assign({ type: 'result' }, item)); };
+    const postedRowIndices = [];
+    const strandedRows = [];
+
+    // Anything another run took first is reported, not silently dropped.
+    for (const skip of claim.skipped || []) {
+      const q = questions.find((item) => sheets.sheetRowOf(item) === Number(skip.row));
+      record({
+        questionId: q ? q.question_id : `row ${skip.row}`,
+        ok: false,
+        error: `Skipped — ${skip.reason}.`,
+        preview: q ? q.question_text.slice(0, 80) : ''
+      });
+    }
+
+    const toSend = questions.filter((q) => claimedRows.has(sheets.sheetRowOf(q)));
+    emit({ type: 'plan', total: toSend.length, eligible: questions.length, skipped: (claim.skipped || []).length });
+
+    for (let i = 0; i < toSend.length; i++) {
+      const q = toSend[i];
+      const sheetRow = sheets.sheetRowOf(q);
+
+      // Stop cleanly while there is still time to record what has been sent,
+      // and hand back what was never attempted.
+      if (Date.now() > deadline || stopping()) {
+        const untouched = toSend.slice(i).map((rest) => sheets.sheetRowOf(rest));
+        try {
+          await db.releaseQuestions(subject, untouched, q.status);
+        } catch (releaseErr) {
+          console.error('[post] could not release unsent rows:', releaseErr.message);
+        }
+        toSend.slice(i).forEach((rest) => record({
+          questionId: rest.question_id,
+          ok: false,
+          error: stopping()
+            ? 'Not sent — posting was stopped. It is back in the queue.'
+            : 'Stopped before the request timed out — run again to post the rest.',
+          preview: rest.question_text.slice(0, 80)
+        }));
+        break;
+      }
+
+      emit({
+        type: 'sending', index: i + 1, total: toSend.length,
+        questionId: q.question_id, preview: String(q.question_text || '').slice(0, 80)
+      });
+
+      try {
+        const sent = await telegram.sendQuizPoll(subjectConfig.topic_thread_id, q, chatId);
+
+        const messageId = sent && sent.message_id ? sent.message_id : null;
+        const pollIds = sent && sent.poll && sent.poll.id
+          ? { [String(sheetRow)]: sent.poll.id }
+          : null;
+
+        try {
+          await db.markAsPosted(
+            subject, [sheetRow], messageId, subjectConfig.topic_thread_id, pollIds
+          );
+          postedRowIndices.push(sheetRow);
+          record({ questionId: q.question_id, ok: true, preview: q.question_text.slice(0, 80) });
+        } catch (markErr) {
+          // The poll is public and the row is still claimed, so it cannot go
+          // out again. It needs a person, and says so.
+          console.error(`[post] row ${sheetRow} posted but not marked:`, markErr.message);
+          strandedRows.push(sheetRow);
+          await holdForChecking(db, subject, sheetRow,
+            `Posted to Telegram${messageId ? ` (message ${messageId})` : ''} but the sheet write failed: ${markErr.message}`);
+          record({
+            questionId: q.question_id,
+            ok: false,
+            error: `Posted to Telegram, but the sheet did not record it (${markErr.message}). ` +
+                   `Row ${sheetRow} is held for checking so it cannot be posted twice — mark it Posted by hand.`,
+            preview: q.question_text.slice(0, 80)
+          });
+        }
+      } catch (err) {
+        // Did Telegram refuse it, or did the answer go missing? Only a refusal
+        // proves nothing was delivered, and only then is it safe to hand the
+        // row back. Anything else keeps the claim.
+        if (telegram.wasRejectedBeforeDelivery(err)) {
+          try {
+            await db.releaseQuestions(subject, [sheetRow], q.status);
+          } catch (releaseErr) {
+            console.error(`[post] could not release row ${sheetRow}:`, releaseErr.message);
+          }
+          record({
+            questionId: q.question_id, ok: false,
+            error: `Telegram refused it: ${err.message}`,
+            preview: q.question_text.slice(0, 80)
+          });
+        } else {
+          strandedRows.push(sheetRow);
+          await holdForChecking(db, subject, sheetRow,
+            `No answer from Telegram when posting: ${err.message}. It may or may not have gone out.`);
+          record({
+            questionId: q.question_id, ok: false,
+            error: `No answer from Telegram (${err.message}). It may or may not have gone out, ` +
+                   `so row ${sheetRow} is held for checking rather than risking a duplicate. Check the channel.`,
+            preview: q.question_text.slice(0, 80)
+          });
+        }
+      }
+
+      // Telegram allows roughly 20 messages a minute into one group and each
+      // question costs two or three, so pace the batch. A 429 is still handled
+      // inside src/telegram.js, this just makes hitting one much less likely.
+      if (i < toSend.length - 1) await sleep(telegram.POST_SPACING_MS);
+    }
+
+    const postedCount = postedRowIndices.length;
+    const remaining = questions.length - postedCount;
+
+    // "2 of 2 posted" after asking for 5 reads like a failure and explains
+    // nothing. When fewer were eligible than were asked for, say so and say
+    // what the rest are, so the answer is not "the poster is broken".
+    let message = `${postedCount} of ${questions.length} question(s) posted to "${subject}"`;
+    if (questions.length < count) {
+      emit({ type: 'stage', text: 'Checking why fewer questions were ready than asked for…' });
+      const shortfall = await describeShortfall(db, subject, count, questions.length, requireApproved);
+      message += ` — you asked for ${count}, and ${questions.length} ${questions.length === 1 ? 'was' : 'were'} ready. ${shortfall}`;
+    } else if (remaining) {
+      message += ` — run again to send the remaining ${remaining}`;
+    }
+    if (recovered.length) {
+      message += ` ♻️ ${recovered.length} question(s) left claimed by an interrupted run were put back in the queue first.`;
+    }
+    if (strandedRows.length) {
+      message += ` ⚠️ ${strandedRows.length} row(s) are held for checking — they may be in the channel.`;
+    }
+
+    return done(200, {
+      success: true,
+      postedCount,
+      requestedCount: count,
+      eligibleCount: questions.length,
+      recoveredRows: recovered.map((r) => r.row),
+      strandedRows,
+      failedCount: questions.length - postedCount,
+      results,
+      message,
+      // Which route reached the sheet, so a deploy can be checked at a glance.
+      sheetAccess: db.direct ? 'sheets-api' : 'apps-script'
+    });
+
+  } catch (err) {
+    console.error(`[post] ${subject} failed:`, err.message);
+    return done(err.statusCode || 500, { success: false, error: err.message });
+  } finally {
+    postsInFlight.delete(lockKey);
+  }
+}
+
+
 /** Small promise delay used to stay under Telegram's rate limits. */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1291,27 +1758,7 @@ async function handlePublicRoute(pathname, method, req, res) {
   // `Authorization: Bearer $CRON_SECRET`, and without a matching secret this
   // refuses to run — otherwise anyone who found the URL could trigger removals.
   if (pathname === '/api/cron/sweep' && (method === 'POST' || method === 'GET')) {
-    const secret = String(process.env.CRON_SECRET || '').trim();
-    if (!secret) {
-      sendJSON(res, 503, {
-        success: false,
-        error: 'CRON_SECRET is not set, so the scheduled sweep refuses to run.'
-      });
-      return true;
-    }
-
-    const offered = String(req.headers.authorization || '');
-    // Constant-time compare: a timing oracle on a secret that can remove paying
-    // members is not worth saving three lines over.
-    const expected = `Bearer ${secret}`;
-    const a = Buffer.from(offered);
-    const b = Buffer.from(expected);
-    const authorised = a.length === b.length && crypto.timingSafeEqual(a, b);
-
-    if (!authorised) {
-      sendJSON(res, 401, { success: false, error: 'Unauthorised' });
-      return true;
-    }
+    if (!authoriseCron(req, res)) return true;
 
     try {
       const summary = await membership.runDailyCheckAllGroups({ dryRun: false });
@@ -1325,6 +1772,83 @@ async function handlePublicRoute(pathname, method, req, res) {
       console.error('[cron] sweep failed:', err.message);
       sendJSON(res, 500, { success: false, error: err.message });
     }
+    return true;
+  }
+
+  // ---- Autopilot tick (serverless) ----------------------------------------
+  // On Vercel nothing survives between requests, so the in-process timer never
+  // fires: a job started from the dashboard would be forgotten the moment the
+  // response was sent. Vercel Cron calling this is the scheduler there, and it
+  // runs exactly the same tick the timer does.
+  //
+  // Same authorisation as the expiry sweep: this posts to a public channel, so
+  // an unauthenticated caller who found the URL must not be able to trigger it.
+  if (pathname === '/api/cron/autopilot' && (method === 'POST' || method === 'GET')) {
+    if (!authoriseCron(req, res)) return true;
+
+    try {
+      const ran = await autopilot.tick();
+      if (ran.length) {
+        console.log(`[cron] autopilot ran ${ran.length} job(s): ` +
+          ran.map((r) => `${r.subject} (+${r.run.posted})`).join(', '));
+      }
+      sendJSON(res, 200, { success: true, data: { ran, jobs: autopilot.list() } });
+    } catch (err) {
+      console.error('[cron] autopilot failed:', err.message);
+      sendJSON(res, 500, { success: false, error: err.message });
+    }
+    return true;
+  }
+
+  // ---- Deleted-poll sweep (serverless) -------------------------------------
+  // The half of "keep the sheet honest" that has to keep working when nobody
+  // is watching: a poll deleted in Telegram leaves the sheet claiming it was
+  // posted, so the question can never be re-sent and every count is wrong.
+  // One subject per group per call, taking the next in rotation, because each
+  // row costs a Telegram call and a rate-limit pause.
+  if (pathname === '/api/cron/reconcile' && (method === 'POST' || method === 'GET')) {
+    if (!authoriseCron(req, res)) return true;
+
+    const results = [];
+    for (const group of groupRegistry.listGroups()) {
+      if (!group.ready) continue;
+      try {
+        const groupDb = sheets.forGroup(group.id);
+        const config = await groupDb.readConfig();
+        const subjects = config.map((c) => c.subject).filter(Boolean);
+        if (!subjects.length) continue;
+
+        // Round-robin across this group's subjects, so a daily cron eventually
+        // covers all of them instead of only ever checking the first.
+        const at = cronReconcileTurn.get(group.id) || 0;
+        const subject = subjects[at % subjects.length];
+        cronReconcileTurn.set(group.id, (at + 1) % subjects.length);
+
+        const outcome = await reconcileChannel({
+          db: groupDb,
+          groupId: group.id,
+          subject,
+          apply: true,
+          limit: AUTOPILOT_RECONCILE_LIMIT,
+          budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
+          actor: 'cron'
+        });
+        results.push({
+          groupId: group.id,
+          subject,
+          restored: outcome.payload.restored || 0,
+          checked: outcome.payload.checked || 0,
+          complete: outcome.payload.complete === true
+        });
+      } catch (err) {
+        console.error(`[cron] reconcile failed for ${group.id}: ${err.message}`);
+        results.push({ groupId: group.id, error: err.message });
+      }
+    }
+
+    const restored = results.reduce((sum, r) => sum + (r.restored || 0), 0);
+    console.log(`[cron] deleted-poll sweep put ${restored} question(s) back in the queue`);
+    sendJSON(res, 200, { success: true, data: { results, restored } });
     return true;
   }
 
@@ -2325,12 +2849,12 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const status = str(body.status, 20);
     if (!status) { sendJSON(res, 400, { success: false, error: 'Missing status' }); return true; }
 
-    const updatedCount = await db.bulkStatus(subject.value, ids, status, actor);
-    sendJSON(res, 200, { success: true, updatedCount });
+    const result = await db.bulkStatus(subject.value, ids, status, actor);
+    sendJSON(res, 200, Object.assign({ success: true }, result));
     return true;
   }
 
-  // ---- Schedule ------------------------------------------------------------
+  // ---- Queue and unqueue ---------------------------------------------------
   if (pathname === '/api/questions/schedule' && method === 'POST') {
     const body = await readJsonBody(req);
     const subject = validateSubject(body.subject);
@@ -2338,9 +2862,31 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
 
     const ids = Array.isArray(body.questionIds) ? body.questionIds.map((id) => str(id, 60)).filter(Boolean) : [];
     if (!ids.length) { sendJSON(res, 400, { success: false, error: 'No questionIds provided' }); return true; }
+    if (ids.length > 200) { sendJSON(res, 400, { success: false, error: 'Too many questionIds (max 200)' }); return true; }
 
-    const updatedCount = await db.scheduleQuestions(subject.value, ids, str(body.scheduledFor, 40), actor);
-    sendJSON(res, 200, { success: true, updatedCount });
+    const result = await db.scheduleQuestions(subject.value, ids, str(body.scheduledFor, 40), actor);
+    sendJSON(res, 200, Object.assign({ success: true }, result));
+    return true;
+  }
+
+  // Takes questions back out of the queue. Queueing was a one-way door: the
+  // only way back was to open the sheet and edit two columns by hand on every
+  // row, which is exactly the work this dashboard exists to remove.
+  if (pathname === '/api/questions/unschedule' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const subject = validateSubject(body.subject);
+    if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
+
+    const ids = Array.isArray(body.questionIds) ? body.questionIds.map((id) => str(id, 60)).filter(Boolean) : [];
+    if (!ids.length) { sendJSON(res, 400, { success: false, error: 'No questionIds provided' }); return true; }
+    if (ids.length > 200) { sendJSON(res, 400, { success: false, error: 'Too many questionIds (max 200)' }); return true; }
+
+    // Approved by default: a question that was ready enough to queue is still
+    // ready, so unqueueing should not quietly send it back for review.
+    const status = str(body.status, 20) || 'Approved';
+    const result = await db.unscheduleQuestions(subject.value, ids, status, actor);
+    console.log(`[questions] ${actor} unqueued ${result.updatedCount} question(s) in "${subject.value}"`);
+    sendJSON(res, 200, Object.assign({ success: true }, result));
     return true;
   }
 
@@ -2461,55 +3007,81 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const subject = validateSubject(body.subject);
     if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
 
-    let chatId;
-    try {
-      ensureTelegram();
-      chatId = telegramChatFor(groupId);
-    } catch (err) {
-      sendJSON(res, 400, { success: false, error: err.message });
-      return true;
-    }
+    const outcome = await reconcileChannel({
+      db,
+      groupId,
+      subject: subject.value,
+      // Reporting only unless asked to write, so it can be run to look first.
+      apply: body.apply === true,
+      limit: parseInt(body.limit, 10) || 0,
+      actor
+    });
+    sendJSON(res, outcome.status, outcome.payload);
+    return true;
+  }
 
-    // Reporting only unless asked to write, so it can be run to look first.
-    const apply = body.apply === true;
-    const deadline = Date.now() + POST_BUDGET_MS;
-
-    const posted = await db.listPosted(subject.value);
-    const missing = [];
-    const unknown = [];
-    let checked = 0;
-
-    for (const row of posted) {
-      if (Date.now() > deadline) break;
-      checked++;
-
-      const exists = await telegram.pollStillExists(row.message_id, chatId);
-      if (exists === false) missing.push(row);
-      else if (exists === null) unknown.push(row.question_id);
-
-      // Telegram rate-limits edits like anything else.
-      await sleep(400);
-    }
-
-    let restored = 0;
-    if (apply && missing.length) {
-      restored = await db.unpostQuestions(subject.value, missing.map((m) => m.row), 'Approved');
-      console.log(`[reconcile] ${actor} returned ${restored} deleted poll(s) to the queue in "${subject.value}"`);
-    }
-
+  // ---- Autopilot -----------------------------------------------------------
+  // "Every 5 minutes, post the next 20 questions until there are none left."
+  // Before this the only unattended posting was a cron expression in the
+  // Config tab driving `node schedule.js` from a terminal that has to stay
+  // open — nothing a curator could start, watch or stop from the dashboard.
+  if (pathname === '/api/automation/autopilot' && method === 'GET') {
     sendJSON(res, 200, {
       success: true,
-      applied: apply,
-      checked,
-      totalPosted: posted.length,
-      missing: missing.map((m) => ({ questionId: m.question_id, row: m.row, messageId: m.message_id })),
-      // Named, so "3 could not be checked" is actionable rather than ominous.
-      unknown,
-      restored,
-      message: apply
-        ? `${restored} deleted poll(s) put back in the queue for "${subject.value}".`
-        : `${missing.length} of ${checked} checked poll(s) are no longer in the channel.` +
-          (missing.length ? ' Run again with Apply to put them back in the queue.' : '')
+      data: {
+        // Only this group's jobs: the page shows one group at a time, and
+        // another group's job is not this curator's business.
+        jobs: autopilot.list().filter((job) => job.groupId === groupId),
+        // A job here lives in this process. On a serverless deployment that
+        // process is gone between requests, so the page has to say so rather
+        // than show a job that will never run again.
+        persistent: !process.env.VERCEL,
+        tickSeconds: Math.round(autopilotFactory.TICK_MS / 1000),
+        maxBatch: MAX_POST_BATCH,
+        emptyRunsBeforeStop: autopilotFactory.EMPTY_RUNS_BEFORE_STOP
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/automation/autopilot' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const subject = validateSubject(body.subject);
+    if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
+
+    const job = autopilot.start(groupId, subject.value, {
+      intervalMinutes: body.intervalMinutes,
+      batchSize: body.batchSize,
+      requireApproved: body.requireApproved,
+      stopWhenEmpty: body.stopWhenEmpty,
+      reconcileEveryRuns: body.reconcileEveryRuns
+    }, actor);
+
+    console.log(`[autopilot] ${actor} started "${subject.value}": ` +
+      `${job.settings.batchSize} question(s) every ${job.settings.intervalMinutes} min`);
+    sendJSON(res, 200, { success: true, data: job, persistent: !process.env.VERCEL });
+    return true;
+  }
+
+  if (pathname === '/api/automation/autopilot/stop' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const subject = validateSubject(body.subject);
+    if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
+
+    const job = autopilot.stop(groupId, subject.value, `Stopped by ${actor}.`);
+    if (!job) {
+      sendJSON(res, 404, { success: false, error: `Nothing is running for "${subject.value}".` });
+      return true;
+    }
+    console.log(`[autopilot] ${actor} stopped "${subject.value}"`);
+    // A batch already in flight finishes — it is mid-send to a public channel,
+    // and abandoning it is how a question ends up posted but unrecorded.
+    sendJSON(res, 200, {
+      success: true,
+      data: job,
+      message: job.busy
+        ? 'Stopped. The batch already sending will finish, and nothing new will start.'
+        : 'Stopped.'
     });
     return true;
   }
@@ -2520,42 +3092,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const subject = validateSubject(body.subject);
     if (!subject.ok) { sendJSON(res, 400, { success: false, error: subject.error }); return true; }
 
-    const count = Math.min(Math.max(parseInt(body.count, 10) || 1, 1), MAX_POST_BATCH);
-    const requireApproved = body.requireApproved !== false;
-    const deadline = Date.now() + POST_BUDGET_MS;
-
-    let chatId;
-    try {
-      ensureTelegram();
-      chatId = telegramChatFor(groupId);
-    } catch (err) {
-      sendJSON(res, 400, { success: false, error: err.message });
-      return true;
-    }
-
-    // Resolve the forum topic for this subject from the Config tab.
-    const config = await db.readConfig();
-    const subjectConfig = config.find((c) => c.subject === subject.value);
-    if (!subjectConfig) {
-      sendJSON(res, 400, { success: false, error: `"${subject.value}" is not in the Config tab` });
-      return true;
-    }
-    if (!subjectConfig.topic_thread_id) {
-      sendJSON(res, 400, { success: false, error: `No Telegram topic thread configured for "${subject.value}". Run: node setup.js` });
-      return true;
-    }
-
-    const lockKey = `${groupId}::${subject.value}`;
-    if (postsInFlight.has(lockKey)) {
-      sendJSON(res, 409, {
-        success: false,
-        error: `A posting batch for "${subject.value}" is already running. Wait for it to finish — starting a second one would post the same questions twice.`
-      });
-      return true;
-    }
-    postsInFlight.add(lockKey);
-
-    // ---- Live progress --------------------------------------------------
+    // ---- Live progress ----------------------------------------------------
     // A batch runs for minutes — every question is a Telegram send plus a
     // sheet write, and Apps Script alone can take 10s a call. Answering once
     // at the end left the page showing "Posting…" with no way to tell a slow
@@ -2568,11 +3105,6 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       if (!streaming || res.writableEnded) return;
       try { res.write(JSON.stringify(event) + '\n'); } catch (err) { clientGone = true; }
     };
-    const finish = (status, payload) => {
-      if (!streaming) { sendJSON(res, status, payload); return; }
-      emit(Object.assign({ type: 'done', status }, payload));
-      res.end();
-    };
     if (streaming) {
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -2584,198 +3116,20 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       res.on('close', () => { if (!res.writableEnded) clientGone = true; });
     }
 
-    try {
-      emit({ type: 'stage', text: 'Checking for questions an interrupted run left behind…' });
-      // A run that was killed mid-batch leaves its unsent rows claimed. They
-      // were never posted, and without this they never could be: they are not
-      // eligible, and no one can clear them from the dashboard. Put them back
-      // before deciding what to send, so "post the rest" is just posting again.
-      const recovered = await recoverAbandonedClaims(db, subject.value);
-      emit({ type: 'stage', text: `Reading the next ${count} eligible question(s) from the sheet…` });
-      const questions = await db.getUnpostedQuestions(subject.value, count, requireApproved);
-      if (!questions.length) {
-        finish(200, {
-          success: true,
-          postedCount: 0,
-          requestedCount: count,
-          results: [],
-          message: requireApproved
-            ? `No Approved or Scheduled questions waiting in "${subject.value}"`
-            : `No unposted questions left in "${subject.value}"`
-        });
-        return true;
-      }
+    const outcome = await postBatch({
+      db,
+      groupId,
+      subject: subject.value,
+      count: body.count,
+      requireApproved: body.requireApproved !== false,
+      emit,
+      stopping: () => clientGone
+    });
 
-      // ---- Claim before sending ------------------------------------------
-      // A poll can reach Telegram and still leave this process with a timeout
-      // or a dropped connection. Marking only after a confirmed send therefore
-      // left delivered questions looking unposted, and they went out again on
-      // every subsequent run — two of them were stuck in that loop. Claiming
-      // first means the worst case is a question that needs a human to resolve,
-      // never one that is posted twice.
-      emit({ type: 'stage', text: `Reserving ${questions.length} question(s) so none can go out twice…` });
-      const rowsWanted = questions.map((q) => sheets.sheetRowOf(q));
-      const claim = await db.claimQuestions(subject.value, rowsWanted);
-      const claimedRows = new Set(claim.claimed);
-
-      const results = [];
-      // Every outcome is also streamed the moment it is known.
-      const record = (item) => { results.push(item); emit(Object.assign({ type: 'result' }, item)); };
-      const postedRowIndices = [];
-      const strandedRows = [];
-
-      // Anything another run took first is reported, not silently dropped.
-      for (const skip of claim.skipped || []) {
-        const q = questions.find((item) => sheets.sheetRowOf(item) === Number(skip.row));
-        record({
-          questionId: q ? q.question_id : `row ${skip.row}`,
-          ok: false,
-          error: `Skipped — ${skip.reason}.`,
-          preview: q ? q.question_text.slice(0, 80) : ''
-        });
-      }
-
-      const toSend = questions.filter((q) => claimedRows.has(sheets.sheetRowOf(q)));
-      emit({ type: 'plan', total: toSend.length, eligible: questions.length, skipped: (claim.skipped || []).length });
-
-      for (let i = 0; i < toSend.length; i++) {
-        const q = toSend[i];
-        const sheetRow = sheets.sheetRowOf(q);
-
-        // Stop cleanly while there is still time to record what has been sent,
-        // and hand back what was never attempted.
-        if (Date.now() > deadline || clientGone) {
-          const untouched = toSend.slice(i).map((rest) => sheets.sheetRowOf(rest));
-          try {
-            await db.releaseQuestions(subject.value, untouched, q.status);
-          } catch (releaseErr) {
-            console.error('[post] could not release unsent rows:', releaseErr.message);
-          }
-          toSend.slice(i).forEach((rest) => record({
-            questionId: rest.question_id,
-            ok: false,
-            error: clientGone
-              ? 'Not sent — posting was stopped. It is back in the queue.'
-              : 'Stopped before the request timed out — run again to post the rest.',
-            preview: rest.question_text.slice(0, 80)
-          }));
-          break;
-        }
-
-        emit({
-          type: 'sending', index: i + 1, total: toSend.length,
-          questionId: q.question_id, preview: String(q.question_text || '').slice(0, 80)
-        });
-
-        try {
-          const sent = await telegram.sendQuizPoll(subjectConfig.topic_thread_id, q, chatId);
-
-          const messageId = sent && sent.message_id ? sent.message_id : null;
-          const pollIds = sent && sent.poll && sent.poll.id
-            ? { [String(sheetRow)]: sent.poll.id }
-            : null;
-
-          try {
-            await db.markAsPosted(
-              subject.value, [sheetRow], messageId, subjectConfig.topic_thread_id, pollIds
-            );
-            postedRowIndices.push(sheetRow);
-            record({ questionId: q.question_id, ok: true, preview: q.question_text.slice(0, 80) });
-          } catch (markErr) {
-            // The poll is public and the row is still claimed, so it cannot go
-            // out again. It needs a person, and says so.
-            console.error(`[post] row ${sheetRow} posted but not marked:`, markErr.message);
-            strandedRows.push(sheetRow);
-            await holdForChecking(db, subject.value, sheetRow,
-              `Posted to Telegram${messageId ? ` (message ${messageId})` : ''} but the sheet write failed: ${markErr.message}`);
-            record({
-              questionId: q.question_id,
-              ok: false,
-              error: `Posted to Telegram, but the sheet did not record it (${markErr.message}). ` +
-                     `Row ${sheetRow} is held for checking so it cannot be posted twice — mark it Posted by hand.`,
-              preview: q.question_text.slice(0, 80)
-            });
-          }
-        } catch (err) {
-          // Did Telegram refuse it, or did the answer go missing? Only a refusal
-          // proves nothing was delivered, and only then is it safe to hand the
-          // row back. Anything else keeps the claim.
-          if (telegram.wasRejectedBeforeDelivery(err)) {
-            try {
-              await db.releaseQuestions(subject.value, [sheetRow], q.status);
-            } catch (releaseErr) {
-              console.error(`[post] could not release row ${sheetRow}:`, releaseErr.message);
-            }
-            record({
-              questionId: q.question_id, ok: false,
-              error: `Telegram refused it: ${err.message}`,
-              preview: q.question_text.slice(0, 80)
-            });
-          } else {
-            strandedRows.push(sheetRow);
-            await holdForChecking(db, subject.value, sheetRow,
-              `No answer from Telegram when posting: ${err.message}. It may or may not have gone out.`);
-            record({
-              questionId: q.question_id, ok: false,
-              error: `No answer from Telegram (${err.message}). It may or may not have gone out, ` +
-                     `so row ${sheetRow} is held for checking rather than risking a duplicate. Check the channel.`,
-              preview: q.question_text.slice(0, 80)
-            });
-          }
-        }
-
-        // Telegram allows roughly 20 messages a minute into one group and each
-        // question costs two or three, so pace the batch. A 429 is still handled
-        // inside src/telegram.js, this just makes hitting one much less likely.
-        if (i < toSend.length - 1) await sleep(telegram.POST_SPACING_MS);
-      }
-
-      const postedCount = postedRowIndices.length;
-      const remaining = questions.length - postedCount;
-
-      // "2 of 2 posted" after asking for 5 reads like a failure and explains
-      // nothing. When fewer were eligible than were asked for, say so and say
-      // what the rest are, so the answer is not "the poster is broken".
-      let message = `${postedCount} of ${questions.length} question(s) posted to "${subject.value}"`;
-      if (questions.length < count) {
-        emit({ type: 'stage', text: 'Checking why fewer questions were ready than asked for…' });
-        const shortfall = await describeShortfall(db, subject.value, count, questions.length, requireApproved);
-        message += ` — you asked for ${count}, and ${questions.length} ${questions.length === 1 ? 'was' : 'were'} ready. ${shortfall}`;
-      } else if (remaining) {
-        message += ` — run again to send the remaining ${remaining}`;
-      }
-      if (recovered.length) {
-        message += ` ♻️ ${recovered.length} question(s) left claimed by an interrupted run were put back in the queue first.`;
-      }
-      if (strandedRows.length) {
-        message += ` ⚠️ ${strandedRows.length} row(s) are held for checking — they may be in the channel.`;
-      }
-
-      finish(200, {
-        success: true,
-        postedCount,
-        requestedCount: count,
-        eligibleCount: questions.length,
-        recoveredRows: recovered.map((r) => r.row),
-        strandedRows,
-        failedCount: questions.length - postedCount,
-        results,
-        message,
-        // Which route reached the sheet, so a deploy can be checked at a glance.
-        sheetAccess: db.direct ? 'sheets-api' : 'apps-script'
-      });
-      return true;
-
-    } catch (err) {
-      // Once streaming, the status line has gone out, so a failure has to be
-      // reported in the stream rather than thrown to the generic handler.
-      if (!streaming) throw err;
-      console.error(`[post] ${subject.value} failed:`, err.message);
-      finish(err.statusCode || 500, { success: false, error: err.message });
-      return true;
-    } finally {
-      postsInFlight.delete(lockKey);
-    }
+    if (!streaming) { sendJSON(res, outcome.status, outcome.payload); return true; }
+    emit(Object.assign({ type: 'done', status: outcome.status }, outcome.payload));
+    res.end();
+    return true;
   }
 
   return false;
