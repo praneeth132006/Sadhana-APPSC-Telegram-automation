@@ -1077,6 +1077,9 @@ const autopilot = autopilotFactory.createAutopilot({
       groupId,
       subject,
       apply: true,
+      // Never re-queue unattended: a question someone deleted from the channel
+      // would go back out within the interval, and nobody would be watching.
+      action: 'mark',
       limit: AUTOPILOT_RECONCILE_LIMIT,
       budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
       actor: 'autopilot'
@@ -1118,6 +1121,13 @@ const reconcileCursor = new Map();
  */
 async function reconcileChannel(options) {
   const { db, groupId, subject, apply, actor } = options;
+
+  // What to do with a poll that is gone. Marking is the default, and the old
+  // default of re-queueing was wrong in the common case: a curator who deletes
+  // a poll from the channel has decided that question should not be there, and
+  // putting it back in the queue posts it again a few minutes later. Getting
+  // it back out is a separate decision a person makes on purpose.
+  const action = options.action === 'requeue' ? 'requeue' : 'mark';
 
   let chatId;
   try {
@@ -1165,10 +1175,20 @@ async function reconcileChannel(options) {
   reconcileCursor.set(cursorKey, checked >= ordered.length ? 0 : lastRow);
 
   let restored = 0;
+  let marked = 0;
   if (apply && missing.length) {
-    restored = await db.unpostQuestions(subject, missing.map((m) => m.row), 'Approved');
-    console.log(`[reconcile] ${actor || 'autopilot'} returned ${restored} deleted poll(s) ` +
-      `to the queue in "${subject}"`);
+    const rowNumbers = missing.map((m) => m.row);
+    if (action === 'requeue') {
+      restored = await db.unpostQuestions(subject, rowNumbers, 'Approved');
+      console.log(`[reconcile] ${actor || 'the deleted-poll check'} returned ${restored} deleted ` +
+        `poll(s) to the queue in "${subject}"`);
+    } else {
+      marked = await db.markDeleted(subject, rowNumbers,
+        `Deleted from the Telegram group — the poll is no longer there. ` +
+        `Noticed by ${actor || 'the scheduled deleted-poll check'}.`);
+      console.log(`[reconcile] ${actor || 'the deleted-poll check'} marked ${marked} question(s) ` +
+        `Deleted in "${subject}"`);
+    }
   }
 
   const swept = checked >= ordered.length;
@@ -1182,12 +1202,17 @@ async function reconcileChannel(options) {
       missing: missing.map((m) => ({ questionId: m.question_id, row: m.row, messageId: m.message_id })),
       // Named, so "3 could not be checked" is actionable rather than ominous.
       unknown,
+      action,
       restored,
+      marked,
       // A partial sweep has to say so, or "0 deleted" sounds like the whole
       // channel was checked when only the first few rows were.
       complete: swept,
       message: apply
-        ? `${restored} deleted poll(s) put back in the queue for "${subject}".`
+        ? (action === 'requeue'
+          ? `${restored} deleted poll(s) put back in the queue for "${subject}".`
+          : `${marked} question(s) marked Deleted in "${subject}". They stay out of the queue, ` +
+            'so none of them will be posted again.')
         : `${missing.length} of ${checked} checked poll(s) are no longer in the channel.` +
           (swept ? '' : ` ${ordered.length - checked} more will be checked on the next pass.`) +
           (missing.length ? ' Run again with Apply to put them back in the queue.' : '')
@@ -1833,14 +1858,15 @@ async function handlePublicRoute(pathname, method, req, res) {
           groupId: group.id,
           subject,
           apply: true,
+          action: 'mark',
           limit: AUTOPILOT_RECONCILE_LIMIT,
           budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
-          actor: 'cron'
+          actor: 'the nightly deleted-poll check'
         });
         results.push({
           groupId: group.id,
           subject,
-          restored: outcome.payload.restored || 0,
+          marked: outcome.payload.marked || 0,
           checked: outcome.payload.checked || 0,
           complete: outcome.payload.complete === true
         });
@@ -1850,9 +1876,9 @@ async function handlePublicRoute(pathname, method, req, res) {
       }
     }
 
-    const restored = results.reduce((sum, r) => sum + (r.restored || 0), 0);
-    console.log(`[cron] deleted-poll sweep put ${restored} question(s) back in the queue`);
-    sendJSON(res, 200, { success: true, data: { results, restored } });
+    const marked = results.reduce((sum, r) => sum + (r.marked || 0), 0);
+    console.log(`[cron] deleted-poll sweep marked ${marked} question(s) Deleted`);
+    sendJSON(res, 200, { success: true, data: { results, marked } });
     return true;
   }
 
@@ -3017,6 +3043,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       subject: subject.value,
       // Reporting only unless asked to write, so it can be run to look first.
       apply: body.apply === true,
+      action: str(body.action, 10),
       limit: parseInt(body.limit, 10) || 0,
       actor
     });

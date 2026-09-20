@@ -112,10 +112,32 @@
 
             <hr style="border:none;border-top:1px solid var(--border-subtle);margin:18px 0">
 
+            <div class="editor-field full" style="margin-bottom:10px">
+              <label for="reconcileAction">When a poll has been deleted from Telegram</label>
+              <select id="reconcileAction" class="field-select">
+                <option value="mark" selected>Mark the question Deleted in the sheet (recommended)</option>
+                <option value="requeue">Put it back in the queue, to be posted again</option>
+              </select>
+            </div>
+
             <button id="reconcileBtn" class="btn btn-ghost" style="width:100%">🔍 Check the channel for deleted polls</button>
             <p class="hint-text" style="margin-top:10px">
-              Telegram never tells the bot when a message is deleted. This checks every posted
-              question is still in the channel and offers to put the deleted ones back in the queue.
+              Telegram never tells a bot when one of its messages is deleted — there is no such
+              notification in the Bot API — so the only way to know is to ask about each posted
+              poll in turn. This does that, reports what it found, and writes nothing until you
+              say so.
+            </p>
+            <p class="hint-text" style="margin-top:10px">
+              <strong>Marking</strong> sets <span class="inline-code">Status = Deleted</span> and
+              notes when it was spotted. The row keeps its <span class="inline-code">Posted = YES</span>,
+              which is what keeps it out of the queue: a question you removed from the group is not
+              sent again. Nothing is erased. <strong>Re-queueing</strong> is the opposite choice —
+              for a poll deleted by accident that you do want posted again.
+            </p>
+            <p class="hint-text" style="margin-top:10px">
+              This also runs unattended: nightly for every group, and — if you switch it on —
+              every few autopilot runs for the subject it is posting. Those always mark, never
+              re-queue.
             </p>
             <div id="reconcileLog" class="log-output" style="display:none;margin-top:14px"></div>
 
@@ -260,8 +282,15 @@
           </p>
 
           <p id="autopilotWarning" class="hint-text" style="margin-top:10px;color:var(--warn,#e0a03a)" hidden>
-            ⚠️ This deployment does not keep a job between requests, so the timer here will not fire.
-            Point a scheduled job at <span class="inline-code">/api/cron/autopilot</span> to drive it.
+            ⚠️ <strong>Autopilot will not run on this deployment.</strong> It is serverless: the
+            server only exists while it is answering a request, and it is thrown away afterwards
+            along with any job you start here. There is no process left between requests to wake up
+            five minutes later and post the next batch, so the button will appear to work and then
+            nothing will happen.
+            <br><br>
+            It runs properly wherever the server stays up — <span class="inline-code">npm run dashboard</span>
+            on a machine that does not sleep, or any always-on host. The nightly deleted-poll check
+            is not affected: that one is driven by a scheduled job, so it keeps working here.
           </p>
 
           <div id="autopilotJobs" style="margin-top:16px"></div>

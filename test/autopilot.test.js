@@ -260,7 +260,7 @@ test('the deleted-poll check runs on its own cadence and never fails the run', a
   const h = harness({
     reconcile: async (job) => {
       checks.push(job.subject);
-      if (checks.length === 1) return { restored: 2 };
+      if (checks.length === 1) return { marked: 2 };
       throw new Error('Telegram refused the check');
     }
   });
@@ -270,7 +270,7 @@ test('the deleted-poll check runs on its own cadence and never fails the run', a
 
   assert.equal(checks.length, 2, 'every second run, not every run');
   const job = h.auto.get('g1', 'Polity');
-  assert.equal(job.totals.restored, 2);
+  assert.equal(job.totals.deleted, 2);
   assert.equal(job.totals.runs, 4);
   // The posting is the job; this is housekeeping, so its failure is reported
   // rather than recorded as a failed batch.

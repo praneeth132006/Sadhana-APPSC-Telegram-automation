@@ -10,7 +10,7 @@
 // Group id : appsc_q_en
 // Subjects : 16
 //            Ancient India, Medieval India, Modern India, AP History, Physical Geography, Indian Geography, AP Geography, Indian Economy, AP Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Indian Society, Disaster Management
-// Built    : 2026-09-20T12:04:26.750Z
+// Built    : 2026-09-20T12:31:30.875Z
 // ==========================================================================
 
 // ============================================================================
@@ -110,9 +110,12 @@ var IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 /** Statuses the posting machinery owns. A curator setting one by hand would
  *  desynchronise Status from the Posted column, which is what decides
  *  eligibility — so the row would claim to be posted and be sent again. */
-var MACHINE_OWNED_STATUSES = ['Posted', 'Sending'];
+// "Deleted" belongs here too: it is not an opinion about a question, it is
+// something the deleted-poll sweep saw in the channel, and it is written
+// together with a Posted column that must stay YES.
+var MACHINE_OWNED_STATUSES = ['Posted', 'Sending', 'Deleted'];
 
-var STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+var STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived', 'Deleted'];
 
 /** Allowed values for the Difficulty column. */
 var DIFFICULTY_VALUES = ['Easy', 'Medium', 'Hard'];
@@ -541,7 +544,7 @@ function doGet(e) {
  * doPost — mutating API surface.
  * Actions: addQuestions, markPosted, updateConfig, updateQuestion,
  *          deleteQuestion, bulkDelete, bulkStatus, scheduleQuestions,
- *          unscheduleQuestions, formatQuestions,
+ *          unscheduleQuestions, formatQuestions, markDeleted,
  *          claimQuestions, releaseQuestions, unpostQuestions.
  */
 function doPost(e) {
@@ -807,6 +810,16 @@ function doPost(e) {
       return jsonResponse({
         success: true, updatedCount: scheduled.updatedCount,
         notFound: scheduled.notFound, skipped: scheduled.skipped
+      });
+    }
+
+    if (action === 'markDeleted') {
+      if (!payload.subject || !(payload.rowNumbers || []).length) {
+        return jsonResponse({ success: false, error: 'Missing subject or rowNumbers' });
+      }
+      return jsonResponse({
+        success: true,
+        markedCount: markQuestionsDeleted(payload.subject, payload.rowNumbers, payload.note || '')
       });
     }
 
@@ -1526,6 +1539,9 @@ function listPostedQuestions(subject) {
     if (!q.question_text) continue;
     if (q.posted.toUpperCase() !== 'YES') continue;
     if (!String(q.telegram_msg_id || '').trim()) continue;
+    // Already settled: re-asking Telegram about a message everyone agrees is
+    // gone spends the sweep's budget on rows that need nothing.
+    if (q.status === 'Deleted') continue;
     out.push({
       row: q.excel_row,
       question_id: q.question_id,
@@ -2175,6 +2191,52 @@ function writeQueueChange(sheet, map, questionIds, status, scheduledFor, updated
   }
 
   return { updatedCount: count, notFound: notFound, skipped: skipped };
+}
+
+/**
+ * markQuestionsDeleted — records that a poll is no longer in the channel.
+ *
+ * Posted is deliberately left at YES. The question WAS posted; that is a fact
+ * about the past and this does not undo it. It also keeps the row out of the
+ * posting queue, which is the whole point: a question someone deleted from the
+ * channel must not quietly go back out. Putting it back is a separate decision
+ * a person makes, through unpostQuestions.
+ *
+ * @param {string} subject Subject tab
+ * @param {number[]} rowNumbers 1-based rows
+ * @param {string} note What to record in Review Notes
+ * @returns {number} Rows marked
+ */
+function markQuestionsDeleted(subject, rowNumbers, note) {
+  var sheet = book().getSheetByName(subject);
+  if (!sheet) throw new Error('Sheet tab "' + subject + '" not found.');
+
+  var map = headerMap(sheet);
+  var lastRow = sheet.getLastRow();
+  var now = istNow();
+  var marked = 0;
+
+  for (var i = 0; i < rowNumbers.length; i++) {
+    var n = Number(rowNumbers[i]);
+    if (!(n >= 2) || n > lastRow) continue;
+
+    // Only a row that is actually posted can have been deleted. Anything else
+    // means the sheet moved under the sweep while it was asking Telegram.
+    if (!isPostedValue(sheet.getRange(n, colNum(map, 'Posted')).getValue())) continue;
+    if (String(sheet.getRange(n, colNum(map, 'Status')).getValue() || '').trim() === 'Deleted') continue;
+
+    sheet.getRange(n, colNum(map, 'Status')).setValue('Deleted');
+    sheet.getRange(n, colNum(map, 'Updated At')).setValue(now);
+    sheet.getRange(n, colNum(map, 'Updated By')).setValue('Deleted-poll check');
+    if (note) {
+      var notesCell = sheet.getRange(n, colNum(map, 'Review Notes'));
+      var existing = String(notesCell.getValue() || '');
+      var line = '[' + now + '] ' + note;
+      notesCell.setValue(existing ? existing + '\n' + line : line);
+    }
+    marked++;
+  }
+  return marked;
 }
 
 /** Stamps Scheduled For and flips Status to Scheduled for the given questions. */
@@ -3984,6 +4046,7 @@ function applyConditionalFormatting(sheet) {
     rule(statusRange, 'Review',    '#ffe0b2', '#e65100'),
     rule(statusRange, 'Rejected',  '#ffcdd2', '#b71c1c'),
     rule(statusRange, 'Archived',  '#eceff1', '#455a64'),
+    rule(statusRange, 'Deleted',   '#f8bbd0', '#880e4f'),
     rule(diffRange,   'Easy',      '#dcedc8', '#33691e'),
     rule(diffRange,   'Medium',    '#fff9c4', '#f57f17'),
     rule(diffRange,   'Hard',      '#ffccbc', '#bf360c')

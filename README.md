@@ -175,6 +175,10 @@ have `Posted = NO`, and only one of them should ever reach the channel. The Auto
 dashboard sends only `Approved` or `Scheduled` questions by default, and `Rejected`
 and `Archived` rows are never eligible.
 
+`Posted`, `Sending` and `Deleted` are written by the machinery, not by hand. Each is
+paired with what the `Posted` column says, and setting one by hand desynchronises the
+row — the question then claims to be posted and is sent again anyway.
+
 **Why `Dup Hash` matters:** the question text is lowercased and stripped of
 punctuation and whitespace before hashing, so re-pasting the same question with
 different formatting is still recognised as a duplicate rather than silently doubling
@@ -207,53 +211,50 @@ halfway hands back what it did not send. Beyond that:
 
 Optionally it also checks for deleted polls every few runs (see below).
 
-**On Vercel** nothing survives between requests, so the in-process timer never fires
-and the page says so. Point a scheduled job at `/api/cron/autopilot` — it runs the
-same tick — with `Authorization: Bearer $CRON_SECRET`. Frequent crons need a plan
-that allows them; running `npm run dashboard` on a machine that stays awake needs
-nothing at all.
+**Autopilot needs a server that stays up.** On a serverless deployment the server
+only exists while it is answering a request and is thrown away afterwards, along with
+any job started from the dashboard — there is no process left to wake up five minutes
+later and post the next batch. The page says so plainly when that is where it is
+running. `npm run dashboard` on a machine that does not sleep, or any always-on host,
+works with no extra setup. The nightly deleted-poll check is unaffected either way:
+it is driven by a scheduled job rather than by a timer in the process.
 
 ---
 
 ## Deleted polls, and keeping the sheet honest
 
-Telegram never tells a bot that a message was deleted. Without something watching,
-a poll removed from the channel leaves the sheet claiming it was posted for ever:
-the question can never be re-sent, and every count is wrong.
+Telegram never tells a bot that one of its own messages was deleted — there is no
+such notification in the Bot API, and no "get message" call either. The only way to
+know is to ask about each posted poll in turn, which is what the check does.
 
-**Check the channel for deleted polls** on the Automation page walks the posted rows,
-asks Telegram whether each poll is still there, and offers to put the deleted ones
-back in the queue as `Approved`. It reports before it writes, and a poll it *cannot*
-tell about is left alone — guessing "deleted" would post a live question a second
-time, which is the opposite of the point.
+**What happens when a poll is found missing:** the question is marked
+`Status = Deleted` in the sheet, with a note saying when it was spotted. Its
+`Posted` column stays `YES`, and that is the point — it is what keeps the row out of
+the posting queue. Deleting a poll from the group is nearly always a decision that
+the question should not be there, so it must not quietly go back out. Nothing is
+erased: the row, the question, the message id and the history all stay.
 
-The same check runs unattended two ways:
+**Re-queueing** is the opposite choice, for a poll deleted by accident that you do
+want posted again. It sets the row back to `Approved` and clears its message id, so
+it becomes eligible. It is offered on the Automation page and is never what an
+unattended run does.
 
-- **Autopilot**, every few runs, on the subject it is posting.
-- **`/api/cron/reconcile`**, nightly (in `vercel.json`), taking each group's subjects
-  in rotation.
+The check runs three ways:
+
+| | When | What it does |
+|---|---|---|
+| **Check the channel for deleted polls** | You press it | Reports first, writes only after you confirm |
+| **`/api/cron/reconcile`** | Nightly, per `vercel.json` | Marks, taking each group's subjects in rotation |
+| **Autopilot** | Every few runs, if switched on | Marks, on the subject it is posting |
+
+A poll Telegram will not answer about is always left alone. Guessing "deleted" would
+retire a question that is live in the channel, which is worse than not knowing.
 
 Each row costs one Telegram call and a rate-limit pause, so a channel with hundreds
 of posts cannot be swept in one pass. Each pass carries on from where the last one
 stopped and wraps around, so the newest posts — the ones most likely to have just
 been deleted — are reached rather than being stuck behind the same first rows for
-ever.
-
----
-
-## Sheet formatting
-
-Rows appended through the Sheets API inherit the formatting of the row above them —
-the same thing inserting a row in the UI does. The row above the first upload is the
-header, so a tab filled this way came out bold white on `#1a237e` from top to bottom,
-one upload inheriting from the last.
-
-Appended rows are now put back to the body style straight after the append, and a tab
-this client creates is styled as it is created. **🎨 Repair sheet formatting** on the
-Automation page is the way back for a tab that is already navy: it restores the header
-style, column widths, frozen panes, row height, the dropdowns and the colour coding
-for `Status`, `Posted` and `Difficulty`, across every subject in the group. It changes
-formatting only — not one question is read, moved or altered.
+ever. A row already marked `Deleted` is settled and is not asked about again.
 
 ---
 
@@ -686,7 +687,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-545 tests. The ones worth knowing about:
+578 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -733,7 +734,7 @@ npm test
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 545 tests
+└── test/                     # 578 tests
 ```
 
 ## Notes

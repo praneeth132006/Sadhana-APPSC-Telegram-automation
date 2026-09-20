@@ -107,6 +107,7 @@ stub(sheets, 'holdQuestions', 1);
 stub(sheets, 'listPosted', []);
 stub(sheets, 'unpostQuestions', 0);
 stub(sheets, 'formatQuestions', (subject) => ({ subject, rows: 12 }));
+stub(sheets, 'markDeleted', 1);
 
 // Telegram: pretend the bot is healthy and every send succeeds.
 telegram.init = () => {};
@@ -971,7 +972,7 @@ test('reconcile reports deleted polls and changes nothing until asked', async ()
   }
 });
 
-test('reconcile puts deleted polls back in the queue when applied', async () => {
+test('reconcile puts deleted polls back in the queue when that is asked for', async () => {
   const originalPosted = clientStubs.listPosted;
   const originalExists = telegram.pollStillExists;
   const originalUnpost = clientStubs.unpostQuestions;
@@ -986,10 +987,11 @@ test('reconcile puts deleted polls back in the queue when applied', async () => 
 
   try {
     const res = await authed('/api/telegram/reconcile', {
-      method: 'POST', body: { subject: 'Polity', apply: true }
+      method: 'POST', body: { subject: 'Polity', apply: true, action: 'requeue' }
     });
 
     assert.equal(res.json.restored, 1);
+    assert.equal(res.json.action, 'requeue');
     assert.equal(unpostArgs.length, 1);
     assert.equal(unpostArgs[0][0], 'Polity');
     assert.deepEqual(unpostArgs[0][1], [7]);
@@ -2696,19 +2698,22 @@ test('the autopilot cron runs the due jobs and reports them', async () => {
   }
 });
 
-test('the deleted-poll cron puts questions back across every ready group', async () => {
+test('the deleted-poll cron marks questions Deleted across every ready group', async () => {
   const original = process.env.CRON_SECRET;
   process.env.CRON_SECRET = 'cron-secret';
   const originalPosted = clientStubs.listPosted;
   const originalUnpost = clientStubs.unpostQuestions;
   const originalExists = telegram.pollStillExists;
 
+  const originalMark = clientStubs.markDeleted;
   clientStubs.listPosted = async () => ([
     { row: 4, question_id: 'POL-4', message_id: '904', status: 'Posted' }
   ]);
   telegram.pollStillExists = async () => false;
   const unposted = [];
+  const markedRows = [];
   clientStubs.unpostQuestions = async (...args) => { unposted.push(args); return 1; };
+  clientStubs.markDeleted = async (...args) => { markedRows.push(args); return 1; };
 
   try {
     const res = await call('/api/cron/reconcile', {
@@ -2716,12 +2721,17 @@ test('the deleted-poll cron puts questions back across every ready group', async
     });
 
     assert.equal(res.status, 200);
-    assert.ok(res.json.data.restored >= 1, 'a deleted poll was not put back in the queue');
-    assert.ok(unposted.length >= 1);
-    assert.equal(unposted[0][2], 'Approved', 'it comes back ready to post, not as a Draft');
+    assert.ok(res.json.data.marked >= 1, 'a deleted poll was not marked Deleted');
+    assert.ok(markedRows.length >= 1);
+    assert.deepEqual(markedRows[0][1], [4]);
+    assert.match(markedRows[0][2], /Deleted from the Telegram group/);
+    // The unattended path must never put a question back on its own: it would
+    // be posted again within the interval, with nobody watching.
+    assert.equal(unposted.length, 0, 'the nightly sweep re-queued a deleted question');
   } finally {
     clientStubs.listPosted = originalPosted;
     clientStubs.unpostQuestions = originalUnpost;
+    clientStubs.markDeleted = originalMark;
     telegram.pollStillExists = originalExists;
     if (original === undefined) delete process.env.CRON_SECRET;
     else process.env.CRON_SECRET = original;
@@ -2845,5 +2855,176 @@ test('repairing a group with no configured subjects says so', async () => {
     assert.match(res.json.error, /No subjects are configured/);
   } finally {
     clientStubs.readConfig = original;
+  }
+});
+
+// ===========================================================================
+// Deleting a question in Telegram, reflected in the sheet
+// ===========================================================================
+
+/** A subject with `n` posted questions, and control over which polls survive. */
+function postedChannel(gone = []) {
+  const restore = {
+    listPosted: clientStubs.listPosted,
+    markDeleted: clientStubs.markDeleted,
+    unpostQuestions: clientStubs.unpostQuestions,
+    pollStillExists: telegram.pollStillExists
+  };
+  const marked = [];
+  const unposted = [];
+
+  clientStubs.listPosted = async () => ([
+    { row: 2, question_id: 'POL-1', message_id: '901', status: 'Posted' },
+    { row: 3, question_id: 'POL-2', message_id: '902', status: 'Posted' },
+    { row: 4, question_id: 'POL-3', message_id: '903', status: 'Posted' }
+  ]);
+  telegram.pollStillExists = async (id) => !gone.includes(String(id));
+  clientStubs.markDeleted = async (...args) => { marked.push(args); return args[1].length; };
+  clientStubs.unpostQuestions = async (...args) => { unposted.push(args); return args[1].length; };
+
+  return {
+    marked,
+    unposted,
+    done: () => Object.assign(clientStubs, {
+      listPosted: restore.listPosted,
+      markDeleted: restore.markDeleted,
+      unpostQuestions: restore.unpostQuestions
+    }) && (telegram.pollStillExists = restore.pollStillExists)
+  };
+}
+
+test('a question deleted in Telegram is marked Deleted in the sheet', async () => {
+  const channel = postedChannel(['902']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true }
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.json.action, 'mark', 'marking is the default');
+    assert.equal(res.json.marked, 1);
+    assert.equal(res.json.restored, 0);
+
+    assert.equal(channel.marked.length, 1);
+    const [subject, rows, note] = channel.marked[0];
+    assert.equal(subject, 'Polity');
+    assert.deepEqual(rows, [3], 'only the row whose poll is gone');
+    assert.match(note, /no longer there/);
+    assert.match(note, /curator@example\.com/, 'the sheet records who noticed');
+
+    assert.equal(channel.unposted.length, 0, 'marking must not also re-queue');
+    assert.match(res.json.message, /will be posted again/);
+  } finally {
+    channel.done();
+  }
+});
+
+test('marking is what happens unless re-queueing is asked for by name', async () => {
+  // The old default put the question back as Approved, so a poll a curator
+  // had deliberately deleted went out again on the very next run.
+  const channel = postedChannel(['903']);
+  try {
+    for (const action of [undefined, '', 'nonsense', 'mark']) {
+      channel.marked.length = 0;
+      await authed('/api/telegram/reconcile', {
+        method: 'POST', body: { subject: 'Polity', apply: true, action }
+      });
+      assert.equal(channel.marked.length, 1, `action ${JSON.stringify(action)} did not mark`);
+    }
+    assert.equal(channel.unposted.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('re-queueing stays available for a poll deleted by accident', async () => {
+  const channel = postedChannel(['901']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true, action: 'requeue' }
+    });
+
+    assert.equal(res.json.action, 'requeue');
+    assert.equal(res.json.restored, 1);
+    assert.equal(res.json.marked, 0);
+    assert.deepEqual(channel.unposted[0][1], [2]);
+    assert.equal(channel.unposted[0][2], 'Approved');
+    assert.equal(channel.marked.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('a check that is only looking writes nothing either way', async () => {
+  const channel = postedChannel(['901', '902']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity' }
+    });
+
+    assert.equal(res.json.applied, false);
+    assert.equal(res.json.missing.length, 2);
+    assert.equal(res.json.marked, 0);
+    assert.equal(channel.marked.length, 0);
+    assert.equal(channel.unposted.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('a poll Telegram will not answer about is never marked Deleted', async () => {
+  // Guessing "deleted" would retire a question that is live in the channel.
+  const restore = {
+    listPosted: clientStubs.listPosted,
+    markDeleted: clientStubs.markDeleted,
+    exists: telegram.pollStillExists
+  };
+  const marked = [];
+  clientStubs.listPosted = async () => ([
+    { row: 2, question_id: 'POL-1', message_id: '901', status: 'Posted' }
+  ]);
+  telegram.pollStillExists = async () => null;
+  clientStubs.markDeleted = async (...args) => { marked.push(args); return 1; };
+
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true }
+    });
+    assert.deepEqual(res.json.unknown, ['POL-1']);
+    assert.equal(res.json.marked, 0);
+    assert.equal(marked.length, 0);
+  } finally {
+    clientStubs.listPosted = restore.listPosted;
+    clientStubs.markDeleted = restore.markDeleted;
+    telegram.pollStillExists = restore.exists;
+  }
+});
+
+test('the autopilot check marks and never re-queues, because nobody is watching', async () => {
+  const original = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'cron-secret';
+  const channel = postedChannel(['902']);
+
+  try {
+    // reconcileEveryRuns: 1 — the check runs on the very first batch.
+    await authed('/api/automation/autopilot', {
+      method: 'POST',
+      body: { subject: 'Polity', intervalMinutes: 720, batchSize: 1, reconcileEveryRuns: 1 }
+    });
+
+    const res = await call('/api/cron/autopilot', {
+      method: 'POST', headers: { Authorization: 'Bearer cron-secret' }
+    });
+
+    assert.equal(res.json.data.ran.length, 1);
+    assert.equal(res.json.data.ran[0].run.deleted, 1, 'the run did not record the deletion');
+    assert.equal(channel.marked.length, 1);
+    assert.equal(channel.unposted.length, 0,
+      'an unattended run put a deliberately deleted question back in the queue');
+  } finally {
+    await authed('/api/automation/autopilot/stop', { method: 'POST', body: { subject: 'Polity' } });
+    channel.done();
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
   }
 });

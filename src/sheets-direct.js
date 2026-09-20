@@ -75,10 +75,13 @@ const HEADER_ALIASES = {
   'Review Notes': ['review notes', 'notes', 'remarks']
 };
 
-const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived', 'Deleted'];
 
-/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script. */
-const MACHINE_OWNED_STATUSES = ['Posted', 'Sending'];
+/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script.
+ *  "Deleted" is one of them: it is not an opinion about a question, it is
+ *  something the sweep saw in the channel, and it is written together with a
+ *  Posted column that must stay YES. */
+const MACHINE_OWNED_STATUSES = ['Posted', 'Sending', 'Deleted'];
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -566,9 +569,56 @@ async function listPosted(ctx, subject) {
   rows.forEach((row, i) => {
     const q = rowToQuestion(row, map, subject, i);
     if (!q.question_text || q.posted !== 'YES' || !q.telegram_msg_id) return;
+    // A row already marked Deleted is settled. Leaving it in would have every
+    // sweep ask Telegram about a message everyone agrees is gone, re-mark it,
+    // and spend part of its budget doing so — for ever, and at the expense of
+    // the rows that have not been checked yet.
+    if (q.status === 'Deleted') return;
     out.push({ row: q.excel_row, question_id: q.question_id, message_id: q.telegram_msg_id, status: q.status });
   });
   return out;
+}
+
+/**
+ * markDeleted — records that a poll is no longer in the channel.
+ *
+ * Posted is deliberately left at YES. The question WAS posted; that is a fact
+ * about the past and this does not undo it. It also keeps the row out of the
+ * posting queue, which is the whole point: a question someone deleted from the
+ * channel must not quietly go back out. Putting it back is a separate decision
+ * a person makes, with unpostQuestions.
+ *
+ * @param {string} note What to record in Review Notes
+ * @returns {Promise<number>} Rows marked
+ */
+async function markDeleted(ctx, subject, rowNumbers, note) {
+  if (!rowNumbers || !rowNumbers.length) return 0;
+  const { map, rows } = await readTab(ctx, subject);
+  const now = istNow();
+  const cells = [];
+  let marked = 0;
+
+  for (const n of validRows(rowNumbers, rows.length)) {
+    const row = rows[n - 2];
+    // Only a row that is actually posted can have been deleted. Anything else
+    // means the sheet moved under the sweep while it was asking Telegram.
+    if (!isPostedValue(row[colNum(map, 'Posted') - 1])) continue;
+    if (cell(row, map, 'Status') === 'Deleted') continue;
+
+    const set = (header, value) => cells.push({ tab: subject, row: n, col: colNum(map, header), value });
+    set('Status', 'Deleted');
+    set('Updated At', now);
+    set('Updated By', 'Deleted-poll check');
+    if (note) {
+      const existing = cell(row, map, 'Review Notes');
+      const line = `[${now}] ${note}`;
+      set('Review Notes', existing ? `${existing}\n${line}` : line);
+    }
+    marked++;
+  }
+
+  await writeCells(ctx, cells);
+  return marked;
 }
 
 async function unpostQuestions(ctx, subject, rowNumbers, status) {
@@ -631,6 +681,7 @@ const CELL_COLOURS = [
   ['Status', 'Review', '#ffe0b2', '#e65100'],
   ['Status', 'Rejected', '#ffcdd2', '#b71c1c'],
   ['Status', 'Archived', '#eceff1', '#455a64'],
+  ['Status', 'Deleted', '#f8bbd0', '#880e4f'],
   ['Difficulty', 'Easy', '#dcedc8', '#33691e'],
   ['Difficulty', 'Medium', '#fff9c4', '#f57f17'],
   ['Difficulty', 'Hard', '#ffccbc', '#bf360c']
@@ -1209,13 +1260,13 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
-  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions,
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions, markDeleted,
   scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
-  'recoverStaleClaims', 'unpostQuestions', 'addQuestions',
+  'recoverStaleClaims', 'unpostQuestions', 'addQuestions', 'markDeleted',
   'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus', 'formatQuestions']);
 
 module.exports = {

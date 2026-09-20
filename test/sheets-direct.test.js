@@ -490,22 +490,22 @@ test('repairing a tab restores the header, the widths, the panes and the colour 
   const rules = requests.filter((r) => r.addConditionalFormatRule)
     .map((r) => r.addConditionalFormatRule.rule.booleanRule.condition.values[0].userEnteredValue);
   assert.deepEqual(rules, ['YES', 'NO', 'Approved', 'Posted', 'Scheduled', 'Review',
-    'Rejected', 'Archived', 'Easy', 'Medium', 'Hard']);
+    'Rejected', 'Archived', 'Deleted', 'Easy', 'Medium', 'Hard']);
 });
 
 test('repairing twice does not leave two of every colour rule behind', async () => {
   const book = { Physics: [HEADERS, question(1)] };
   const log = fakeSheets(book);
   // What the sheet already carries from the first repair.
-  log.existingRules = new Array(11).fill({});
+  log.existingRules = new Array(12).fill({});
 
   await DIRECT.formatQuestions(ctx, 'Physics');
 
   const deletes = log.formatRequests.filter((r) => r.deleteConditionalFormatRule);
-  assert.equal(deletes.length, 11, 'the rules already there were not cleared first');
+  assert.equal(deletes.length, 12, 'the rules already there were not cleared first');
   // Highest index first: deleting index 0 first would renumber the rest.
   assert.deepEqual(deletes.map((d) => d.deleteConditionalFormatRule.index),
-    [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
 });
 
 test('an empty tab is still styled rather than skipped for having no rows', async () => {
@@ -530,4 +530,98 @@ test('the long-form columns wrap and the rest stay on one line', async () => {
 test('repairing a tab that is not there says which one', async () => {
   fakeSheets({ Physics: [HEADERS] });
   await assert.rejects(DIRECT.formatQuestions(ctx, 'Nope'), /Sheet tab "Nope" not found/);
+});
+
+// ---------------------------------------------------------------------------
+// A poll deleted from Telegram
+// ---------------------------------------------------------------------------
+// Telegram never tells a bot one of its messages was deleted, so the sheet used
+// to claim for ever that a removed question was posted. Marking it is only half
+// the job; the other half is that the row must not quietly become eligible
+// again and go back out.
+
+test('a deleted poll is marked Deleted and keeps Posted = YES, so it is never re-sent', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 })] };
+  fakeSheets(book);
+
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [2], 'Deleted from the Telegram group'), 1);
+
+  const row = book.Physics[1];
+  assert.equal(row[col('Status')], 'Deleted');
+  assert.equal(row[col('Posted')], 'YES',
+    'clearing Posted would put the question back in the queue and post it again');
+  assert.equal(row[col('Telegram Msg ID')], 901, 'the record of what was deleted stays');
+  assert.equal(row[col('Updated By')], 'Deleted-poll check');
+  assert.match(row[col('Review Notes')], /^\[.* IST\] Deleted from the Telegram group$/);
+
+  // And the posting queue agrees: it is not eligible.
+  const queue = await DIRECT.getUnpostedQuestions(ctx, 'Physics', 10, true);
+  assert.deepEqual(queue.map((q) => q.excel_row), []);
+});
+
+test('a note is added to whatever the row already said, not over it', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Review Notes': 'checked by Ravi' })] };
+  fakeSheets(book);
+  await DIRECT.markDeleted(ctx, 'Physics', [2], 'Deleted from the Telegram group');
+  assert.match(book.Physics[1][col('Review Notes')], /^checked by Ravi\n\[.* IST\] Deleted from/);
+});
+
+test('marking skips a row that is not posted, and one already marked', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'NO', Status: 'Approved' }),
+    question(2, { Posted: 'YES', Status: 'Deleted' }),
+    question(3, { Posted: 'YES', Status: 'Posted' })] };
+  const log = fakeSheets(book);
+
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [2, 3, 4], 'gone'), 1);
+  assert.equal(book.Physics[1][col('Status')], 'Approved', 'an unposted row cannot have been deleted');
+  assert.equal(book.Physics[3][col('Status')], 'Deleted');
+  // Re-marking would append the same note again on every nightly sweep.
+  assert.equal(log.writes.filter((w) => w.row === 3).length, 0);
+});
+
+test('a marked question is not offered to the next sweep', async () => {
+  // Otherwise every sweep would re-ask Telegram about a message everyone
+  // agrees is gone, and spend its budget there instead of on unchecked rows.
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 }),
+    question(2, { Posted: 'YES', Status: 'Deleted', 'Telegram Msg ID': 902 })] };
+  fakeSheets(book);
+
+  const posted = await DIRECT.listPosted(ctx, 'Physics');
+  assert.deepEqual(posted.map((p) => p.message_id), ['901']);
+});
+
+test('marking nothing writes nothing', async () => {
+  const book = { Physics: [HEADERS, question(1, { Posted: 'YES', Status: 'Posted' })] };
+  const log = fakeSheets(book);
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [], 'gone'), 0);
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [99], 'gone'), 0);
+  assert.equal(log.writes.length, 0);
+});
+
+test('Deleted is a status the poster owns, not one a curator sets by hand', async () => {
+  // Setting it by hand would leave Status saying Deleted on a row that is
+  // still in the channel, which is the same desynchronisation as Posted.
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A' })] };
+  fakeSheets(book);
+  await assert.rejects(DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Deleted', 'C'), /set by the poster/);
+});
+
+test('a marked question can still be put back deliberately', async () => {
+  // Re-queueing is the separate, explicit decision — for a poll deleted by
+  // accident that a curator does want posted again.
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Deleted', 'Telegram Msg ID': 901 })] };
+  fakeSheets(book);
+
+  assert.equal(await DIRECT.unpostQuestions(ctx, 'Physics', [2], 'Approved'), 1);
+  assert.equal(book.Physics[1][col('Posted')], 'NO');
+  assert.equal(book.Physics[1][col('Status')], 'Approved');
+  assert.equal(book.Physics[1][col('Telegram Msg ID')], '');
+
+  const queue = await DIRECT.getUnpostedQuestions(ctx, 'Physics', 10, true);
+  assert.deepEqual(queue.map((q) => q.excel_row), [2], 'it is eligible again, on purpose');
 });

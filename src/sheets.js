@@ -52,7 +52,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions', 'markDeleted'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -740,6 +740,19 @@ async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, update
 }
 
 /**
+ * markDeleted — records that a poll is no longer in the channel.
+ *
+ * Posted stays YES: the question WAS posted, and leaving it that way is what
+ * keeps a question someone deleted from quietly going back out.
+ */
+async function markDeleted(ctx, subject, rowNumbers, note) {
+  const result = await request(ctx, 'POST', {
+    action: 'markDeleted', subject, rowNumbers, note: note || ''
+  });
+  return result.markedCount || 0;
+}
+
+/**
  * formatQuestions — puts one subject tab back to the canonical layout.
  *
  * The way back for a tab an upload turned navy from top to bottom. On the
@@ -998,8 +1011,8 @@ const IMPLEMENTATIONS = {
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   recoverStaleClaims, holdQuestions,
-  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, unscheduleQuestions,
-  formatQuestions, getSubscriber,
+  unpostQuestions, listPosted, markDeleted, bulkStatus, scheduleQuestions,
+  unscheduleQuestions, formatQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,
