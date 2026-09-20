@@ -22,7 +22,8 @@
           <h1 class="page-title">Automation</h1>
           <p class="page-subtitle">
             Publish quiz polls to Telegram straight from the browser, queue questions for a
-            planned time, and see the cron cadence and content runway for every subject.
+            planned time or take them back out, hand the queue to autopilot, and see the cadence
+            and content runway for every subject.
           </p>
         </div>
         <div class="page-actions">
@@ -118,6 +119,18 @@
             </p>
             <div id="reconcileLog" class="log-output" style="display:none;margin-top:14px"></div>
 
+            <hr style="border:none;border-top:1px solid var(--border-subtle);margin:18px 0">
+
+            <button id="formatBtn" class="btn btn-ghost" style="width:100%">🎨 Repair sheet formatting</button>
+            <p class="hint-text" style="margin-top:10px">
+              Puts every subject tab in this group back to the standard layout — header style,
+              column widths, frozen panes, the dropdowns and the colour coding for
+              <span class="inline-code">Status</span>, <span class="inline-code">Posted</span> and
+              <span class="inline-code">Difficulty</span>. Use it if a tab has come out bold white on
+              navy from top to bottom. It changes formatting only: not one question is touched.
+            </p>
+            <div id="formatLog" class="log-output" style="display:none;margin-top:14px"></div>
+
           </div>
         </section>
 
@@ -150,17 +163,110 @@
             </div>
 
             <button id="scheduleBtn" class="btn btn-primary" style="width:100%">📅 Queue Questions</button>
+            <button id="unqueueBtn" class="btn btn-ghost" style="width:100%;margin-top:8px">↩️ Unqueue Questions</button>
 
             <p class="hint-text" style="margin-top:12px">
               Queueing sets <span class="inline-code">Status = Scheduled</span> and fills the
               <span class="inline-code">Scheduled For</span> column. It does not post anything by itself —
-              <span class="inline-code">node schedule.js</span> or the button on the left does the sending.
+              autopilot below, <span class="inline-code">node schedule.js</span>, or the button on the left
+              does the sending.
+            </p>
+            <p class="hint-text" style="margin-top:10px">
+              Unqueueing is the way back: it takes the same number of <em>queued</em> questions, sets them
+              to <span class="inline-code">Approved</span> and clears their
+              <span class="inline-code">Scheduled For</span> time. They stay eligible to post — nothing is
+              deleted, and a question already sent or being sent is never touched.
             </p>
 
             <div id="scheduleLog" class="log-output" style="display:none;margin-top:14px"></div>
           </div>
         </section>
       </div>
+
+      <!-- Unattended posting -->
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Autopilot</h2>
+            <p class="panel-subtitle">Posts a batch every few minutes, on its own, until the queue runs out</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="editor-grid">
+            <div class="editor-field">
+              <label for="autoSubject">Subject</label>
+              <select id="autoSubject" class="field-select"></select>
+            </div>
+            <div class="editor-field">
+              <label for="autoInterval">How often</label>
+              <select id="autoInterval" class="field-select">
+                <option value="1">Every 1 minute</option>
+                <option value="5" selected>Every 5 minutes</option>
+                <option value="10">Every 10 minutes</option>
+                <option value="15">Every 15 minutes</option>
+                <option value="30">Every 30 minutes</option>
+                <option value="60">Every hour</option>
+                <option value="180">Every 3 hours</option>
+                <option value="360">Every 6 hours</option>
+                <option value="720">Every 12 hours</option>
+                <option value="1440">Once a day</option>
+              </select>
+            </div>
+            <div class="editor-field">
+              <label for="autoBatch">How many each time</label>
+              <select id="autoBatch" class="field-select">
+                <option value="1">1 question</option>
+                <option value="5">5 questions</option>
+                <option value="10">10 questions</option>
+                <option value="20" selected>20 questions</option>
+              </select>
+            </div>
+            <div class="editor-field">
+              <label for="autoApproved">Eligibility</label>
+              <select id="autoApproved" class="field-select">
+                <option value="true" selected>Only Approved or Scheduled (recommended)</option>
+                <option value="false">Any unposted question, including Drafts</option>
+              </select>
+            </div>
+            <div class="editor-field">
+              <label for="autoStopWhenEmpty">When the queue runs out</label>
+              <select id="autoStopWhenEmpty" class="field-select">
+                <option value="true" selected>Stop on its own</option>
+                <option value="false">Keep checking for new questions</option>
+              </select>
+            </div>
+            <div class="editor-field">
+              <label for="autoReconcile">Check for deleted polls</label>
+              <select id="autoReconcile" class="field-select">
+                <option value="0">Never</option>
+                <option value="5" selected>Every 5 runs</option>
+                <option value="10">Every 10 runs</option>
+                <option value="25">Every 25 runs</option>
+              </select>
+            </div>
+          </div>
+
+          <button id="autoStartBtn" class="btn btn-send" style="width:100%">🤖 Start Autopilot</button>
+
+          <p class="hint-text" style="margin-top:12px">
+            Each run does exactly what the Post button does: reserve the rows first, send each poll,
+            then mark the sheet — so a question is never sent twice, and a run that fails halfway
+            hands back what it did not send. Runs never overlap, and the next one is timed from when
+            the last one <em>finished</em>.
+          </p>
+          <p class="hint-text" style="margin-top:10px">
+            Starting a subject that is already on autopilot just changes its settings — it does not
+            start a second job.
+          </p>
+
+          <p id="autopilotWarning" class="hint-text" style="margin-top:10px;color:var(--warn,#e0a03a)" hidden>
+            ⚠️ This deployment does not keep a job between requests, so the timer here will not fire.
+            Point a scheduled job at <span class="inline-code">/api/cron/autopilot</span> to drive it.
+          </p>
+
+          <div id="autopilotJobs" style="margin-top:16px"></div>
+        </div>
+      </section>
 
       <!-- Cadence overview across all subjects -->
       <section class="panel">

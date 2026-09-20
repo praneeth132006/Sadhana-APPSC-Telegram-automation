@@ -13,7 +13,8 @@
 //
 //   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions,
 //   markAsPosted, holdQuestions, recoverStaleClaims, listPosted,
-//   unpostQuestions, and addQuestions (the dashboard's "Send to Sheet")
+//   unpostQuestions, addQuestions (the dashboard's "Send to Sheet"), and the
+//   curation queue: scheduleQuestions, unscheduleQuestions, bulkStatus
 //
 // Everything else (analytics, members, support) still goes through
 // the Apps Script, unchanged.
@@ -75,6 +76,9 @@ const HEADER_ALIASES = {
 };
 
 const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+
+/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script. */
+const MACHINE_OWNED_STATUSES = ['Posted', 'Sending'];
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -586,6 +590,399 @@ async function unpostQuestions(ctx, subject, rowNumbers, status) {
 }
 
 // ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+// A tab written through this client used to come out unreadable: solid navy,
+// bold white, top to bottom.
+//
+// `values:append` with insertDataOption=INSERT_ROWS does what inserting a row
+// in the UI does — the new row inherits the formatting of the row above it.
+// The row above the first upload is the header: bold white on #1a237e. Every
+// later upload then inherited that from the row before, so one tab at a time
+// the whole sheet turned into header.
+//
+// The Apps Script never hit this because it wrote into rows that already
+// existed and styled the sheet as it created it. So this file has to do the
+// same two things: style a tab it creates, and put appended rows back to the
+// body style afterwards. The values below mirror formatSheetHeaders and
+// applyConditionalFormatting in google_apps_script.js exactly — a curator
+// should not be able to tell which route filled their sheet.
+
+const HEADER_BACKGROUND = '#1a237e';
+const HEADER_FOREGROUND = '#ffffff';
+
+/** Per-column widths tuned for readability of long APPSC statements. */
+const COLUMN_WIDTHS = [
+  55, 140, 100, 130, 130, 150, 460, 190, 190, 190,
+  190, 110, 420, 95, 180, 200, 110, 80, 180, 150,
+  90, 140, 140, 100, 180, 220, 180, 200, 130, 240
+];
+
+/** 1-based columns whose text wraps: the question, the options, the notes. */
+const WRAP_COLUMNS = [7, 8, 9, 10, 11, 13, 30];
+
+/** Colour codes so state is readable at a glance. [header, value, bg, fg]. */
+const CELL_COLOURS = [
+  ['Posted', 'YES', '#c8e6c9', '#1b5e20'],
+  ['Posted', 'NO', '#ffcdd2', '#b71c1c'],
+  ['Status', 'Approved', '#c8e6c9', '#1b5e20'],
+  ['Status', 'Posted', '#bbdefb', '#0d47a1'],
+  ['Status', 'Scheduled', '#fff9c4', '#f57f17'],
+  ['Status', 'Review', '#ffe0b2', '#e65100'],
+  ['Status', 'Rejected', '#ffcdd2', '#b71c1c'],
+  ['Status', 'Archived', '#eceff1', '#455a64'],
+  ['Difficulty', 'Easy', '#dcedc8', '#33691e'],
+  ['Difficulty', 'Medium', '#fff9c4', '#f57f17'],
+  ['Difficulty', 'Hard', '#ffccbc', '#bf360c']
+];
+
+/** "#rrggbb" as the 0..1 colour the Sheets API takes. */
+function rgb(hex) {
+  const n = parseInt(String(hex).replace('#', ''), 16);
+  return { red: ((n >> 16) & 255) / 255, green: ((n >> 8) & 255) / 255, blue: (n & 255) / 255 };
+}
+
+/** The numeric sheetId of one tab, which every formatting request needs. */
+async function sheetIdOf(ctx, tab) {
+  const body = await call('GET', `/${ctx.spreadsheetId}?fields=sheets.properties(sheetId,title)`);
+  const found = (body.sheets || []).find((sh) => sh.properties && sh.properties.title === tab);
+  if (!found) throw new Error(`Sheet tab "${tab}" not found.`);
+  return found.properties.sheetId;
+}
+
+/** Every cell format an ordinary data row carries. */
+const BODY_FORMAT_FIELDS =
+  'userEnteredFormat(backgroundColor,textFormat,verticalAlignment,horizontalAlignment,wrapStrategy)';
+
+/**
+ * bodyFormatRequests — puts a range of rows back to the plain body style.
+ *
+ * Written out in full rather than as a "clear formatting": the wrapped columns
+ * have a style of their own, and clearing would take that with it.
+ *
+ * @param {number} startRow 1-based first row to reset
+ * @param {number} endRow 1-based last row, inclusive
+ */
+function bodyFormatRequests(sheetId, startRow, endRow) {
+  const range = {
+    sheetId,
+    startRowIndex: startRow - 1,
+    endRowIndex: endRow,
+    startColumnIndex: 0,
+    endColumnIndex: QUESTION_HEADERS.length
+  };
+
+  const requests = [{
+    repeatCell: {
+      range,
+      cell: {
+        userEnteredFormat: {
+          backgroundColor: rgb('#ffffff'),
+          textFormat: { bold: false, foregroundColor: rgb('#000000') },
+          verticalAlignment: 'TOP',
+          horizontalAlignment: 'LEFT',
+          wrapStrategy: 'CLIP'
+        }
+      },
+      fields: BODY_FORMAT_FIELDS
+    }
+  }];
+
+  // The long-form columns wrap; the rest stay on one line so the row does not
+  // grow to the height of its longest cell.
+  for (const column of WRAP_COLUMNS) {
+    requests.push({
+      repeatCell: {
+        range: Object.assign({}, range, { startColumnIndex: column - 1, endColumnIndex: column }),
+        cell: { userEnteredFormat: { wrapStrategy: 'WRAP', verticalAlignment: 'TOP' } },
+        fields: 'userEnteredFormat(wrapStrategy,verticalAlignment)'
+      }
+    });
+  }
+  return requests;
+}
+
+/**
+ * resetAppendedRows — undoes the header style an append inherited.
+ *
+ * Best effort: the questions are already safely in the sheet, and refusing an
+ * upload that worked because its rows came out the wrong colour would be the
+ * worse failure of the two.
+ */
+async function resetAppendedRows(ctx, subject, firstRow, count) {
+  if (!firstRow || !count) return;
+  try {
+    const sheetId = await sheetIdOf(ctx, subject);
+    await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
+      requests: bodyFormatRequests(sheetId, firstRow, firstRow + count - 1)
+    });
+  } catch (err) {
+    console.warn(`[sheets] could not restore row formatting in "${subject}": ${err.message}`);
+  }
+}
+
+/**
+ * formatQuestions — puts one subject tab back to the canonical layout.
+ *
+ * Header style, column widths, frozen panes, row height, the dropdowns and the
+ * colour coding. Safe to run on a tab that is already correct, and the way back
+ * for any tab an earlier upload turned navy from top to bottom.
+ *
+ * @returns {Promise<{subject: string, rows: number}>}
+ */
+async function formatQuestions(ctx, subject) {
+  const sheetId = await sheetIdOf(ctx, subject);
+  const { rows } = await readTab(ctx, subject);
+  const columns = QUESTION_HEADERS.length;
+
+  // At least one row, so a tab with no questions yet still gets its styling and
+  // its dropdowns rather than being skipped for being empty.
+  const lastRow = Math.max(rows.length + 1, 2);
+  const map = headerMap(QUESTION_HEADERS);
+  const dataRange = (header) => ({
+    sheetId,
+    startRowIndex: 1,
+    endRowIndex: lastRow,
+    startColumnIndex: colNum(map, header) - 1,
+    endColumnIndex: colNum(map, header)
+  });
+
+  const requests = [
+    {
+      updateSheetProperties: {
+        // S.No and Question ID stay visible while scrolling right.
+        properties: { sheetId, gridProperties: { frozenRowCount: 1, frozenColumnCount: 2 } },
+        fields: 'gridProperties(frozenRowCount,frozenColumnCount)'
+      }
+    },
+    {
+      repeatCell: {
+        range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: columns },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: rgb(HEADER_BACKGROUND),
+            textFormat: { bold: true, foregroundColor: rgb(HEADER_FOREGROUND) },
+            verticalAlignment: 'MIDDLE',
+            horizontalAlignment: 'CENTER',
+            wrapStrategy: 'WRAP'
+          }
+        },
+        fields: BODY_FORMAT_FIELDS
+      }
+    },
+    {
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'ROWS', startIndex: 0, endIndex: 1 },
+        properties: { pixelSize: 44 },
+        fields: 'pixelSize'
+      }
+    },
+    ...bodyFormatRequests(sheetId, 2, lastRow)
+  ];
+
+  COLUMN_WIDTHS.forEach((pixelSize, i) => {
+    requests.push({
+      updateDimensionProperties: {
+        range: { sheetId, dimension: 'COLUMNS', startIndex: i, endIndex: i + 1 },
+        properties: { pixelSize },
+        fields: 'pixelSize'
+      }
+    });
+  });
+
+  // Posted is not a two-value column any more — it also carries "SENDING | …"
+  // while a question is with Telegram. The dropdown is a convenience for the
+  // two values a curator would pick by hand, and must not reject what the
+  // poster writes, so invalid values are allowed through with a warning.
+  const dropdown = (header, values, strict) => ({
+    setDataValidation: {
+      range: dataRange(header),
+      rule: {
+        condition: { type: 'ONE_OF_LIST', values: values.map((v) => ({ userEnteredValue: v })) },
+        showCustomUi: true,
+        strict
+      }
+    }
+  });
+  requests.push(dropdown('Posted', ['YES', 'NO'], false));
+  requests.push(dropdown('Status', STATUS_VALUES, false));
+  requests.push(dropdown('Difficulty', DIFFICULTY_VALUES, true));
+
+  // Replace the colour rules rather than adding to them: running this twice
+  // would otherwise leave two of every rule behind.
+  const existing = await call('GET',
+    `/${ctx.spreadsheetId}?fields=sheets(properties.sheetId,conditionalFormats)`);
+  const current = ((existing.sheets || [])
+    .find((sh) => sh.properties && sh.properties.sheetId === sheetId) || {}).conditionalFormats || [];
+  for (let i = current.length - 1; i >= 0; i--) {
+    requests.push({ deleteConditionalFormatRule: { sheetId, index: i } });
+  }
+
+  CELL_COLOURS.forEach(([header, value, bg, fg], index) => {
+    requests.push({
+      addConditionalFormatRule: {
+        index,
+        rule: {
+          ranges: [dataRange(header)],
+          booleanRule: {
+            condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: value }] },
+            format: { backgroundColor: rgb(bg), textFormat: { foregroundColor: rgb(fg) } }
+          }
+        }
+      }
+    });
+  });
+
+  await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, { requests });
+  return { subject, rows: rows.length };
+}
+
+// ---------------------------------------------------------------------------
+// The curation queue
+// ---------------------------------------------------------------------------
+// Queueing, unqueueing and bulk status changes used to be the Apps Script's
+// job. They were also the operations most likely to answer "0 updated" with
+// no explanation: a stale deployment, a renamed tab, or an id that is simply
+// not in this subject all look identical from the dashboard. Doing them here
+// makes them fast, and — because the ids that matched nothing are named —
+// makes a zero say why it is a zero.
+
+/** Question ID (trimmed, case-insensitive) → 1-based row number. */
+function rowsByQuestionId(map, rows) {
+  const index = new Map();
+  rows.forEach((row, i) => {
+    const id = cell(row, map, 'Question ID').toLowerCase();
+    // First match wins: a duplicated id is a sheet problem, and silently
+    // preferring the later row would edit whichever one the reader cannot see.
+    if (id && !index.has(id)) index.set(id, i + 2);
+  });
+  return index;
+}
+
+/**
+ * resolveIds — splits the ids asked for into rows that exist and ids that do not.
+ *
+ * @returns {{targets: Array<{id: string, row: number}>, notFound: string[]}}
+ */
+function resolveIds(map, rows, questionIds) {
+  const index = rowsByQuestionId(map, rows);
+  const targets = [];
+  const notFound = [];
+  const seen = new Set();
+  for (const raw of questionIds || []) {
+    const id = String(raw == null ? '' : raw).trim();
+    if (!id) continue;
+    const row = index.get(id.toLowerCase());
+    if (!row) { notFound.push(id); continue; }
+    if (seen.has(row)) continue;
+    seen.add(row);
+    targets.push({ id, row });
+  }
+  return { targets, notFound };
+}
+
+/**
+ * queueSkipReason — why this row must not be re-statused from the dashboard.
+ *
+ * A claimed row is mid-flight: a posting run is holding it and will write the
+ * Posted column itself, so changing Status underneath is a race with a public
+ * channel on the other end. A row that is already posted only blocks
+ * *queueing* — marking a posted question Scheduled would set it up to go out
+ * a second time — while archiving or rejecting one is an ordinary thing to do.
+ *
+ * @param {boolean} skipPosted Whether an already-posted row is off limits
+ */
+function queueSkipReason(row, map, skipPosted) {
+  const posted = row[colNum(map, 'Posted') - 1];
+  if (isHeldValue(posted)) return 'held for checking';
+  if (isClaimedValue(posted)) return 'being sent right now';
+  if (skipPosted && isPostedValue(posted)) return 'already posted';
+  return null;
+}
+
+/**
+ * writeQueueChange — the one body behind queueing, unqueueing and bulkStatus.
+ *
+ * @param {string} status Status to write
+ * @param {string|null} scheduledFor Text for Scheduled For, or null to leave it
+ * @returns {Promise<{updatedCount: number, notFound: string[], skipped: Array}>}
+ */
+async function writeQueueChange(ctx, subject, questionIds, { status, scheduledFor, updatedBy, skipPosted }) {
+  const { map, rows } = await readTab(ctx, subject);
+  const { targets, notFound } = resolveIds(map, rows, questionIds);
+  const now = istNow();
+  const cells = [];
+  const skipped = [];
+  let updated = 0;
+
+  for (const target of targets) {
+    const row = rows[target.row - 2];
+    const reason = queueSkipReason(row, map, skipPosted !== false);
+    if (reason) { skipped.push({ questionId: target.id, row: target.row, reason }); continue; }
+
+    const set = (header, value) => cells.push({ tab: subject, row: target.row, col: colNum(map, header), value });
+    set('Status', status);
+    if (scheduledFor !== null) set('Scheduled For', scheduledFor);
+    set('Updated At', now);
+    set('Updated By', String(updatedBy || 'Dashboard User'));
+    updated++;
+  }
+
+  await writeCells(ctx, cells);
+  return { updatedCount: updated, notFound, skipped };
+}
+
+/** Stamps Scheduled For and flips Status to Scheduled. */
+async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, updatedBy) {
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: 'Scheduled',
+    scheduledFor: String(scheduledFor == null ? '' : scheduledFor),
+    updatedBy
+  });
+}
+
+/**
+ * unscheduleQuestions — takes questions back out of the queue.
+ *
+ * Clearing Scheduled For is the point: leaving yesterday's target time on a
+ * row that is no longer queued is how a sheet starts lying about its own plan.
+ */
+async function unscheduleQuestions(ctx, subject, questionIds, status, updatedBy) {
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: normaliseChoice(status || 'Approved', STATUS_VALUES, 'Approved'),
+    scheduledFor: '',
+    updatedBy
+  });
+}
+
+/**
+ * Sets Status on many questions at once, leaving Scheduled For alone.
+ *
+ * Posted and Sending are refused for the same reason the Apps Script refuses
+ * them: they are written by the poster alongside the Posted column, the
+ * message id and the poll id. Setting one by hand leaves Status saying
+ * "Posted" while Posted still says NO, so the question stays eligible and
+ * goes out again with the dashboard insisting it was already sent.
+ */
+async function bulkStatus(ctx, subject, questionIds, status, updatedBy) {
+  const clean = normaliseChoice(status, STATUS_VALUES, 'Draft');
+  if (MACHINE_OWNED_STATUSES.includes(clean)) {
+    throw new Error(
+      `"${clean}" is set by the poster, not by hand. Use the Automation page ` +
+      'to post, or "Check the channel for deleted polls" to undo one.'
+    );
+  }
+  return writeQueueChange(ctx, subject, questionIds, {
+    status: clean,
+    scheduledFor: null,
+    updatedBy,
+    // Archiving or rejecting a question that has already gone out is ordinary
+    // curation, so unlike queueing this does not refuse a posted row.
+    skipPosted: false
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Adding questions
 // ---------------------------------------------------------------------------
 
@@ -631,6 +1028,16 @@ async function createTab(ctx, tab) {
   });
   await call('PUT', `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}?valueInputOption=RAW`,
     { values: [QUESTION_HEADERS] });
+
+  // Styled as the Apps Script styles a tab it creates, so a subject added from
+  // the dashboard is not visibly a second-class one. Best effort: the tab and
+  // its headers exist either way, and the upload that created it must not fail
+  // because a column came out the wrong width.
+  try {
+    await formatQuestions(ctx, tab);
+  } catch (err) {
+    console.warn(`[sheets] created "${tab}" but could not style it: ${err.message}`);
+  }
 }
 
 /**
@@ -752,7 +1159,13 @@ async function addQuestions(ctx, subject, questions, addedBy, skipDuplicates = t
     const appended = await call('POST', `/${ctx.spreadsheetId}/values/${range}:append` +
       '?valueInputOption=RAW&insertDataOption=INSERT_ROWS', { values: out });
     const firstRow = Number(((appended.updates || {}).updatedRange || '').match(/![A-Z]+(\d+)/)?.[1]);
-    if (firstRow) await reissueCollidingIds(ctx, subject, firstRow, out.length, code, stamp, ids);
+    if (firstRow) {
+      // The rows Sheets just inserted inherited the formatting of the row
+      // above — the header, for the first upload into a tab. Left alone, one
+      // upload at a time turns the whole sheet bold white on navy.
+      await resetAppendedRows(ctx, subject, firstRow, out.length);
+      await reissueCollidingIds(ctx, subject, firstRow, out.length, code, stamp, ids);
+    }
   }
 
   return {
@@ -796,12 +1209,14 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
-  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions,
+  scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
-  'recoverStaleClaims', 'unpostQuestions', 'addQuestions']);
+  'recoverStaleClaims', 'unpostQuestions', 'addQuestions',
+  'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus', 'formatQuestions']);
 
 module.exports = {
   DIRECT,
@@ -809,5 +1224,5 @@ module.exports = {
   isConfigured,
   serviceAccountEmail,
   // Exposed for tests.
-  _internal: { istNow, hashQuestion, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
+  _internal: { istNow, hashQuestion, parseIstDate, headerMap, columnLetter, quoteTab, rowToQuestion, resolveIds, rgb, bodyFormatRequests, resetForTests() { cachedKey = undefined; token = { value: null, expiresAt: 0 }; } }
 };

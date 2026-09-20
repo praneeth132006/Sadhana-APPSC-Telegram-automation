@@ -3,7 +3,8 @@
 // ============================================================================
 // The "upload the questions directly in the web app / automate the task" page:
 // publish quiz polls to Telegram without dropping to the CLI, queue batches for
-// a planned time, and see each subject's cadence and remaining runway.
+// a planned time (and take them back out), run the queue down unattended on
+// autopilot, and see each subject's cadence and remaining runway.
 //
 // Posting is the most consequential action in this whole app — it writes to a
 // public channel — so the button confirms first, the server re-checks the
@@ -74,9 +75,9 @@ function renderStats() {
   );
 }
 
-/** Fills both subject dropdowns and keeps the summary line in sync. */
+/** Fills every subject dropdown on the page and keeps the summary line in sync. */
 function initSubjectSelects() {
-  [$('postSubject'), $('scheduleSubject')].forEach((select) => {
+  [$('postSubject'), $('scheduleSubject'), $('autoSubject')].forEach((select) => {
     replaceChildren(select, ...SUBJECTS.map((s) => el('option', { value: s, text: s })));
   });
 
@@ -491,6 +492,95 @@ async function reconcileChannel() {
   }
 }
 
+/**
+ * repairFormatting — puts every subject tab back to the standard layout.
+ *
+ * Rows appended through the Sheets API inherit the formatting of the row above
+ * them, and the row above the first upload is the header. Tabs filled before
+ * that was fixed are bold white on navy top to bottom; this is the way back
+ * without anyone editing a sheet by hand.
+ */
+async function repairFormatting() {
+  const button = $('formatBtn');
+
+  clearLog('formatLog');
+  button.disabled = true;
+  button.textContent = 'Repairing…';
+
+  try {
+    log('formatLog', 'Putting every subject tab back to the standard layout…');
+    log('formatLog', 'Formatting only — no question is read, changed or moved.', 'muted');
+
+    const result = await api('/api/questions/format', {
+      method: 'POST', body: { allSubjects: true }
+    });
+
+    (result.results || []).forEach((r) => log('formatLog',
+      r.ok ? `✅ ${r.subject} — ${r.rows} row(s) restyled` : `⚠️ ${r.subject} — ${r.error}`,
+      r.ok ? 'ok' : 'fail'));
+
+    log('formatLog', result.message, result.formattedCount ? 'ok' : 'fail');
+    showToast(result.formattedCount ? 'success' : 'error', result.message);
+  } catch (err) {
+    log('formatLog', 'Failed: ' + err.message, 'fail');
+    showToast('error', err.message, 9000);
+  } finally {
+    button.disabled = false;
+    button.textContent = '🎨 Repair sheet formatting';
+  }
+}
+
+/**
+ * reportQueueChange — turns a queue write's answer into lines a curator can act on.
+ *
+ * This used to print "📅 <id> → Scheduled" for every id it had SENT, then the
+ * server's count underneath. When the two disagreed — 15 hopeful lines above
+ * "0 question(s) queued" — the page was asserting something that had not
+ * happened, and said nothing about why. Nothing is claimed here until the
+ * server has said it happened, and the ids it refused are named.
+ */
+function reportQueueChange(target, result, verb) {
+  const changed = result.changed || [];
+  changed.forEach((id) => log(target, `✅ ${id} → ${verb}`, 'ok'));
+
+  (result.skipped || []).forEach((s) =>
+    log(target, `• ${s.questionId} — left alone: ${s.reason}`, 'muted'));
+
+  if ((result.notFound || []).length) {
+    log(target, `⚠️ ${result.notFound.length} id(s) are not in this subject's tab: ` +
+      result.notFound.slice(0, 10).join(', ') + (result.notFound.length > 10 ? '…' : ''), 'fail');
+  }
+  if (result.partial) log(target, '⚠️ ' + result.partial, 'fail');
+
+  const n = result.updatedCount || 0;
+  log(target, `${n} question(s) ${verb.toLowerCase()}.`, n ? 'ok' : 'fail');
+  return n;
+}
+
+/**
+ * pickQueueCandidates — the next N questions of a subject in a given state.
+ *
+ * Queueing asks for questions that are NOT already queued, and unqueueing asks
+ * for exactly the ones that are. Reading the same "everything unposted" page
+ * for both is what made the queue button spend its whole batch re-queueing
+ * rows that were already Scheduled and then report that it had changed nothing.
+ */
+async function pickQueueCandidates(subject, count, wanted) {
+  const page = await api('/api/questions', {
+    // Deliberately wider than `count`: the first N unposted rows are not the
+    // first N in the state being asked for.
+    query: { subject, posted: 'NO', page: 1, pageSize: Math.min(200, Math.max(count * 5, 50)) }
+  });
+
+  return (page.questions || [])
+    .filter((q) => (wanted === 'queued'
+      ? q.status === 'Scheduled'
+      : q.status !== 'Scheduled' && q.status !== 'Rejected' && q.status !== 'Archived'))
+    .map((q) => q.question_id)
+    .filter(Boolean)
+    .slice(0, count);
+}
+
 /** Marks the next N pending questions of a subject as Scheduled. */
 async function queueForLater() {
   const subject = $('scheduleSubject').value;
@@ -503,20 +593,13 @@ async function queueForLater() {
   button.textContent = 'Queueing…';
 
   try {
-    // Find the next pending question ids for this subject, oldest first.
-    log('scheduleLog', `Finding the next ${count} pending question(s) in "${subject}"…`);
-    const page = await api('/api/questions', {
-      query: { subject, posted: 'NO', page: 1, pageSize: count }
-    });
-
-    const candidates = (page.questions || [])
-      .filter((q) => q.status !== 'Rejected' && q.status !== 'Archived')
-      .map((q) => q.question_id)
-      .filter(Boolean);
+    log('scheduleLog', `Finding the next ${count} question(s) in "${subject}" that are not queued yet…`);
+    const candidates = await pickQueueCandidates(subject, count, 'unqueued');
 
     if (!candidates.length) {
-      log('scheduleLog', `Nothing pending in "${subject}".`, 'muted');
-      showToast('info', `No pending questions to queue in "${subject}".`);
+      log('scheduleLog', `Nothing left to queue in "${subject}" — everything pending is already queued, ` +
+        'rejected or archived.', 'muted');
+      showToast('info', `Nothing left to queue in "${subject}".`);
       return;
     }
 
@@ -525,9 +608,13 @@ async function queueForLater() {
       body: { subject, questionIds: candidates, scheduledFor: when }
     });
 
-    candidates.forEach((id) => log('scheduleLog', '📅 ' + id + ' → Scheduled' + (when ? ' for ' + when : ''), 'ok'));
-    log('scheduleLog', `${result.updatedCount} question(s) queued.`, 'ok');
-    showToast('success', `${result.updatedCount} question(s) queued in "${subject}".`);
+    // The server names what it refused, so what is left is what it changed.
+    const refused = new Set([...(result.notFound || []),
+      ...(result.skipped || []).map((s) => s.questionId)]);
+    result.changed = candidates.filter((id) => !refused.has(id));
+
+    const n = reportQueueChange('scheduleLog', result, 'Scheduled' + (when ? ` for ${when}` : ''));
+    showToast(n ? 'success' : 'error', `${n} question(s) queued in "${subject}".`);
 
     await loadAnalytics();
   } catch (err) {
@@ -536,6 +623,199 @@ async function queueForLater() {
   } finally {
     button.disabled = false;
     button.textContent = '📅 Queue Questions';
+  }
+}
+
+/**
+ * unqueue — takes questions back out of the queue.
+ *
+ * Queueing was a one-way door: the only way back was to open the sheet and
+ * clear two columns by hand on every row.
+ */
+async function unqueue() {
+  const subject = $('scheduleSubject').value;
+  const count = Number($('scheduleCount').value);
+  const button = $('unqueueBtn');
+
+  clearLog('scheduleLog');
+  button.disabled = true;
+  button.textContent = 'Unqueueing…';
+
+  try {
+    log('scheduleLog', `Finding the next ${count} queued question(s) in "${subject}"…`);
+    const candidates = await pickQueueCandidates(subject, count, 'queued');
+
+    if (!candidates.length) {
+      log('scheduleLog', `Nothing is queued in "${subject}".`, 'muted');
+      showToast('info', `Nothing is queued in "${subject}".`);
+      return;
+    }
+
+    const result = await api('/api/questions/unschedule', {
+      method: 'POST',
+      body: { subject, questionIds: candidates, status: 'Approved' }
+    });
+
+    const refused = new Set([...(result.notFound || []),
+      ...(result.skipped || []).map((s) => s.questionId)]);
+    result.changed = candidates.filter((id) => !refused.has(id));
+
+    const n = reportQueueChange('scheduleLog', result, 'Approved');
+    if (n) {
+      log('scheduleLog', 'Their "Scheduled For" times are cleared. They are still eligible to post.', 'muted');
+    }
+    showToast(n ? 'success' : 'error', `${n} question(s) taken out of the queue in "${subject}".`);
+
+    await loadAnalytics();
+  } catch (err) {
+    log('scheduleLog', 'Failed: ' + err.message, 'fail');
+    showToast('error', err.message, 9000);
+  } finally {
+    button.disabled = false;
+    button.textContent = '↩️ Unqueue Questions';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Autopilot
+// ---------------------------------------------------------------------------
+// "Every 5 minutes, post the next 20 questions until there are none left."
+// The page polls rather than streams: a job outlives the tab, so the display
+// has to be rebuildable from scratch at any moment anyway.
+
+/** Server's view of the autopilot, refreshed on a timer while the page is open. */
+let autopilotState = { jobs: [], persistent: true };
+
+/** Poll handle, so leaving the page does not leave a timer running. */
+let autopilotTimer = null;
+
+/** A timestamp as "in 4 min", "in 25s", or "now". */
+function untilText(seconds) {
+  if (seconds === null || seconds === undefined) return '—';
+  if (seconds <= 0) return 'now';
+  if (seconds < 90) return `in ${seconds}s`;
+  return `in ${Math.round(seconds / 60)} min`;
+}
+
+/** Paints the running-jobs list. */
+function renderAutopilot() {
+  const area = $('autopilotJobs');
+  const jobs = autopilotState.jobs || [];
+
+  if (!jobs.length) {
+    replaceChildren(area, emptyState('🤖', 'Autopilot is not running.',
+      'Pick a subject, choose how often and how many, and start it.'));
+    return;
+  }
+
+  replaceChildren(area, ...jobs.map((job) => {
+    const s = job.settings;
+    const head = el('div', { class: 'post-progress-head' },
+      el('span', { text: `${job.running ? '🟢' : '⚪'} ${job.subject}` }),
+      pill(job.running ? (job.busy ? 'Posting now' : untilText(job.nextRunInSeconds)) : 'Stopped',
+        job.running ? 'ok' : 'muted'));
+
+    const lines = [
+      `${s.batchSize} question(s) every ${s.intervalMinutes} min` +
+        (s.requireApproved ? ', Approved or Scheduled only' : ', including Drafts'),
+      `${job.totals.runs} run(s) so far — ${job.totals.posted} posted, ${job.totals.failed} failed` +
+        (job.totals.restored ? `, ${job.totals.restored} put back after being deleted` : '')
+    ];
+    if (s.reconcileEveryRuns) {
+      lines.push(`Checks for deleted polls every ${s.reconcileEveryRuns} run(s).`);
+    }
+    if (job.startedBy) lines.push(`Started by ${job.startedBy}.`);
+    if (!job.running && job.stoppedReason) lines.push(job.stoppedReason);
+
+    // The last few runs, so a job that has quietly stopped posting can be
+    // asked why without anyone having watched it happen.
+    const history = (job.history || []).slice(0, 3).map((run) =>
+      el('div', {
+        class: 'log-line ' + (run.ok ? (run.posted ? 'ok' : 'muted') : 'fail'),
+        text: `${new Date(run.at).toLocaleTimeString()} — ` +
+          (run.ok ? `${run.posted} posted` : 'failed') + (run.message ? `: ${run.message}` : '')
+      }));
+
+    const stopBtn = el('button', { class: 'btn btn-ghost', text: '⏹ Stop ' + job.subject });
+    stopBtn.addEventListener('click', () => stopAutopilot(job.subject));
+
+    return el('div', { class: 'panel-body tight', style: 'border-top:1px solid var(--border-subtle)' },
+      head,
+      ...lines.map((text) => el('p', { class: 'hint-text', text })),
+      ...history,
+      job.running ? stopBtn : el('span'));
+  }));
+}
+
+/** Reads the current jobs and repaints. Quiet on failure: it runs on a timer. */
+async function loadAutopilot(loud = false) {
+  try {
+    autopilotState = await api('/api/automation/autopilot');
+    autopilotState = autopilotState.data || autopilotState;
+    renderAutopilot();
+
+    const warning = $('autopilotWarning');
+    // A job lives in the server process. On a serverless deployment that
+    // process is gone between requests, so saying nothing here would leave a
+    // curator watching a job that will never run again.
+    warning.hidden = autopilotState.persistent !== false;
+  } catch (err) {
+    if (loud) showToast('error', err.message, 9000);
+  }
+}
+
+/** Starts (or reconfigures) autopilot for the chosen subject. */
+async function startAutopilot() {
+  const subject = $('autoSubject').value;
+  const intervalMinutes = Number($('autoInterval').value);
+  const batchSize = Number($('autoBatch').value);
+  const button = $('autoStartBtn');
+
+  const ready = availableToPost(analytics, subject, $('autoApproved').value !== 'false');
+  const confirmed = confirm(
+    `Start autopilot for "${subject}"?\n\n` +
+    `It will post ${batchSize} question(s) every ${intervalMinutes} minute(s) — into the live ` +
+    `Telegram group — until the queue runs out.\n\n` +
+    (ready === null ? '' : `${ready} question(s) are ready right now, so roughly ` +
+      `${Math.ceil(ready / batchSize)} run(s).\n\n`) +
+    'You can stop it at any time.'
+  );
+  if (!confirmed) return;
+
+  button.disabled = true;
+  button.textContent = 'Starting…';
+  try {
+    const result = await api('/api/automation/autopilot', {
+      method: 'POST',
+      body: {
+        subject, intervalMinutes, batchSize,
+        requireApproved: $('autoApproved').value !== 'false',
+        stopWhenEmpty: $('autoStopWhenEmpty').value !== 'false',
+        reconcileEveryRuns: Number($('autoReconcile').value)
+      }
+    });
+    showToast('success', `Autopilot started for "${subject}". First batch is going out now.`);
+    if (result.persistent === false) {
+      showToast('info', 'This deployment does not keep the job between requests — ' +
+        'set up the /api/cron/autopilot cron so it keeps running.', 12000);
+    }
+    await loadAutopilot(true);
+  } catch (err) {
+    showToast('error', err.message, 9000);
+  } finally {
+    button.disabled = false;
+    button.textContent = '🤖 Start Autopilot';
+  }
+}
+
+/** Stops one subject's job. */
+async function stopAutopilot(subject) {
+  try {
+    const result = await api('/api/automation/autopilot/stop', { method: 'POST', body: { subject } });
+    showToast('success', result.message || `Autopilot stopped for "${subject}".`);
+    await loadAutopilot(true);
+  } catch (err) {
+    showToast('error', err.message, 9000);
   }
 }
 
@@ -577,6 +857,7 @@ async function load() {
   try {
     await loadBotStatus();
     await loadAnalytics();
+    await loadAutopilot();
   } catch (err) {
     showToast('error', err.message, 9000);
     replaceChildren($('cadenceArea'), emptyState('⚠️', 'Could not load subject data.', err.message));
@@ -607,9 +888,18 @@ initDashboard({
     window.addEventListener('beforeunload', (e) => {
       if (posting) { e.preventDefault(); e.returnValue = ''; }
     });
-  $('reconcileBtn').addEventListener('click', reconcileChannel);
+    $('reconcileBtn').addEventListener('click', reconcileChannel);
+    $('formatBtn').addEventListener('click', repairFormatting);
     $('scheduleBtn').addEventListener('click', queueForLater);
+    $('unqueueBtn').addEventListener('click', unqueue);
+    $('autoStartBtn').addEventListener('click', startAutopilot);
     $('refreshBtn').addEventListener('click', load);
+
+    // A job runs on the server and outlives this tab, so the page polls for
+    // its state rather than believing whatever it last saw.
+    autopilotTimer = setInterval(() => loadAutopilot(), 10000);
+    window.addEventListener('beforeunload', () => clearInterval(autopilotTimer));
+
     await load();
   }
 });

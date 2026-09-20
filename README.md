@@ -18,7 +18,7 @@ Live at <https://appscsadhana.vercel.app>, or locally with `npm run dashboard` a
 | 📤 | **Upload** (`/`) | Paste a JSON batch, review it as editable cards, push it into the sheet. Duplicates are detected and skipped. |
 | 📊 | **Analytics** (`/analytics.html`) | How many questions exist per subject, how many are posted, what is pending, the workflow and difficulty mix, curator contributions, posting timeline, and how many days of content each subject has left. |
 | 📚 | **Questions** (`/questions.html`) | Browse and search the whole bank. Filter by subject, status, difficulty or posted state. Edit any question in place, approve or reject in bulk, delete. |
-| 🤖 | **Automation** (`/automation.html`) | Post to Telegram straight from the browser. Queue batches for a planned time. See every subject's cron cadence and remaining runway. |
+| 🤖 | **Automation** (`/automation.html`) | Post to Telegram straight from the browser. Queue batches for a planned time, or take them back out. Hand the queue to **Autopilot** and let it post unattended. See every subject's cron cadence and remaining runway. |
 | 💳 | **Members** (`/members.html`) | Paying members, revenue by plan, who is about to lapse, and a dry run of the nightly expiry sweep. |
 | 🎟 | **Pass & Coupons** (`/pricing.html`) | The pass students buy — name, price, valid-until date — and coupon codes with their usage. |
 | 🆘 | **Support** (`/support.html`) | Student tickets: read the conversation, reply, send a new invite link, check a payment, grant a pass, resolve. |
@@ -179,6 +179,96 @@ and `Archived` rows are never eligible.
 punctuation and whitespace before hashing, so re-pasting the same question with
 different formatting is still recognised as a duplicate rather than silently doubling
 your bank.
+
+---
+
+## Autopilot — posting without watching
+
+The Automation page can run the queue down on its own: **every N minutes, post the
+next M questions, until there is nothing left.**
+
+Each run is exactly what the Post button does — reserve the rows first, send each
+poll, then mark the sheet — so a question is never sent twice and a run that fails
+halfway hands back what it did not send. Beyond that:
+
+- **Runs never overlap.** A job still posting is not started again, and the next run
+  is timed from when the last one *finished*. A batch of 20 takes minutes; counting
+  from the start would stack runs on a job that is already behind.
+- **One job per subject.** Starting a subject that is already running changes its
+  settings in place rather than racing a second job against the first.
+- **It stops when the queue is empty** — after three empty runs in a row, not one,
+  because a batch can land exactly on the end of the queue. A Telegram outage is
+  never mistaken for an empty queue: it is recorded as a failure and retried.
+- **It survives a restart.** Running jobs are written to `.autopilot-state.json` and
+  picked back up, without replaying every run that came due while the server was
+  down.
+- **Every run is recorded**, so a job that quietly stopped posting can be asked why
+  days later.
+
+Optionally it also checks for deleted polls every few runs (see below).
+
+**On Vercel** nothing survives between requests, so the in-process timer never fires
+and the page says so. Point a scheduled job at `/api/cron/autopilot` — it runs the
+same tick — with `Authorization: Bearer $CRON_SECRET`. Frequent crons need a plan
+that allows them; running `npm run dashboard` on a machine that stays awake needs
+nothing at all.
+
+---
+
+## Deleted polls, and keeping the sheet honest
+
+Telegram never tells a bot that a message was deleted. Without something watching,
+a poll removed from the channel leaves the sheet claiming it was posted for ever:
+the question can never be re-sent, and every count is wrong.
+
+**Check the channel for deleted polls** on the Automation page walks the posted rows,
+asks Telegram whether each poll is still there, and offers to put the deleted ones
+back in the queue as `Approved`. It reports before it writes, and a poll it *cannot*
+tell about is left alone — guessing "deleted" would post a live question a second
+time, which is the opposite of the point.
+
+The same check runs unattended two ways:
+
+- **Autopilot**, every few runs, on the subject it is posting.
+- **`/api/cron/reconcile`**, nightly (in `vercel.json`), taking each group's subjects
+  in rotation.
+
+Each row costs one Telegram call and a rate-limit pause, so a channel with hundreds
+of posts cannot be swept in one pass. Each pass carries on from where the last one
+stopped and wraps around, so the newest posts — the ones most likely to have just
+been deleted — are reached rather than being stuck behind the same first rows for
+ever.
+
+---
+
+## Sheet formatting
+
+Rows appended through the Sheets API inherit the formatting of the row above them —
+the same thing inserting a row in the UI does. The row above the first upload is the
+header, so a tab filled this way came out bold white on `#1a237e` from top to bottom,
+one upload inheriting from the last.
+
+Appended rows are now put back to the body style straight after the append, and a tab
+this client creates is styled as it is created. **🎨 Repair sheet formatting** on the
+Automation page is the way back for a tab that is already navy: it restores the header
+style, column widths, frozen panes, row height, the dropdowns and the colour coding
+for `Status`, `Posted` and `Difficulty`, across every subject in the group. It changes
+formatting only — not one question is read, moved or altered.
+
+---
+
+## Queueing, and taking it back
+
+**Queue for Later** sets `Status = Scheduled` and fills `Scheduled For`, so the next
+run picks those questions first. It posts nothing by itself.
+
+**Unqueue Questions** is the way back: it takes the same number of *queued* questions,
+sets them to `Approved` and clears `Scheduled For`. Nothing is deleted, and a question
+already sent — or being sent right now — is never touched.
+
+Both report what they actually changed. An id that is not in that subject's tab, and a
+row the poster is holding, are each named rather than being folded into a count: a bare
+"0 questions queued" cannot tell you which of the two it was.
 
 ---
 
@@ -596,7 +686,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-87 tests across three suites:
+545 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -609,6 +699,12 @@ npm test
 - `test/payments.test.js` — plan pricing and expiry arithmetic, and the webhook
   security model: forged signatures, tampered bodies, replayed deliveries, and
   identity coming only from Razorpay's echoed notes.
+- `test/sheets-direct.test.js` — the posting path and the curation queue against an
+  in-memory spreadsheet, checked to write exactly what the Apps Script writes: the
+  two share every sheet, so each has to understand the other's marks.
+- `test/autopilot.test.js` — the unattended scheduler on a fake clock: overlapping
+  runs, an empty queue, a Telegram outage being mistaken for an empty queue, and a
+  restart neither forgetting its jobs nor stampeding through every missed run.
 
 ---
 
@@ -632,10 +728,12 @@ npm test
 ├── src/
 │   ├── auth.js               # Firebase ID token verification
 │   ├── sheets.js             # Apps Script client
+│   ├── sheets-direct.js      # Google Sheets API client (the posting path)
+│   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 75 tests
+└── test/                     # 545 tests
 ```
 
 ## Notes
