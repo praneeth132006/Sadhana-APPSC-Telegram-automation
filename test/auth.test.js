@@ -252,14 +252,32 @@ test('the curator allowlist admits accounts that are on it', async () => {
 
 test('with no allowlist, an unverified email is refused', async () => {
   process.env.CURATOR_EMAILS = '';
-  await assert.rejects(() => auth.authorize(mintToken({ email_verified: false })), /not verified/);
+  await assert.rejects(
+    () => auth.authorize(mintToken({ email_verified: false, firebase: { sign_in_provider: 'password' } })),
+    /not verified/
+  );
 });
 
-test('an allowlisted account is admitted even if unverified', async () => {
-  // The allowlist is the stronger control, so it overrides the verification rule.
+test('an unverified email is refused even when it is on the allowlist', async () => {
+  // This was the hole: anyone can register a Firebase password account for an
+  // address they do not own, so an allowlisted address that had never actually
+  // signed in could simply be claimed by a stranger. Google sign-in arrives
+  // verified, so refusing costs a real curator nothing.
   process.env.CURATOR_EMAILS = 'curator@example.com';
   try {
-    const identity = await auth.authorize(mintToken({ email_verified: false }));
+    await assert.rejects(
+      () => auth.authorize(mintToken({ email_verified: false })),
+      (err) => err.statusCode === 403 && /not verified/.test(err.message)
+    );
+  } finally {
+    process.env.CURATOR_EMAILS = '';
+  }
+});
+
+test('an allowlisted, verified account is admitted', async () => {
+  process.env.CURATOR_EMAILS = 'curator@example.com';
+  try {
+    const identity = await auth.authorize(mintToken());
     assert.equal(identity.uid, 'uid-123');
   } finally {
     process.env.CURATOR_EMAILS = '';
@@ -286,4 +304,99 @@ test('the bearer token is extracted only from a well-formed header', async () =>
   assert.equal(auth.extractBearerToken({ headers: {} }), '');
   assert.equal(auth.extractBearerToken({ headers: { authorization: 'Basic abc123' } }), '');
   assert.equal(auth.extractBearerToken({ headers: { authorization: 'abc123' } }), '');
+});
+
+// ---------------------------------------------------------------------------
+// Resilience and classification
+// ---------------------------------------------------------------------------
+
+/** A fresh copy of src/auth.js, so its certificate cache starts empty. */
+function freshAuth() {
+  delete require.cache[require.resolve('../src/auth')];
+  return require('../src/auth');
+}
+
+test('a failed certificate refresh falls back to the keys already held', async () => {
+  // Google's keys rotate roughly daily and the old ones stay valid for a while.
+  // A refresh that fails — a network blip, a Google outage — must not reject
+  // every curator for as long as it lasts.
+  const saved = globalThis.fetch;
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const fresh = freshAuth();
+
+    // max-age=0: the keys are cached but already due for a refresh.
+    globalThis.fetch = async () => ({
+      ok: true,
+      headers: { get: () => 'public, max-age=0' },
+      json: async () => ({ [KID]: CERT_PEM })
+    });
+    const first = await fresh.verifyIdToken(mintToken());
+    assert.equal(first.uid, 'uid-123');
+
+    // Now Google is unreachable.
+    let attempts = 0;
+    globalThis.fetch = async () => { attempts++; throw new Error('getaddrinfo ENOTFOUND www.googleapis.com'); };
+
+    const second = await fresh.verifyIdToken(mintToken());
+    assert.equal(second.uid, 'uid-123', 'a Google outage locked the curator out');
+    assert.equal(attempts, 1, 'it did try to refresh first');
+  } finally {
+    globalThis.fetch = saved;
+    console.warn = warn;
+    freshAuth();
+  }
+});
+
+test('with no keys held at all, a failed refresh is still an error', async () => {
+  // The fallback is to keys we already trust, never to "accept anything".
+  const saved = globalThis.fetch;
+  try {
+    const fresh = freshAuth();
+    globalThis.fetch = async () => { throw new Error('offline'); };
+    await assert.rejects(() => fresh.verifyIdToken(mintToken()), /offline/);
+  } finally {
+    globalThis.fetch = saved;
+    freshAuth();
+  }
+});
+
+test('an empty key set from Google is refused rather than cached', async () => {
+  const saved = globalThis.fetch;
+  try {
+    const fresh = freshAuth();
+    globalThis.fetch = async () => ({
+      ok: true, headers: { get: () => 'max-age=3600' }, json: async () => ({})
+    });
+    await assert.rejects(() => fresh.verifyIdToken(mintToken()), /no keys/);
+  } finally {
+    globalThis.fetch = saved;
+    freshAuth();
+  }
+});
+
+test('token problems ask for a new token; identity problems do not', async () => {
+  // What the dashboard does next depends on this: a 401 is retried with a
+  // fresh token, a 403 is shown as a permissions problem.
+  const reauth = [
+    ['expired', mintToken({ exp: Math.floor(Date.now() / 1000) - 3600 })],
+    ['wrong project', mintToken({ aud: 'someone-else' })],
+    ['forged', mintToken({}, {}, false) + 'garbage'],
+    ['malformed', 'not.a.jwt.at.all']
+  ];
+  for (const [what, token] of reauth) {
+    await assert.rejects(() => auth.verifyIdToken(token),
+      (err) => err.statusCode === 401 && err.authKind === 'reauth',
+      `${what} should ask for a new token`);
+  }
+
+  process.env.CURATOR_EMAILS = 'someone.else@example.com';
+  try {
+    await assert.rejects(() => auth.authorize(mintToken()),
+      (err) => err.statusCode === 403 && err.authKind === 'forbidden',
+      'an account off the allowlist should be refused, not asked to sign in again');
+  } finally {
+    process.env.CURATOR_EMAILS = '';
+  }
 });

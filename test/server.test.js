@@ -133,7 +133,12 @@ telegram.sendQuizPoll = async () => ({ message_id: 999, poll: { id: 'poll-1' } }
 
 // Auth: accept exactly one token.
 auth.authorize = async (token) => {
-  if (token !== 'valid-token') throw new Error('Token signature is invalid.');
+  // Refused the way the real one refuses, so the routes see the same shapes:
+  // a bad token asks for a new one (401), a refused identity does not (403).
+  if (token === 'not-a-curator') {
+    throw auth.authError('Account nobody@example.com is not on the curator allowlist.', 'forbidden');
+  }
+  if (token !== 'valid-token') throw auth.authError('Token signature is invalid.', 'reauth');
   return {
     uid: 'uid-1', email: 'curator@example.com', name: 'Test Curator',
     emailVerified: true, signInProvider: 'google.com'
@@ -345,10 +350,19 @@ test('every data route refuses an unauthenticated caller', async () => {
   }
 });
 
-test('an invalid token is rejected with 403', async () => {
+test('a bad token asks the browser to sign in again, rather than reading as a ban', async () => {
+  // 401 and not 403. Both used to be 403, so a session that had simply lapsed
+  // reached the dashboard as a permissions problem and told the curator to add
+  // themselves to CURATOR_EMAILS when all they had to do was sign in again.
   const res = await call('/api/analytics', { token: 'forged-token' });
-  assert.equal(res.status, 403);
+  assert.equal(res.status, 401);
   assert.match(res.json.error, /signature/i);
+});
+
+test('an identity that is refused stays 403, because a new token would not help', async () => {
+  const res = await call('/api/analytics', { token: 'not-a-curator' });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /allowlist/i);
 });
 
 test('a valid token is accepted', async () => {

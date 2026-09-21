@@ -443,6 +443,32 @@ change for any that are not.
 The full review, including what was wrong before this release and how each issue was
 proven, is in [SECURITY-REVIEW.md](SECURITY-REVIEW.md).
 
+**A verified email is required, always.** Being on `CURATOR_EMAILS` used to be treated
+as enough on its own, and that was a hole: anyone can register a Firebase password
+account for an address they do not own, so an allowlisted address that had never
+actually signed in could simply be claimed. Google sign-in arrives verified, so this
+costs a real curator nothing.
+
+### When a session lapses
+
+The server answers **401** when a new token would fix the problem — an expired session,
+a drifted clock, a token from another project — and **403** only when the identity itself
+is refused. Both used to be 403, so a session that had simply lapsed reached the
+dashboard as a permissions problem, telling a curator to add themselves to
+`CURATOR_EMAILS` when all they needed was to sign in again.
+
+The dashboard acts on the difference:
+
+| Server says | Dashboard does |
+|---|---|
+| 401 | Asks Firebase for a **fresh** token and retries once, silently |
+| 401 again | Signs out and puts the sign-in card back — once, however many requests noticed |
+| 403 | Shows why the account is refused, and does not retry |
+
+If Google's certificate endpoint is unreachable, the server keeps verifying against the
+keys it already holds rather than rejecting every curator for as long as the outage
+lasts.
+
 ---
 
 ## Paid group access (Razorpay)
@@ -801,12 +827,15 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-651 tests. The ones worth knowing about:
+663 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
 - `test/auth.test.js` — Firebase token verification against real signing attacks:
-  `alg:none`, HS256 confusion, tampered payloads, expiry, wrong audience.
+  `alg:none`, HS256 confusion, tampered payloads, expiry, wrong audience — plus which
+  failures ask for a new token and which do not, and surviving a Google outage.
+- `test/dashboard-auth.test.mjs` — the browser's `api()` loaded for real with Firebase
+  stubbed, so the token refresh and the lapsed-session path actually run.
 - `test/apps-script.test.js` — the Apps Script logic in a sandboxed Google runtime:
   header resolution, the migration, duplicate detection, filtering and the runway math.
 - `test/host-authorisation.test.js` — the Firebase authorised-domain matching rule,
@@ -855,7 +884,7 @@ npm test
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 651 tests
+└── test/                     # 663 tests
 ```
 
 ## Notes

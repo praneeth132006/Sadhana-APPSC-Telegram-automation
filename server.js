@@ -3505,7 +3505,15 @@ const server = http.createServer(async (req, res) => {
     try {
       user = await auth.authorize(token);
     } catch (err) {
-      sendJSON(res, 403, { success: false, error: err.message });
+      // 401 when a NEW token would fix it — an expired session, a clock that
+      // has drifted, a token from another project. 403 only when the identity
+      // itself is refused, where signing in again changes nothing.
+      //
+      // Both used to answer 403, so a lapsed session reached the dashboard as
+      // a permissions problem and told the curator to add themselves to
+      // CURATOR_EMAILS when all they had to do was sign in again.
+      const status = err.statusCode === 401 || err.authKind === 'reauth' ? 401 : 403;
+      sendJSON(res, status, { success: false, error: err.message });
       return;
     }
 

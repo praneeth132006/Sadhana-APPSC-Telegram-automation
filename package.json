@@ -9,7 +9,7 @@
     "schedule": "node schedule.js",
     "create-sample": "node create-sample.js",
     "dashboard": "node server.js",
-    "test": "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
+    "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
     "verify-topics": "node verify-topics.js",
     "bot": "node bot.js",
     "membership-cron": "node membership-cron.js",
