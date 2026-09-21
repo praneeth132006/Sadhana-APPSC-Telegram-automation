@@ -35,6 +35,7 @@ const groupRegistry = require('./groups');
 const support = require('./support');
 const pricing = require('./pricing');
 const referrals = require('./referrals');
+const botCommands = require('./bot-commands');
 
 /**
  * createPaymentBot — builds one family's bot with all its handlers attached.
@@ -128,9 +129,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * shown before anyone presses Start) by `npm run bot-profile`, so the first
    * thing a stranger reads and the first thing /about says do not drift apart.
    */
-  const ABOUT_TEXT =
-    'Join our APPSC prep group via this bot. Get daily practice questions from ' +
-    'Eenadu, Sakshi &amp; Nipuna in poll format. Available in both Telugu and English mediums.';
+  // From src/bot-commands.js, so /about and the Telegram description screen can
+  // no longer drift apart. Escaped here because this one is sent as HTML.
+  const ABOUT_TEXT = esc(botCommands.ABOUT);
 
   /** The family's name, for the top of a greeting. */
   function botDisplayName() {

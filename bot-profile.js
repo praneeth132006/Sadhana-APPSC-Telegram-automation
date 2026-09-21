@@ -25,37 +25,20 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const groupRegistry = require('./src/groups');
 
-/**
- * What the bot is, in one paragraph.
- *
- * This is the same text as ABOUT_TEXT in src/botapp.js, which is what /about
- * replies. Two copies of one paragraph is a smell, but the alternative is
- * importing the bot factory — and that refuses to load without a Razorpay key,
- * which this script has no business needing. Keep them in step.
- */
-const DESCRIPTION =
-  'Join our APPSC prep group via this bot. Get daily practice questions from ' +
-  'Eenadu, Sakshi & Nipuna in poll format. Available in both Telugu and English mediums.';
+const botCommands = require('./src/bot-commands');
+const support = require('./src/support');
 
-/** The line under the bot's name. Telegram allows 120 characters. */
-const SHORT_DESCRIPTION =
-  'Daily APPSC practice questions from Eenadu, Sakshi & Nipuna — in Telugu and English.';
+const DESCRIPTION = botCommands.ABOUT;
 
-/**
- * The ☰ Menu.
- *
- * Ordered by how often a student needs them, not alphabetically: /start and
- * /about are what a newcomer wants, /plans and /status what a member wants.
- */
-const COMMANDS = [
-  { command: 'start', description: 'Start here — what this bot is' },
-  { command: 'about', description: 'About this group and the questions' },
-  { command: 'plans', description: 'See the pass and join' },
-  { command: 'status', description: 'Check your current pass' },
-  { command: 'referral', description: 'Invite a friend and earn 20%' },
-  { command: 'help', description: 'How it all works' },
-  { command: 'support', description: 'Get help with a problem' }
-];
+/** A plain Telegram API caller for one bot, for the calls the library lacks. */
+function telegramFor(env) {
+  const token = String(process.env[env] || '').trim();
+  return (method, params) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {})
+  }).then((r) => r.json());
+}
+const SHORT_DESCRIPTION = botCommands.SHORT_DESCRIPTION;
+const COMMANDS = botCommands.STUDENT_COMMANDS;
 
 const statusOnly = process.argv.includes('--status');
 const dryRun = process.argv.includes('--dry-run');
@@ -95,15 +78,14 @@ async function main() {
     console.log(`  ${env}  →  @${me.username}`);
 
     if (statusOnly) {
-      const [description, short, commands] = await Promise.all([
+      const [description, short] = await Promise.all([
         bot.getMyDescription().catch(() => ({})),
-        bot.getMyShortDescription().catch(() => ({})),
-        bot.getMyCommands().catch(() => [])
+        bot.getMyShortDescription().catch(() => ({}))
       ]);
-      console.log(`    description: ${description.description || '(none)'}`);
-      console.log(`    short:       ${short.short_description || '(none)'}`);
-      console.log(`    commands:    ${commands.length
-        ? commands.map((c) => '/' + c.command).join(' ') : '(none)'}\n`);
+      const shown = await botCommands.menuStudentsSee(telegramFor(env));
+      console.log(`    description:   ${description.description || '(none)'}`);
+      console.log(`    short:         ${short.short_description || '(none)'}`);
+      console.log(`    students see:  ${shown.length ? shown.map((c) => '/' + c).join(' ') : '(nothing)'}\n`);
       continue;
     }
 
@@ -118,8 +100,29 @@ async function main() {
       // Each is a separate call, and each is reported on its own: a bot whose
       // commands were set but whose description was refused should not look
       // like a success.
-      await bot.setMyCommands(COMMANDS);
-      console.log(`    ✅ commands    (${COMMANDS.length})`);
+      // The menus go to the scopes students and admins are actually in. This
+      // script used to write the default scope, which Telegram never shows in
+      // a private chat while set-webhooks has filled the private-chat scope —
+      // so the new commands were invisible to every student.
+      const telegram = telegramFor(env);
+      const results = await botCommands.registerMenus(telegram, support.supportChatFor(env));
+      for (const r of results) {
+        if (!r.ok) {
+          console.log(`    ❌ ${r.what}: ${r.detail}`);
+          process.exitCode = 1;
+        }
+      }
+
+      // What a student is really shown, read back from Telegram.
+      const shown = await botCommands.menuStudentsSee(telegram);
+      const wanted = COMMANDS.map((c) => c.command);
+      if (shown.join(' ') === wanted.join(' ')) {
+        console.log(`    ✅ students see ${shown.map((c) => '/' + c).join(' ')}`);
+      } else {
+        console.log(`    ❌ students see ${shown.length ? shown.map((c) => '/' + c).join(' ') : 'nothing'}, ` +
+          `not ${wanted.map((c) => '/' + c).join(' ')}`);
+        process.exitCode = 1;
+      }
 
       // These two take a FORM, not a string. Handed a string the library sends
       // an empty form, Telegram answers ok, and the description stays blank —

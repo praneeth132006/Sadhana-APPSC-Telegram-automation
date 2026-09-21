@@ -312,6 +312,22 @@ The menu is `/start`, `/about`, `/plans`, `/status`, `/referral`, `/help`, `/sup
 `/start` is one welcome message with a **Continue →** button — the pass is shown when
 they tap it, not unasked.
 
+**Where the menu is written matters.** Telegram keeps a separate list per *scope* and
+shows the most specific one that has anything in it. In a private chat that is
+`all_private_chats`, which beats `default` — so a list written only to `default` is
+never seen by a student. The menus are written to:
+
+| Scope | List | Why |
+|---|---|---|
+| Private chats | the student commands | where every one of them works |
+| The bot's support chat | the admin commands | `/summary`, `/tickets`, `/find`… |
+| Default | cleared | the paid groups fall back to it, and the bot answers no command there |
+
+There is one list, in `src/bot-commands.js`. `set-webhooks` and `bot-profile` both read
+it; they used to keep one each, in different scopes, and students saw neither the new
+commands nor any sign that they existed. `npm run bot-profile:status` reports what a
+student is actually shown, read back from Telegram.
+
 ---
 
 ## Referrals — invite a friend
@@ -850,7 +866,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-688 tests. The ones worth knowing about:
+699 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -904,10 +920,11 @@ npm test
 │   ├── sheets-direct.js      # Google Sheets API client (the posting path)
 │   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
 │   ├── referrals.js          # referral codes, discounts, commission and payouts
+│   ├── bot-commands.js       # the one command menu and description every bot uses
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 688 tests
+└── test/                     # 699 tests
 ```
 
 ## Notes
