@@ -38,6 +38,7 @@ const plans = require('./src/plans');
 const botapp = require('./src/botapp');
 const support = require('./src/support');
 const pricing = require('./src/pricing');
+const referrals = require('./src/referrals');
 const autopilotFactory = require('./src/autopilot');
 
 // ---------------------------------------------------------------------------
@@ -657,6 +658,89 @@ async function recordCouponUse(notes, paymentId, paidPaise) {
   }
 }
 
+/**
+ * referralSheetFor — the sheet that holds a family's codes and earnings.
+ *
+ * A payment bot family shares one code list. Reading it from whichever group
+ * the dashboard happens to be showing would give a curator a different answer
+ * per group, and settling a payout from one of them would leave the other
+ * still showing it as owed.
+ */
+function referralSheetFor(groupId) {
+  const group = groupRegistry.requireGroup(groupId);
+  const primary = groupRegistry.listGroups()
+    .find((g) => g.ready && g.paymentBotEnv === group.paymentBotEnv) || group;
+  return sheets.forGroup(primary.id);
+}
+
+/**
+ * recordReferralEarning — credits the inviter once a referred payment succeeds.
+ *
+ * Never fails the webhook: the student has paid and must get access whether or
+ * not the commission can be written. The sheet ignores a payment id it has
+ * already recorded, so a redelivered webhook credits nothing twice — which
+ * matters more here than anywhere else in this file, because the other end of
+ * it is money leaving the business.
+ *
+ * What is owed was worked out when the link was created and rides in its
+ * notes, so an admin changing the price while the link was open cannot change
+ * what the inviter is paid for a sale that already happened.
+ */
+async function recordReferralEarning(notes, paymentId, paidPaise) {
+  try {
+    const group = groupRegistry.requireGroup(notes.group_id);
+    const primary = groupRegistry.listGroups()
+      .find((g) => g.ready && g.paymentBotEnv === group.paymentBotEnv) || group;
+    const sheet = sheets.forGroup(primary.id);
+
+    const code = referrals.normaliseCode(notes.referral_code);
+    const referral = await sheet.getReferral(code);
+    if (!referral) {
+      console.error(`[payments] referral ${code} on ${paymentId} is not in the sheet — nothing credited`);
+      return;
+    }
+
+    const paid = Number(paidPaise) || 0;
+    // The notes are authoritative for what was promised; the fallback recomputes
+    // from what was actually paid, so an old link still credits something sane.
+    const commissionPaise = notes.commission_amount !== undefined && notes.commission_amount !== ''
+      ? Math.round(Number(notes.commission_amount) * 100)
+      : referrals.percentOf(paid, referrals.DEFAULT_COMMISSION_PERCENT);
+
+    const result = await sheet.recordReferralEarning({
+      code,
+      referrer_telegram_id: referral.telegram_id,
+      referrer_username: referral.username,
+      referred_telegram_id: notes.telegram_id,
+      referred_username: notes.telegram_username || '',
+      referred_name: notes.telegram_name || '',
+      group: group.shortName,
+      payment_id: paymentId,
+      original_paise: Math.round((Number(notes.original_amount) || 0) * 100),
+      discount_paise: Math.round((Number(notes.discount_amount) || 0) * 100),
+      paid_paise: paid,
+      commission_paise: commissionPaise
+    });
+
+    if (!result.recorded) return;
+    console.log(`[payments] referral ${code}: credited ${commissionPaise / 100} to ${referral.telegram_id} ` +
+      `for ${notes.telegram_id}'s payment ${paymentId}`);
+
+    // Telling the inviter is the whole reward loop. Best effort: a failed DM
+    // must not undo a credit that is already in the sheet.
+    try {
+      await paybot.sendDirectMessage(group.paymentBotEnv, referral.telegram_id,
+        `🎁 Someone joined <b>${group.shortName}</b> using your referral code ` +
+        `<code>${code}</code>.\n\nYou earned <b>₹${(commissionPaise / 100).toFixed(2)}</b>. ` +
+        'Send /referral to see your total.');
+    } catch (err) {
+      console.error(`[payments] could not tell ${referral.telegram_id} about their commission: ${err.message}`);
+    }
+  } catch (err) {
+    console.error(`[payments] could not record referral ${notes.referral_code} for ${paymentId}: ${err.message}`);
+  }
+}
+
 async function handlePaymentEvent(event) {
   const type = String(event.event || '');
   const payload = event.payload || {};
@@ -690,6 +774,9 @@ async function handlePaymentEvent(event) {
 
     if (notes.coupon_code) {
       await recordCouponUse(notes, payment.id || link.id, paidPaise);
+    }
+    if (notes.referral_code) {
+      await recordReferralEarning(notes, payment.id || link.id, paidPaise);
     }
 
     // A repeat delivery of the same payment must not send a second message.
@@ -1077,6 +1164,9 @@ const autopilot = autopilotFactory.createAutopilot({
       groupId,
       subject,
       apply: true,
+      // Never re-queue unattended: a question someone deleted from the channel
+      // would go back out within the interval, and nobody would be watching.
+      action: 'mark',
       limit: AUTOPILOT_RECONCILE_LIMIT,
       budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
       actor: 'autopilot'
@@ -1118,6 +1208,13 @@ const reconcileCursor = new Map();
  */
 async function reconcileChannel(options) {
   const { db, groupId, subject, apply, actor } = options;
+
+  // What to do with a poll that is gone. Marking is the default, and the old
+  // default of re-queueing was wrong in the common case: a curator who deletes
+  // a poll from the channel has decided that question should not be there, and
+  // putting it back in the queue posts it again a few minutes later. Getting
+  // it back out is a separate decision a person makes on purpose.
+  const action = options.action === 'requeue' ? 'requeue' : 'mark';
 
   let chatId;
   try {
@@ -1165,10 +1262,20 @@ async function reconcileChannel(options) {
   reconcileCursor.set(cursorKey, checked >= ordered.length ? 0 : lastRow);
 
   let restored = 0;
+  let marked = 0;
   if (apply && missing.length) {
-    restored = await db.unpostQuestions(subject, missing.map((m) => m.row), 'Approved');
-    console.log(`[reconcile] ${actor || 'autopilot'} returned ${restored} deleted poll(s) ` +
-      `to the queue in "${subject}"`);
+    const rowNumbers = missing.map((m) => m.row);
+    if (action === 'requeue') {
+      restored = await db.unpostQuestions(subject, rowNumbers, 'Approved');
+      console.log(`[reconcile] ${actor || 'the deleted-poll check'} returned ${restored} deleted ` +
+        `poll(s) to the queue in "${subject}"`);
+    } else {
+      marked = await db.markDeleted(subject, rowNumbers,
+        `Deleted from the Telegram group — the poll is no longer there. ` +
+        `Noticed by ${actor || 'the scheduled deleted-poll check'}.`);
+      console.log(`[reconcile] ${actor || 'the deleted-poll check'} marked ${marked} question(s) ` +
+        `Deleted in "${subject}"`);
+    }
   }
 
   const swept = checked >= ordered.length;
@@ -1182,12 +1289,17 @@ async function reconcileChannel(options) {
       missing: missing.map((m) => ({ questionId: m.question_id, row: m.row, messageId: m.message_id })),
       // Named, so "3 could not be checked" is actionable rather than ominous.
       unknown,
+      action,
       restored,
+      marked,
       // A partial sweep has to say so, or "0 deleted" sounds like the whole
       // channel was checked when only the first few rows were.
       complete: swept,
       message: apply
-        ? `${restored} deleted poll(s) put back in the queue for "${subject}".`
+        ? (action === 'requeue'
+          ? `${restored} deleted poll(s) put back in the queue for "${subject}".`
+          : `${marked} question(s) marked Deleted in "${subject}". They stay out of the queue, ` +
+            'so none of them will be posted again.')
         : `${missing.length} of ${checked} checked poll(s) are no longer in the channel.` +
           (swept ? '' : ` ${ordered.length - checked} more will be checked on the next pass.`) +
           (missing.length ? ' Run again with Apply to put them back in the queue.' : '')
@@ -1833,14 +1945,15 @@ async function handlePublicRoute(pathname, method, req, res) {
           groupId: group.id,
           subject,
           apply: true,
+          action: 'mark',
           limit: AUTOPILOT_RECONCILE_LIMIT,
           budgetMs: AUTOPILOT_RECONCILE_BUDGET_MS,
-          actor: 'cron'
+          actor: 'the nightly deleted-poll check'
         });
         results.push({
           groupId: group.id,
           subject,
-          restored: outcome.payload.restored || 0,
+          marked: outcome.payload.marked || 0,
           checked: outcome.payload.checked || 0,
           complete: outcome.payload.complete === true
         });
@@ -1850,9 +1963,9 @@ async function handlePublicRoute(pathname, method, req, res) {
       }
     }
 
-    const restored = results.reduce((sum, r) => sum + (r.restored || 0), 0);
-    console.log(`[cron] deleted-poll sweep put ${restored} question(s) back in the queue`);
-    sendJSON(res, 200, { success: true, data: { results, restored } });
+    const marked = results.reduce((sum, r) => sum + (r.marked || 0), 0);
+    console.log(`[cron] deleted-poll sweep marked ${marked} question(s) Deleted`);
+    sendJSON(res, 200, { success: true, data: { results, marked } });
     return true;
   }
 
@@ -2372,6 +2485,9 @@ async function handlePricingRoute(pathname, method, req, res, query, groupId, ac
       price: pass.amountPaise / 100,
       priceText: pricing.rupees(pass.amountPaise),
       validUntil: pass.validUntil,
+      // The page needs to know, or it offers a "Valid until" box that does
+      // nothing: a lifetime pass ignores any end date by design.
+      lifetime: pass.lifetime === true,
       description: pass.description,
       defaults: (() => {
         const base = pricing.currentPass(primary.id, {});
@@ -3017,6 +3133,7 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       subject: subject.value,
       // Reporting only unless asked to write, so it can be run to look first.
       apply: body.apply === true,
+      action: str(body.action, 10),
       limit: parseInt(body.limit, 10) || 0,
       actor
     });
@@ -3069,6 +3186,124 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       formattedCount: fixed,
       message: `${fixed} of ${results.length} tab(s) put back to the standard layout.`
     });
+    return true;
+  }
+
+  // ---- Referrals -----------------------------------------------------------
+  // Who invited whom, what it cost, what is owed, and what has been paid.
+  // Codes and earnings live on the family's primary sheet, so a student who
+  // invites a friend to the English group and another to the Telugu one has
+  // one code and one balance rather than two halves that never reach a payout.
+  if (pathname === '/api/referrals' && method === 'GET') {
+    const sheet = referralSheetFor(groupId);
+    const settings = referrals.settingsFrom(await sheet.getBotSettings().catch(() => ({})));
+
+    const [codes, earnings] = await Promise.all([
+      sheet.listReferrals(),
+      sheet.listReferralEarnings()
+    ]);
+
+    // Every code, with its own standing worked out the same way the bot works
+    // it out — one function, so the two can never disagree about what a
+    // student is owed.
+    const byCode = codes.map((code) => {
+      const mine = earnings.filter((e) => e.code === String(code.code).toUpperCase());
+      const stats = referrals.summarise(mine, settings);
+      return {
+        code: code.code,
+        telegramId: code.telegram_id,
+        username: code.username,
+        name: code.name,
+        status: code.status || 'active',
+        createdAt: code.created_at,
+        joined: stats.joined,
+        pendingPaise: stats.pendingPaise,
+        paidPaise: stats.paidPaise,
+        totalPaise: stats.totalPaise,
+        payable: stats.payable
+      };
+    });
+    byCode.sort((a, b) => b.pendingPaise - a.pendingPaise || b.joined - a.joined);
+
+    const totals = earnings.reduce((acc, e) => {
+      if (e.status === 'cancelled') return acc;
+      acc.joined++;
+      acc.revenuePaise += e.paid_paise;
+      acc.discountPaise += e.discount_paise;
+      if (e.status === 'paid') acc.paidPaise += e.commission_paise;
+      else acc.pendingPaise += e.commission_paise;
+      return acc;
+    }, { joined: 0, revenuePaise: 0, discountPaise: 0, pendingPaise: 0, paidPaise: 0 });
+
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        settings: {
+          enabled: settings.enabled,
+          discountPercent: settings.discountPercent,
+          commissionPercent: settings.commissionPercent,
+          payoutThresholdPaise: settings.payoutThresholdPaise
+        },
+        codes: byCode,
+        // Newest first: the question an admin has is almost always "who joined
+        // just now", not "who joined in March".
+        earnings: earnings.slice().reverse(),
+        totals,
+        due: referrals.payoutDue(earnings, { thresholdPaise: settings.payoutThresholdPaise })
+      }
+    });
+    return true;
+  }
+
+  // Marks one inviter's pending earnings paid, after the money has actually
+  // been sent. Nothing here moves money: this records that a person did.
+  if (pathname === '/api/referrals/settle' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const code = referrals.normaliseCode(str(body.code, 24));
+    if (!referrals.isCode(code)) {
+      sendJSON(res, 400, { success: false, error: 'That is not a referral code.' });
+      return true;
+    }
+
+    // The payment ids the admin was looking at when they decided. Without
+    // them, an earning recorded between looking and paying would be marked
+    // paid along with the rest, and nobody would ever know.
+    const paymentIds = Array.isArray(body.paymentIds)
+      ? body.paymentIds.map((id) => str(id, 60)).filter(Boolean)
+      : [];
+
+    const result = await referralSheetFor(groupId)
+      .settleReferralEarnings(code, paymentIds, `Paid out by ${actor}`);
+
+    console.log(`[referrals] ${actor} settled ${result.settled} earning(s) for ${code} ` +
+      `(₹${result.paise / 100})`);
+    sendJSON(res, 200, {
+      success: true,
+      settled: result.settled,
+      paise: result.paise,
+      message: result.settled
+        ? `${result.settled} earning(s) marked paid for ${code} (₹${(result.paise / 100).toFixed(2)}).`
+        : `Nothing was pending for ${code}.`
+    });
+    return true;
+  }
+
+  // Switches a code off without destroying its history, for a code being abused.
+  if (pathname === '/api/referrals/status' && method === 'POST') {
+    const body = await readJsonBody(req);
+    const code = referrals.normaliseCode(str(body.code, 24));
+    if (!referrals.isCode(code)) {
+      sendJSON(res, 400, { success: false, error: 'That is not a referral code.' });
+      return true;
+    }
+    const status = str(body.status, 12) === 'disabled' ? 'disabled' : 'active';
+    const changed = await referralSheetFor(groupId).setReferralStatus(code, status);
+    if (!changed) {
+      sendJSON(res, 404, { success: false, error: `${code} is not in the sheet.` });
+      return true;
+    }
+    console.log(`[referrals] ${actor} set ${code} to ${status}`);
+    sendJSON(res, 200, { success: true, code, status });
     return true;
   }
 
@@ -3273,7 +3508,15 @@ const server = http.createServer(async (req, res) => {
     try {
       user = await auth.authorize(token);
     } catch (err) {
-      sendJSON(res, 403, { success: false, error: err.message });
+      // 401 when a NEW token would fix it — an expired session, a clock that
+      // has drifted, a token from another project. 403 only when the identity
+      // itself is refused, where signing in again changes nothing.
+      //
+      // Both used to answer 403, so a lapsed session reached the dashboard as
+      // a permissions problem and told the curator to add themselves to
+      // CURATOR_EMAILS when all they had to do was sign in again.
+      const status = err.statusCode === 401 || err.authKind === 'reauth' ? 401 : 403;
+      sendJSON(res, status, { success: false, error: err.message });
       return;
     }
 

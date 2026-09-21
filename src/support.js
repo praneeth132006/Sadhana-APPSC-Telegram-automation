@@ -228,7 +228,14 @@ const SETTINGS = [
   {
     key: 'support_contact', section: 'support', label: 'Fallback contact', type: 'text', maxLength: 120,
     default: '', optional: true,
-    hint: 'Optional, e.g. @YourAdminHandle or an email. Shown when tickets are switched off.'
+    hint: 'Optional, e.g. @YourAdminHandle. Shown when tickets are switched off.'
+  },
+  {
+    key: 'support_email', section: 'support', label: 'Support email', type: 'text', maxLength: 120,
+    default: 'appscsadhana@gmail.com',
+    hint: 'The second way to reach you. Shown whenever a student raises a ticket, and ' +
+      'prominently when one has been waiting for a reply — so nobody is ever stuck ' +
+      'waiting on a chat that nobody is answering.'
   },
   {
     key: 'welcome_note', section: 'support', label: 'Extra /start message', type: 'textarea', maxLength: 1000,
@@ -272,6 +279,25 @@ const SETTINGS = [
     key: 'pass_description', section: 'pass', label: 'Description', type: 'textarea', maxLength: 300,
     default: '', optional: true,
     hint: 'One or two lines shown with the price. Blank uses the built-in description.'
+  },
+  {
+    key: 'referral_enabled', section: 'pass', label: 'Referrals enabled', type: 'toggle', default: 'yes',
+    hint: 'Switches "invite a friend" off without deleting anyone\'s code or their unpaid earnings.'
+  },
+  {
+    key: 'referral_discount_percent', section: 'pass', label: 'Referral discount (%)', type: 'percent',
+    maxLength: 2, default: '', optional: true,
+    hint: 'What the invited student saves on their first pass. Blank uses 10%.'
+  },
+  {
+    key: 'referral_commission_percent', section: 'pass', label: 'Referral commission (%)', type: 'percent',
+    maxLength: 3, default: '', optional: true,
+    hint: 'What the inviter earns, as a share of what the invited student actually paid. Blank uses 20%.'
+  },
+  {
+    key: 'referral_payout_threshold', section: 'pass', label: 'Payout at (₹)', type: 'price',
+    maxLength: 7, default: '', optional: true,
+    hint: 'Pending earnings at or above this can be claimed from the bot. Blank uses ₹1000.'
   }
 ];
 
@@ -284,6 +310,26 @@ const MAX_MESSAGE_CHARS = 3500;
 function esc(text) {
   return String(text === null || text === undefined ? '' : text)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * emailFallbackLine — the second way to reach a human.
+ *
+ * A student waiting on a chat nobody is answering has no idea whether they
+ * have been forgotten or are simply early, and no other door to try. This is
+ * that other door, and it is deliberately the same sentence everywhere it is
+ * offered so it reads as a standing promise rather than a special case.
+ *
+ * @param {Object} settings Normalised settings
+ * @param {boolean} [waiting] true when they have already been waiting for a reply
+ * @returns {string} HTML, or '' when no email is configured
+ */
+function emailFallbackLine(settings, waiting = false) {
+  const email = String((settings && settings.support_email) || '').trim();
+  if (!email) return '';
+  return waiting
+    ? `📧 Still waiting? Email us at <b>${esc(email)}</b> and we will pick it up there.`
+    : `📧 If you do not hear back, email us at <b>${esc(email)}</b>.`;
 }
 
 /** A category by id, falling back to "other". */
@@ -347,6 +393,12 @@ function validateSettingsPatch(patch) {
       if (!/^(yes|no)$/i.test(text)) return { ok: false, error: `"${key}" must be yes or no.` };
       value[key] = text.toLowerCase();
       continue;
+    }
+    // Before the length check: a percentage's length is implied by its range,
+    // and "12.5 is 4 characters, the limit is 3" explains nothing about why a
+    // half-percent is not allowed.
+    if (def.type === 'percent' && text && (!/^\d{1,3}$/.test(text) || Number(text) > 100)) {
+      return { ok: false, error: `"${key}" must be a whole number from 0 to 100.` };
     }
     if (text.length > def.maxLength) {
       return { ok: false, error: `"${key}" is ${text.length} characters; the limit is ${def.maxLength}.` };
@@ -824,6 +876,7 @@ module.exports = {
   STATUS_LABELS,
   STATUS_MEANINGS,
   WAITING_LABELS,
+  emailFallbackLine,
   normaliseStatus,
   statusLabel,
   statusLine,

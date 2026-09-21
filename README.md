@@ -175,6 +175,10 @@ have `Posted = NO`, and only one of them should ever reach the channel. The Auto
 dashboard sends only `Approved` or `Scheduled` questions by default, and `Rejected`
 and `Archived` rows are never eligible.
 
+`Posted`, `Sending` and `Deleted` are written by the machinery, not by hand. Each is
+paired with what the `Posted` column says, and setting one by hand desynchronises the
+row — the question then claims to be posted and is sent again anyway.
+
 **Why `Dup Hash` matters:** the question text is lowercased and stripped of
 punctuation and whitespace before hashing, so re-pasting the same question with
 different formatting is still recognised as a duplicate rather than silently doubling
@@ -207,53 +211,50 @@ halfway hands back what it did not send. Beyond that:
 
 Optionally it also checks for deleted polls every few runs (see below).
 
-**On Vercel** nothing survives between requests, so the in-process timer never fires
-and the page says so. Point a scheduled job at `/api/cron/autopilot` — it runs the
-same tick — with `Authorization: Bearer $CRON_SECRET`. Frequent crons need a plan
-that allows them; running `npm run dashboard` on a machine that stays awake needs
-nothing at all.
+**Autopilot needs a server that stays up.** On a serverless deployment the server
+only exists while it is answering a request and is thrown away afterwards, along with
+any job started from the dashboard — there is no process left to wake up five minutes
+later and post the next batch. The page says so plainly when that is where it is
+running. `npm run dashboard` on a machine that does not sleep, or any always-on host,
+works with no extra setup. The nightly deleted-poll check is unaffected either way:
+it is driven by a scheduled job rather than by a timer in the process.
 
 ---
 
 ## Deleted polls, and keeping the sheet honest
 
-Telegram never tells a bot that a message was deleted. Without something watching,
-a poll removed from the channel leaves the sheet claiming it was posted for ever:
-the question can never be re-sent, and every count is wrong.
+Telegram never tells a bot that one of its own messages was deleted — there is no
+such notification in the Bot API, and no "get message" call either. The only way to
+know is to ask about each posted poll in turn, which is what the check does.
 
-**Check the channel for deleted polls** on the Automation page walks the posted rows,
-asks Telegram whether each poll is still there, and offers to put the deleted ones
-back in the queue as `Approved`. It reports before it writes, and a poll it *cannot*
-tell about is left alone — guessing "deleted" would post a live question a second
-time, which is the opposite of the point.
+**What happens when a poll is found missing:** the question is marked
+`Status = Deleted` in the sheet, with a note saying when it was spotted. Its
+`Posted` column stays `YES`, and that is the point — it is what keeps the row out of
+the posting queue. Deleting a poll from the group is nearly always a decision that
+the question should not be there, so it must not quietly go back out. Nothing is
+erased: the row, the question, the message id and the history all stay.
 
-The same check runs unattended two ways:
+**Re-queueing** is the opposite choice, for a poll deleted by accident that you do
+want posted again. It sets the row back to `Approved` and clears its message id, so
+it becomes eligible. It is offered on the Automation page and is never what an
+unattended run does.
 
-- **Autopilot**, every few runs, on the subject it is posting.
-- **`/api/cron/reconcile`**, nightly (in `vercel.json`), taking each group's subjects
-  in rotation.
+The check runs three ways:
+
+| | When | What it does |
+|---|---|---|
+| **Check the channel for deleted polls** | You press it | Reports first, writes only after you confirm |
+| **`/api/cron/reconcile`** | Nightly, per `vercel.json` | Marks, taking each group's subjects in rotation |
+| **Autopilot** | Every few runs, if switched on | Marks, on the subject it is posting |
+
+A poll Telegram will not answer about is always left alone. Guessing "deleted" would
+retire a question that is live in the channel, which is worse than not knowing.
 
 Each row costs one Telegram call and a rate-limit pause, so a channel with hundreds
 of posts cannot be swept in one pass. Each pass carries on from where the last one
 stopped and wraps around, so the newest posts — the ones most likely to have just
 been deleted — are reached rather than being stuck behind the same first rows for
-ever.
-
----
-
-## Sheet formatting
-
-Rows appended through the Sheets API inherit the formatting of the row above them —
-the same thing inserting a row in the UI does. The row above the first upload is the
-header, so a tab filled this way came out bold white on `#1a237e` from top to bottom,
-one upload inheriting from the last.
-
-Appended rows are now put back to the body style straight after the append, and a tab
-this client creates is styled as it is created. **🎨 Repair sheet formatting** on the
-Automation page is the way back for a tab that is already navy: it restores the header
-style, column widths, frozen panes, row height, the dropdowns and the colour coding
-for `Status`, `Posted` and `Difficulty`, across every subject in the group. It changes
-formatting only — not one question is read, moved or altered.
+ever. A row already marked `Deleted` is settled and is not asked about again.
 
 ---
 
@@ -272,6 +273,140 @@ row the poster is holding, are each named rather than being folded into a count:
 
 ---
 
+## What each group sells
+
+| Groups | Pass | Pay | Ends |
+|---|---|---|---|
+| **Newspaper · English, Newspaper · Telugu** | ♾️ Lifetime Pass | once | never |
+| Sadhana APPSC · English, Sadhana APPSC · Telugu, UPSC | 🎯 Target 2026 Pass | once | on exam day (`EXAM_PASS_END_DATE`) |
+
+Which pass a group sells is `passPlanId` in `groups.config.json`, defaulting to
+`exam_pass`. Only the two newspaper groups set it. The pass definitions are shared by
+every group, so changing what one group sells never touches another.
+
+A lifetime member is written with an expiry of 31-12-2099 — a real date, so every
+column that sorts, filters and parses Expiry Date keeps working — but the daily sweep
+does not rely on that date: it reads the pass they bought and never reminds or removes
+a lifetime member.
+
+**Members who bought the exam pass in a newspaper group before the change keep what
+they paid for:** it still ends on exam day, and they can upgrade to lifetime from the
+bot. Lifetime is decided by the pass a member bought, never by the group they are in,
+so nobody is upgraded for free by the group changing.
+
+---
+
+## The bot: what people see
+
+Three things live on Telegram's servers rather than in this repository — the
+description shown **before** anyone presses Start, the line under the bot's name,
+and the ☰ Menu. Nothing in a deploy touches them, so they drift. `npm run bot-profile`
+writes all three to every payment bot, and is safe to run as often as you like:
+
+```bash
+npm run bot-profile          # write commands and descriptions
+npm run bot-profile:status   # show what Telegram currently holds
+```
+
+The menu is `/start`, `/about`, `/plans`, `/status`, `/referral`, `/help`, `/support`.
+`/start` is one welcome message with a **Continue →** button — the pass is shown when
+they tap it, not unasked.
+
+---
+
+## Referrals — invite a friend
+
+A member sends `/referral` and gets a code and a share link. Whoever follows that link
+pays **10% less** on their first pass, and the member earns **20% of what that person
+actually paid**, in rupees.
+
+**Commission is on what was paid, never on the list price.** The discount comes off
+first, so a ₹199 pass sold through a referral is ₹179.10 to the buyer, ₹35.82 to the
+inviter, and ₹143.28 kept. Paying 20% of ₹199 would quietly pay out more than the sale
+brought in.
+
+**How a member uses it**
+
+| | |
+|---|---|
+| `/referral` | Their code, their share link, and their running total |
+| Share link | `https://t.me/<bot>?start=ref_REFXXXXXX` — the discount is applied on the first screen the friend sees |
+| Typing the code | Also works, in any case, with or without the `ref_` prefix |
+
+**The rules**
+
+- **One code per member**, however many times they ask. A second code would split
+  their earnings in two, and neither half would ever reach a payout.
+- **Any number of people can join on one code.** The limit is one referral per
+  *buyer*, never a cap on the code itself.
+- **A claim button appears at ₹1000** and not a rupee before. Claiming raises a
+  support ticket; an admin sends the money and presses **Mark paid**.
+
+**And why**
+
+- **A code works once per person, on their first pass.** Otherwise a member renewing
+  monthly would earn their friend a commission every month for one introduction.
+- **You cannot invite yourself.** That is a discount you wrote yourself, plus
+  commission on your own purchase.
+- **A code is re-checked when the Pay button is tapped**, never trusted from the
+  button. A tap on yesterday's message must not buy at yesterday's terms.
+- **Commission is only ever created from a payment that succeeded**, recorded against
+  its Razorpay payment id. Razorpay retries a webhook on any non-2xx, and without that
+  id one sale would pay an inviter once per delivery.
+- **A code can be switched off** without touching what it has already earned.
+
+**Getting paid**
+
+Earnings sit as `pending`. A member can ask to be paid once they pass **₹1000**, and
+the monthly run pays everyone with anything pending. Asking raises a support ticket —
+nothing here moves money. An admin sends it, then presses **Mark paid** on the
+Referrals page, which records that they did.
+
+**Where it all lives**
+
+Two tabs on the family's primary sheet, created on first use:
+
+- **Referrals** — one row per member: their code, who they are, whether it is active.
+- **Referral Log** — one row per referred payment: who invited whom (by Telegram id,
+  which cannot be changed the way a handle can), what was paid, what was taken off,
+  what was earned, and whether it has been paid out.
+
+The **Referrals** dashboard page shows all of it: who joined using whose code, what is
+owed to each member, and totals. Everything is searchable by code, name or Telegram id.
+
+The percentages and the payout threshold are editable on **Pass & Coupons** without a
+deploy, and referrals can be switched off there entirely.
+
+> Referrals need the Google Sheets API — a service account and `SHEET_ID_<PREFIX>`.
+> They were built after that route replaced the Apps Script, and putting them in both
+> would mean pasting a script into five sheets by hand to turn the feature on.
+
+---
+
+## When nobody answers
+
+Support is a chat, and a chat with nobody on the other end gives a student no way
+to tell whether they have been forgotten or are simply early. So there is a second
+door: **appscsadhana@gmail.com**, editable in Bot Settings.
+
+It is offered in the same words everywhere, so it reads as a standing promise rather
+than a special case:
+
+| Where | What it says |
+|---|---|
+| The support menu, `/help`, `/about` | *If you do not hear back, email us at …* |
+| When a ticket is raised | The same line, under the confirmation |
+| On a follow-up **no admin has ever replied to** | *Still waiting? Email us at … and we will pick it up there.* |
+| Tickets switched off, or a ticket that failed to submit | Alongside the fallback contact |
+| A referral payout request | The same line — it is money, and one door is not enough |
+
+The escalation counts **admin replies**, not who the ticket is waiting on: appending
+the student's own message sets "waiting on admin", so that field is true of every
+follow-up and would make the escalation meaningless. No reply ever, on a message they
+have now sent twice, is the real signal.
+
+---
+
 ## Command line
 
 The CLI still does everything it did, and now records the fuller tracking trail.
@@ -284,6 +419,9 @@ node send.js --test                       # check the bot token and group
 
 node schedule.js                          # run the cron scheduler
 node schedule.js --dry-run                # show the schedule without sending
+
+npm run bot-profile                       # set each bot's menu and description
+npm run bot-profile:status                # see what Telegram currently holds
 
 node setup.js                             # create the Telegram forum topics
 node verify-topics.js                     # check every subject's topic still exists
@@ -327,6 +465,32 @@ change for any that are not.
 
 The full review, including what was wrong before this release and how each issue was
 proven, is in [SECURITY-REVIEW.md](SECURITY-REVIEW.md).
+
+**A verified email is required, always.** Being on `CURATOR_EMAILS` used to be treated
+as enough on its own, and that was a hole: anyone can register a Firebase password
+account for an address they do not own, so an allowlisted address that had never
+actually signed in could simply be claimed. Google sign-in arrives verified, so this
+costs a real curator nothing.
+
+### When a session lapses
+
+The server answers **401** when a new token would fix the problem — an expired session,
+a drifted clock, a token from another project — and **403** only when the identity itself
+is refused. Both used to be 403, so a session that had simply lapsed reached the
+dashboard as a permissions problem, telling a curator to add themselves to
+`CURATOR_EMAILS` when all they needed was to sign in again.
+
+The dashboard acts on the difference:
+
+| Server says | Dashboard does |
+|---|---|
+| 401 | Asks Firebase for a **fresh** token and retries once, silently |
+| 401 again | Signs out and puts the sign-in card back — once, however many requests noticed |
+| 403 | Shows why the account is refused, and does not retry |
+
+If Google's certificate endpoint is unreachable, the server keeps verifying against the
+keys it already holds rather than rejecting every curator for as long as the outage
+lasts.
 
 ---
 
@@ -686,12 +850,15 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-545 tests. The ones worth knowing about:
+688 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
 - `test/auth.test.js` — Firebase token verification against real signing attacks:
-  `alg:none`, HS256 confusion, tampered payloads, expiry, wrong audience.
+  `alg:none`, HS256 confusion, tampered payloads, expiry, wrong audience — plus which
+  failures ask for a new token and which do not, and surviving a Google outage.
+- `test/dashboard-auth.test.mjs` — the browser's `api()` loaded for real with Firebase
+  stubbed, so the token refresh and the lapsed-session path actually run.
 - `test/apps-script.test.js` — the Apps Script logic in a sandboxed Google runtime:
   header resolution, the migration, duplicate detection, filtering and the runway math.
 - `test/host-authorisation.test.js` — the Firebase authorised-domain matching rule,
@@ -705,6 +872,11 @@ npm test
 - `test/autopilot.test.js` — the unattended scheduler on a fake clock: overlapping
   runs, an empty queue, a Telegram outage being mistaken for an empty queue, and a
   restart neither forgetting its jobs nor stampeding through every missed run.
+- `test/referrals.test.js` — the money arithmetic: commission on what was paid rather
+  than the list price, self-referral, a code used twice, rounding, and what a member
+  is owed.
+- `test/referral-bot.test.js` — the student side, ending in what actually reaches
+  Razorpay's notes, since that is what the commission is later calculated from.
 
 ---
 
@@ -723,6 +895,7 @@ npm test
 │   ├── index.html/app.js     # Upload
 │   ├── analytics.html/.js    # Analytics
 │   ├── questions.html/.js    # Question bank
+│   ├── referrals.html/.js    # Referral tracking and payouts
 │   ├── automation.html/.js   # Automation
 │   └── health.html/.js       # System health
 ├── src/
@@ -730,10 +903,11 @@ npm test
 │   ├── sheets.js             # Apps Script client
 │   ├── sheets-direct.js      # Google Sheets API client (the posting path)
 │   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
+│   ├── referrals.js          # referral codes, discounts, commission and payouts
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 545 tests
+└── test/                     # 688 tests
 ```
 
 ## Notes

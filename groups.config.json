@@ -30,7 +30,8 @@
     "",
     "shortName is what the dashboard switcher shows. The full label and language are too long for the header, and a truncated group name is worse than a short one: it is the field that says which sheet you are about to write to.",
     "",
-    "ONE PASS: only exam_pass is sold, at Rs 199 (19900 paise). sprint_30 and autopay_monthly are \"retired\": no longer offered anywhere, but still defined so a member who bought one keeps working — their renewal webhook, reminders and /cancel all still look the plan up by id. Do not delete them while anyone holds one. The pass name, price and valid-until date can be overridden per bot from the dashboard (Pass & Coupons page) without editing this file."
+    "ONE PASS: only exam_pass is sold, at Rs 199 (19900 paise). sprint_30 and autopay_monthly are \"retired\": no longer offered anywhere, but still defined so a member who bought one keeps working — their renewal webhook, reminders and /cancel all still look the plan up by id. Do not delete them while anyone holds one. The pass name, price and valid-until date can be overridden per bot from the dashboard (Pass & Coupons page) without editing this file.",
+    "passPlanId says which pass a group sells. It defaults to exam_pass; the two newspaper groups sell lifetime_pass instead. Plans a group no longer sells stay listed so members who already bought them keep resolving."
   ],
   "planShapes": {
     "sprint_30": {
@@ -64,6 +65,16 @@
       "description": "One payment, access right through to the exam. No renewals to remember.",
       "reminderDaysBefore": 7,
       "fixedEndDateEnv": "EXAM_PASS_END_DATE"
+    },
+    "lifetime_pass": {
+      "label": "Lifetime Pass",
+      "emoji": "♾️",
+      "type": "one_time",
+      "lifetime": true,
+      "durationDays": null,
+      "tagline": "Pay once, keep access for life",
+      "description": "One payment, access for life. No renewals, no expiry date, nothing to remember.",
+      "reminderDaysBefore": 0
     }
   },
   "groups": [
@@ -75,7 +86,8 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 19900
+        "exam_pass": 19900,
+        "lifetime_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_NEWS",
       "subjects": [
@@ -96,7 +108,8 @@
         "General Studies",
         "Disaster Management"
       ],
-      "shortName": "Newspaper · English"
+      "shortName": "Newspaper · English",
+      "passPlanId": "lifetime_pass"
     },
     {
       "id": "appsc_news_te",
@@ -106,7 +119,8 @@
       "plans": {
         "sprint_30": 100,
         "autopay_monthly": 200,
-        "exam_pass": 19900
+        "exam_pass": 19900,
+        "lifetime_pass": 19900
       },
       "paymentBotEnv": "TELEGRAM_PAYBOT_NEWS",
       "subjects": [
@@ -127,7 +141,8 @@
         "General Studies",
         "Disaster Management"
       ],
-      "shortName": "Newspaper · Telugu"
+      "shortName": "Newspaper · Telugu",
+      "passPlanId": "lifetime_pass"
     },
     {
       "id": "appsc_q_en",

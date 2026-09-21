@@ -9,7 +9,7 @@
     "schedule": "node schedule.js",
     "create-sample": "node create-sample.js",
     "dashboard": "node server.js",
-    "test": "node --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
+    "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning --test \"test/**/*.test.js\" \"test/**/*.test.mjs\"",
     "verify-topics": "node verify-topics.js",
     "bot": "node bot.js",
     "membership-cron": "node membership-cron.js",
@@ -21,7 +21,9 @@
     "reset-topics": "node reset-topics.js",
     "set-webhooks": "node set-webhooks.js",
     "webhooks:status": "node set-webhooks.js --status",
-    "webhooks:delete": "node set-webhooks.js --delete"
+    "webhooks:delete": "node set-webhooks.js --delete",
+    "bot-profile": "node bot-profile.js",
+    "bot-profile:status": "node bot-profile.js --status"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

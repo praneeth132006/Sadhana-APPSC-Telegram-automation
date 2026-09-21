@@ -181,7 +181,7 @@ function createAutopilot(deps = {}) {
       nextRunAt: null,
       stoppedReason: null,
       consecutiveEmptyRuns: 0,
-      totals: { runs: 0, posted: 0, failed: 0, restored: 0 },
+      totals: { runs: 0, posted: 0, failed: 0, deleted: 0 },
       history: []
     };
   }
@@ -258,7 +258,7 @@ function createAutopilot(deps = {}) {
   async function runJob(job) {
     job.busy = true;
     const startedAt = now();
-    const run = { at: startedAt, posted: 0, failed: 0, restored: 0, ok: true, message: '' };
+    const run = { at: startedAt, posted: 0, failed: 0, deleted: 0, ok: true, message: '' };
 
     try {
       const result = await postBatch({
@@ -287,8 +287,10 @@ function createAutopilot(deps = {}) {
       if (reconcile && every > 0 && (job.totals.runs + 1) % every === 0) {
         try {
           const checked = await reconcile({ groupId: job.groupId, subject: job.subject });
-          run.restored = Number(checked && checked.restored) || 0;
-          job.totals.restored += run.restored;
+          // Marked Deleted, not put back in the queue: a question someone
+          // removed from the channel must not go back out unattended.
+          run.deleted = Number(checked && checked.marked) || 0;
+          job.totals.deleted += run.deleted;
         } catch (err) {
           run.message += ` (the deleted-poll check failed: ${err.message})`;
         }

@@ -387,6 +387,20 @@ function planForSubscriber(groupId, planId) {
 }
 
 /**
+ * isLifetimeSubscriber — did this member buy a pass that never ends?
+ *
+ * Read from the plan they bought, never from the group they are in. A member
+ * who bought the exam pass in a newspaper group before it went lifetime still
+ * holds an exam pass; they are not upgraded for free by the group changing.
+ */
+function isLifetimeSubscriber(subscriber) {
+  if (!subscriber || !subscriber.plan) return false;
+  const shapes = groups.planShapes ? groups.planShapes() : null;
+  if (shapes && shapes[subscriber.plan]) return plans.isLifetimePlan(shapes[subscriber.plan]);
+  return String(subscriber.plan) === 'lifetime_pass';
+}
+
+/**
  * sendRenewalReminder — nudges a member whose access is about to end.
  *
  * @param {Object} subscriber The stored member
@@ -448,6 +462,13 @@ async function runDailyCheck({ groupId, dryRun = false } = {}) {
     const daysLeft = plans.daysUntil(expiry);
     const plan = planForSubscriber(groupId, subscriber.plan);
 
+    // A lifetime member is never reminded and never removed. Their expiry is
+    // set decades out, so the date alone would already keep them safe — but
+    // this is the one sweep that takes paying students out of the group, and
+    // "they paid for life" should be a rule it reads, not an accident of
+    // arithmetic that a mistyped date could undo.
+    if (plans.isLifetimePlan(plan)) continue;
+
     try {
       if (daysLeft <= 0) {
         // Past expiry: remove from the group and mark the row.
@@ -506,6 +527,14 @@ function describeStatus(subscriber) {
   const expiry = parseIst(subscriber.expiry_date);
   const daysLeft = expiry ? plans.daysUntil(expiry) : null;
 
+  // "Expires 31-12-2099, 26765 days remaining" is technically true and reads
+  // like a bug. A lifetime pass says what it is.
+  if (subscriber.status === 'active' && isLifetimeSubscriber(subscriber)) {
+    return `✅ <b>${esc(subscriber.plan_label || 'Lifetime Pass')}</b> — active\n\n` +
+           '♾️ <b>Lifetime access.</b> You paid once — there is nothing to renew and no expiry date.\n' +
+           `Total paid: ₹${subscriber.total_paid}`;
+  }
+
   if (subscriber.status === 'active' && daysLeft !== null && daysLeft > 0) {
     return `✅ <b>${esc(subscriber.plan_label)}</b> — active\n\n` +
            `Expires: <b>${esc(subscriber.expiry_date)}</b>\n` +
@@ -558,6 +587,7 @@ async function runDailyCheckAllGroups({ dryRun = false } = {}) {
 }
 
 module.exports = {
+  isLifetimeSubscriber,
   IST_OFFSET_MS,
   contextFor,
   runDailyCheckAllGroups,

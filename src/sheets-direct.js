@@ -75,10 +75,13 @@ const HEADER_ALIASES = {
   'Review Notes': ['review notes', 'notes', 'remarks']
 };
 
-const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+const STATUS_VALUES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived', 'Deleted'];
 
-/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script. */
-const MACHINE_OWNED_STATUSES = ['Posted', 'Sending'];
+/** Statuses the poster owns. Mirrors MACHINE_OWNED_STATUSES in the Apps Script.
+ *  "Deleted" is one of them: it is not an opinion about a question, it is
+ *  something the sweep saw in the channel, and it is written together with a
+ *  Posted column that must stay YES. */
+const MACHINE_OWNED_STATUSES = ['Posted', 'Sending', 'Deleted'];
 const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -566,9 +569,56 @@ async function listPosted(ctx, subject) {
   rows.forEach((row, i) => {
     const q = rowToQuestion(row, map, subject, i);
     if (!q.question_text || q.posted !== 'YES' || !q.telegram_msg_id) return;
+    // A row already marked Deleted is settled. Leaving it in would have every
+    // sweep ask Telegram about a message everyone agrees is gone, re-mark it,
+    // and spend part of its budget doing so — for ever, and at the expense of
+    // the rows that have not been checked yet.
+    if (q.status === 'Deleted') return;
     out.push({ row: q.excel_row, question_id: q.question_id, message_id: q.telegram_msg_id, status: q.status });
   });
   return out;
+}
+
+/**
+ * markDeleted — records that a poll is no longer in the channel.
+ *
+ * Posted is deliberately left at YES. The question WAS posted; that is a fact
+ * about the past and this does not undo it. It also keeps the row out of the
+ * posting queue, which is the whole point: a question someone deleted from the
+ * channel must not quietly go back out. Putting it back is a separate decision
+ * a person makes, with unpostQuestions.
+ *
+ * @param {string} note What to record in Review Notes
+ * @returns {Promise<number>} Rows marked
+ */
+async function markDeleted(ctx, subject, rowNumbers, note) {
+  if (!rowNumbers || !rowNumbers.length) return 0;
+  const { map, rows } = await readTab(ctx, subject);
+  const now = istNow();
+  const cells = [];
+  let marked = 0;
+
+  for (const n of validRows(rowNumbers, rows.length)) {
+    const row = rows[n - 2];
+    // Only a row that is actually posted can have been deleted. Anything else
+    // means the sheet moved under the sweep while it was asking Telegram.
+    if (!isPostedValue(row[colNum(map, 'Posted') - 1])) continue;
+    if (cell(row, map, 'Status') === 'Deleted') continue;
+
+    const set = (header, value) => cells.push({ tab: subject, row: n, col: colNum(map, header), value });
+    set('Status', 'Deleted');
+    set('Updated At', now);
+    set('Updated By', 'Deleted-poll check');
+    if (note) {
+      const existing = cell(row, map, 'Review Notes');
+      const line = `[${now}] ${note}`;
+      set('Review Notes', existing ? `${existing}\n${line}` : line);
+    }
+    marked++;
+  }
+
+  await writeCells(ctx, cells);
+  return marked;
 }
 
 async function unpostQuestions(ctx, subject, rowNumbers, status) {
@@ -587,6 +637,293 @@ async function unpostQuestions(ctx, subject, rowNumbers, status) {
   }
   await writeCells(ctx, cells);
   return targets.length;
+}
+
+// ---------------------------------------------------------------------------
+// Referrals
+// ---------------------------------------------------------------------------
+// Two tabs, on the family's primary sheet:
+//
+//   Referrals     — one row per inviter: their code, who they are, when it was
+//                   made. The code is the primary key.
+//   Referral Log  — one row per successful referred payment: who invited whom,
+//                   what was paid, what was taken off, what was earned, and
+//                   whether that has been paid out. This is the tab that
+//                   answers "who joined using whose code", and it is append
+//                   only apart from the payout status.
+//
+// Both live here rather than in the Apps Script because the whole point of
+// this route is that a new feature does not mean pasting a script into five
+// sheets by hand. The tabs are created on first use.
+
+// Everything here is written with valueInputOption RAW, as the rest of this
+// file is, so a username of "=IMPORTXML(...)" is stored as that text and never
+// run as a formula. The Apps Script needs its safeCell() because it writes
+// through setValue(), which does interpret a leading "=".
+const REFERRAL_TAB = 'Referrals';
+const REFERRAL_HEADERS = [
+  'Code',           // A  REF + 6 characters, the primary key
+  'Telegram ID',    // B  Who owns it
+  'Username',       // C  @handle, may be blank
+  'Name',           // D  Display name from Telegram
+  'Status',         // E  active | disabled
+  'Created At',     // F  IST stamp
+  'Notes'           // G  Free text, for an admin
+];
+
+const REFERRAL_LOG_TAB = 'Referral Log';
+const REFERRAL_LOG_HEADERS = [
+  'Timestamp',           // A  When the payment was recorded
+  'Code',                // B  The code that was used
+  'Referrer ID',         // C  Who invited
+  'Referrer Username',   // D
+  'Referred ID',         // E  Who joined
+  'Referred Username',   // F
+  'Referred Name',       // G
+  'Group',               // H  Which group they bought
+  'Payment ID',          // I  Razorpay's id — also what makes this idempotent
+  'Original Amount',     // J  Rupees, before the referral discount
+  'Discount',            // K  Rupees taken off for the person who joined
+  'Paid Amount',         // L  Rupees actually paid
+  'Commission',          // M  Rupees earned by the inviter
+  'Status',              // N  pending | paid | cancelled
+  'Paid At',             // O  IST stamp, when the inviter was paid
+  'Notes'                // P
+];
+
+/** Reads a tab, creating it with its headers the first time. */
+async function readOrCreate(ctx, tab, headers) {
+  try {
+    return await readTab(ctx, tab);
+  } catch (err) {
+    if (!/not found/i.test(err.message)) throw err;
+    await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
+      requests: [{ addSheet: { properties: { title: tab, gridProperties: { frozenRowCount: 1 } } } }]
+    });
+    await call('PUT',
+      `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}?valueInputOption=RAW`,
+      { values: [headers] });
+    return { map: headerMap(headers), rows: [] };
+  }
+}
+
+/** A tab's own header map: these tabs are not the 30-column question layout. */
+function plainHeaderMap(headers) {
+  const map = {};
+  headers.forEach((h, i) => { map[h] = i; });
+  return map;
+}
+
+/** One row as an object keyed by the lower_snake_case of its header. */
+function rowToObject(row, headers) {
+  const out = {};
+  headers.forEach((header, i) => {
+    const key = header.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    const value = row[i];
+    out[key] = value === null || value === undefined ? '' : String(value).trim();
+  });
+  return out;
+}
+
+/** Appends rows to a tab, then puts them back to the plain body style. */
+async function appendRows(ctx, tab, values) {
+  const appended = await call('POST',
+    `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}:append` +
+    '?valueInputOption=RAW&insertDataOption=INSERT_ROWS', { values });
+  const firstRow = Number(((appended.updates || {}).updatedRange || '').match(/![A-Z]+(\d+)/)?.[1]);
+  // The same inheritance that once turned a whole question tab navy — and the
+  // width of THIS tab, not the 30-column question layout.
+  if (firstRow) {
+    await resetAppendedRows(ctx, tab, firstRow, values.length, (values[0] || []).length);
+  }
+  return firstRow;
+}
+
+/** Every referral code on this sheet. */
+async function listReferrals(ctx) {
+  const { rows } = await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+  return rows
+    .map((row) => rowToObject(row, REFERRAL_HEADERS))
+    .filter((r) => r.code);
+}
+
+/** One code's row, or null. */
+async function getReferral(ctx, code) {
+  const wanted = String(code || '').trim().toUpperCase();
+  if (!wanted) return null;
+  const all = await listReferrals(ctx);
+  return all.find((r) => r.code.toUpperCase() === wanted) || null;
+}
+
+/** The code a person already owns, or null. */
+async function getReferralFor(ctx, telegramId) {
+  const wanted = String(telegramId || '').trim();
+  if (!wanted) return null;
+  const all = await listReferrals(ctx);
+  return all.find((r) => String(r.telegram_id) === wanted) || null;
+}
+
+/**
+ * createReferral — issues a code, or returns the one this person already has.
+ *
+ * Idempotent on purpose: a student who taps "my referral code" twice must not
+ * end up with two codes, because the second would split their earnings from
+ * the first and neither would ever reach a payout.
+ *
+ * @param {{telegram_id: string, username: string, name: string, code: string}} referral
+ */
+async function createReferral(ctx, referral) {
+  const existing = await getReferralFor(ctx, referral.telegram_id);
+  if (existing) return existing;
+
+  const taken = await getReferral(ctx, referral.code);
+  if (taken) {
+    const err = new Error(`Referral code ${referral.code} is already taken.`);
+    err.codeTaken = true;
+    throw err;
+  }
+
+  const row = REFERRAL_HEADERS.map(() => '');
+  const map = plainHeaderMap(REFERRAL_HEADERS);
+  row[map['Code']] = String(referral.code || '').toUpperCase();
+  row[map['Telegram ID']] = String(referral.telegram_id || '');
+  row[map['Username']] = String(referral.username || '');
+  row[map['Name']] = String(referral.name || '');
+  row[map['Status']] = 'active';
+  row[map['Created At']] = istNow();
+  row[map['Notes']] = '';
+
+  await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+  await appendRows(ctx, REFERRAL_TAB, [row]);
+  return rowToObject(row, REFERRAL_HEADERS);
+}
+
+/** Turns a code on or off without destroying its earnings history. */
+async function setReferralStatus(ctx, code, status) {
+  const { map, rows } = await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+  void map;
+  const plain = plainHeaderMap(REFERRAL_HEADERS);
+  const wanted = String(code || '').trim().toUpperCase();
+  const clean = status === 'disabled' ? 'disabled' : 'active';
+
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i][plain['Code']] || '').trim().toUpperCase() !== wanted) continue;
+    await writeCells(ctx, [{ tab: REFERRAL_TAB, row: i + 2, col: plain['Status'] + 1, value: clean }]);
+    return 1;
+  }
+  return 0;
+}
+
+/** Every earning row, newest last. `code` narrows it to one inviter. */
+async function listReferralEarnings(ctx, code) {
+  const { rows } = await readOrCreate(ctx, REFERRAL_LOG_TAB, REFERRAL_LOG_HEADERS);
+  const wanted = String(code || '').trim().toUpperCase();
+
+  return rows
+    .map((row) => {
+      const o = rowToObject(row, REFERRAL_LOG_HEADERS);
+      return {
+        timestamp: o.timestamp,
+        code: o.code.toUpperCase(),
+        referrer_telegram_id: o.referrer_id,
+        referrer_username: o.referrer_username,
+        referred_telegram_id: o.referred_id,
+        referred_username: o.referred_username,
+        referred_name: o.referred_name,
+        group: o.group,
+        payment_id: o.payment_id,
+        original_paise: Math.round(Number(o.original_amount || 0) * 100),
+        discount_paise: Math.round(Number(o.discount || 0) * 100),
+        paid_paise: Math.round(Number(o.paid_amount || 0) * 100),
+        commission_paise: Math.round(Number(o.commission || 0) * 100),
+        status: (o.status || 'pending').toLowerCase(),
+        paid_at: o.paid_at,
+        notes: o.notes
+      };
+    })
+    .filter((r) => r.code && (!wanted || r.code === wanted));
+}
+
+/**
+ * recordReferralEarning — one successful referred payment.
+ *
+ * Idempotent on the payment id. Razorpay retries a webhook on any non-2xx, so
+ * the same sale can arrive more than once; without this an inviter would be
+ * paid twice — or ten times — for one purchase.
+ *
+ * @returns {Promise<{recorded: boolean, reason?: string, commission_paise: number}>}
+ */
+async function recordReferralEarning(ctx, earning) {
+  const paymentId = String(earning.payment_id || '').trim();
+  const existing = await listReferralEarnings(ctx);
+  if (paymentId && existing.some((r) => r.payment_id === paymentId)) {
+    return { recorded: false, reason: 'already recorded', commission_paise: 0 };
+  }
+
+  const map = plainHeaderMap(REFERRAL_LOG_HEADERS);
+  const row = REFERRAL_LOG_HEADERS.map(() => '');
+  const put = (header, value) => { row[map[header]] = value; };
+
+  put('Timestamp', istNow());
+  put('Code', String(earning.code || '').toUpperCase());
+  put('Referrer ID', String(earning.referrer_telegram_id || ''));
+  put('Referrer Username', String(earning.referrer_username || ''));
+  put('Referred ID', String(earning.referred_telegram_id || ''));
+  put('Referred Username', String(earning.referred_username || ''));
+  put('Referred Name', String(earning.referred_name || ''));
+  put('Group', String(earning.group || ''));
+  put('Payment ID', paymentId);
+  put('Original Amount', (Number(earning.original_paise) || 0) / 100);
+  put('Discount', (Number(earning.discount_paise) || 0) / 100);
+  put('Paid Amount', (Number(earning.paid_paise) || 0) / 100);
+  put('Commission', (Number(earning.commission_paise) || 0) / 100);
+  put('Status', 'pending');
+  put('Paid At', '');
+  put('Notes', String(earning.notes || ''));
+
+  await readOrCreate(ctx, REFERRAL_LOG_TAB, REFERRAL_LOG_HEADERS);
+  await appendRows(ctx, REFERRAL_LOG_TAB, [row]);
+  return { recorded: true, commission_paise: Number(earning.commission_paise) || 0 };
+}
+
+/**
+ * settleReferralEarnings — marks one inviter's pending earnings paid.
+ *
+ * Takes the rows as they were read, so a payment recorded between the admin
+ * looking and the admin paying is not silently marked paid along with them.
+ *
+ * @param {string} code Whose earnings
+ * @param {string[]} [paymentIds] Only these rows; omitted means all pending
+ * @returns {Promise<{settled: number, paise: number}>}
+ */
+async function settleReferralEarnings(ctx, code, paymentIds, note) {
+  const { rows } = await readOrCreate(ctx, REFERRAL_LOG_TAB, REFERRAL_LOG_HEADERS);
+  const map = plainHeaderMap(REFERRAL_LOG_HEADERS);
+  const wanted = String(code || '').trim().toUpperCase();
+  const only = Array.isArray(paymentIds) && paymentIds.length
+    ? new Set(paymentIds.map((id) => String(id)))
+    : null;
+
+  const now = istNow();
+  const cells = [];
+  let settled = 0;
+  let paise = 0;
+
+  rows.forEach((row, i) => {
+    if (String(row[map['Code']] || '').trim().toUpperCase() !== wanted) return;
+    if (String(row[map['Status']] || 'pending').trim().toLowerCase() !== 'pending') return;
+    if (only && !only.has(String(row[map['Payment ID']] || '').trim())) return;
+
+    const n = i + 2;
+    cells.push({ tab: REFERRAL_LOG_TAB, row: n, col: map['Status'] + 1, value: 'paid' });
+    cells.push({ tab: REFERRAL_LOG_TAB, row: n, col: map['Paid At'] + 1, value: now });
+    if (note) cells.push({ tab: REFERRAL_LOG_TAB, row: n, col: map['Notes'] + 1, value: String(note) });
+    settled++;
+    paise += Math.round(Number(row[map['Commission']] || 0) * 100);
+  });
+
+  await writeCells(ctx, cells);
+  return { settled, paise };
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +968,7 @@ const CELL_COLOURS = [
   ['Status', 'Review', '#ffe0b2', '#e65100'],
   ['Status', 'Rejected', '#ffcdd2', '#b71c1c'],
   ['Status', 'Archived', '#eceff1', '#455a64'],
+  ['Status', 'Deleted', '#f8bbd0', '#880e4f'],
   ['Difficulty', 'Easy', '#dcedc8', '#33691e'],
   ['Difficulty', 'Medium', '#fff9c4', '#f57f17'],
   ['Difficulty', 'Hard', '#ffccbc', '#bf360c']
@@ -663,13 +1001,13 @@ const BODY_FORMAT_FIELDS =
  * @param {number} startRow 1-based first row to reset
  * @param {number} endRow 1-based last row, inclusive
  */
-function bodyFormatRequests(sheetId, startRow, endRow) {
+function bodyFormatRequests(sheetId, startRow, endRow, columns = QUESTION_HEADERS.length) {
   const range = {
     sheetId,
     startRowIndex: startRow - 1,
     endRowIndex: endRow,
     startColumnIndex: 0,
-    endColumnIndex: QUESTION_HEADERS.length
+    endColumnIndex: columns
   };
 
   const requests = [{
@@ -689,8 +1027,10 @@ function bodyFormatRequests(sheetId, startRow, endRow) {
   }];
 
   // The long-form columns wrap; the rest stay on one line so the row does not
-  // grow to the height of its longest cell.
-  for (const column of WRAP_COLUMNS) {
+  // grow to the height of its longest cell. Only the ones this tab actually
+  // has: the referral tabs are seven and sixteen columns wide, and asking
+  // Sheets to format column 30 of a seven-column tab is refused outright.
+  for (const column of WRAP_COLUMNS.filter((c) => c <= columns)) {
     requests.push({
       repeatCell: {
         range: Object.assign({}, range, { startColumnIndex: column - 1, endColumnIndex: column }),
@@ -709,12 +1049,12 @@ function bodyFormatRequests(sheetId, startRow, endRow) {
  * upload that worked because its rows came out the wrong colour would be the
  * worse failure of the two.
  */
-async function resetAppendedRows(ctx, subject, firstRow, count) {
+async function resetAppendedRows(ctx, subject, firstRow, count, columns) {
   if (!firstRow || !count) return;
   try {
     const sheetId = await sheetIdOf(ctx, subject);
     await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
-      requests: bodyFormatRequests(sheetId, firstRow, firstRow + count - 1)
+      requests: bodyFormatRequests(sheetId, firstRow, firstRow + count - 1, columns)
     });
   } catch (err) {
     console.warn(`[sheets] could not restore row formatting in "${subject}": ${err.message}`);
@@ -1209,14 +1549,17 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
-  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions,
-  scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions
+  holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions, markDeleted,
+  scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions,
+  listReferrals, getReferral, getReferralFor, createReferral, setReferralStatus,
+  listReferralEarnings, recordReferralEarning, settleReferralEarnings
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
-  'recoverStaleClaims', 'unpostQuestions', 'addQuestions',
-  'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus', 'formatQuestions']);
+  'recoverStaleClaims', 'unpostQuestions', 'addQuestions', 'markDeleted',
+  'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus', 'formatQuestions',
+  'createReferral', 'setReferralStatus', 'recordReferralEarning', 'settleReferralEarnings']);
 
 module.exports = {
   DIRECT,

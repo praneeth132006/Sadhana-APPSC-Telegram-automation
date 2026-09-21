@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Referrals — Sadhana APPSC</title>
+  <meta name="description" content="Who invited whom, what each referral earned, what is owed to each member, and marking payouts as made.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+  <div class="app-container">
+    <main id="pageRoot" class="page-root" style="display:none">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Referrals</h1>
+          <p class="page-subtitle">
+            Who invited whom, what each join was worth, what is still owed, and marking a
+            payout as made once you have actually sent the money.
+          </p>
+        </div>
+        <div class="page-actions">
+          <span id="schemeBadge" class="hint-text"></span>
+          <button id="refreshBtn" class="btn btn-primary">Refresh</button>
+        </div>
+      </div>
+
+      <div id="statGrid" class="stat-grid"></div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Owed right now</h2>
+            <p class="panel-subtitle">Members with earnings waiting to be paid, largest first</p>
+          </div>
+        </div>
+        <div class="panel-body tight">
+          <div id="dueArea" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Who joined using whose code</h2>
+            <p class="panel-subtitle">One row per referred payment, newest first</p>
+          </div>
+          <div class="page-actions">
+            <input id="search" class="field-input" type="search" style="max-width:260px"
+                   placeholder="Code, name or Telegram ID" aria-label="Filter referrals">
+          </div>
+        </div>
+        <div class="panel-body tight">
+          <div id="joinsArea" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Every referral code</h2>
+            <p class="panel-subtitle">Each member's code, how many it has brought in and what it has earned</p>
+          </div>
+        </div>
+        <div class="panel-body tight">
+          <div id="codesArea" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <div id="referralLog" class="log-output" style="display:none;margin-top:14px"></div>
+    </main>
+  </div>
+
+  <script type="module" src="referrals.js"></script>
+</body>
+</html>

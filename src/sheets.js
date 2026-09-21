@@ -52,7 +52,22 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions', 'markDeleted',
+  'listReferrals', 'getReferral', 'getReferralFor', 'createReferral', 'setReferralStatus',
+  'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings'];
+
+/**
+ * Operations that exist only on the Sheets API route.
+ *
+ * Referrals were built after the move to the service account, and their two
+ * tabs are created on first use. Adding them to the Apps Script as well would
+ * mean pasting a script into five sheets by hand to turn the feature on —
+ * which is exactly the step that route was replaced to remove. A group without
+ * a service account gets a sentence saying so rather than a confusing failure
+ * five calls deeper.
+ */
+const DIRECT_ONLY = new Set(['listReferrals', 'getReferral', 'getReferralFor', 'createReferral',
+  'setReferralStatus', 'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings']);
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -144,6 +159,14 @@ function forGroup(groupId) {
           // Dashboard reads cached from the Apps Script must not outlive a write.
           if (direct.WRITES.has(name)) invalidateReads(ctx);
         }
+      };
+    } else if (DIRECT_ONLY.has(name)) {
+      bound[name] = async () => {
+        throw new Error(
+          `Referrals need the Google Sheets API, which "${ctx.label}" is not set up for. ` +
+          'Set GOOGLE_SERVICE_ACCOUNT_JSON and this group\'s SHEET_ID_<PREFIX>, and share the ' +
+          'sheet with the service account as an Editor.'
+        );
       };
     } else {
       bound[name] = (...args) => module.exports[`_${name}`](ctx, ...args);
@@ -740,6 +763,19 @@ async function scheduleQuestions(ctx, subject, questionIds, scheduledFor, update
 }
 
 /**
+ * markDeleted — records that a poll is no longer in the channel.
+ *
+ * Posted stays YES: the question WAS posted, and leaving it that way is what
+ * keeps a question someone deleted from quietly going back out.
+ */
+async function markDeleted(ctx, subject, rowNumbers, note) {
+  const result = await request(ctx, 'POST', {
+    action: 'markDeleted', subject, rowNumbers, note: note || ''
+  });
+  return result.markedCount || 0;
+}
+
+/**
  * formatQuestions — puts one subject tab back to the canonical layout.
  *
  * The way back for a tab an upload turned navy from top to bottom. On the
@@ -998,8 +1034,8 @@ const IMPLEMENTATIONS = {
   getStats, getAnalytics, listQuestions, checkDuplicates, addQuestions,
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   recoverStaleClaims, holdQuestions,
-  unpostQuestions, listPosted, bulkStatus, scheduleQuestions, unscheduleQuestions,
-  formatQuestions, getSubscriber,
+  unpostQuestions, listPosted, markDeleted, bulkStatus, scheduleQuestions,
+  unscheduleQuestions, formatQuestions, getSubscriber,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,
@@ -1007,6 +1043,15 @@ const IMPLEMENTATIONS = {
 };
 
 API_NAMES.forEach((name) => {
+  // A direct-only operation has no Apps Script twin by design; forGroup binds
+  // it to an explanation instead. Everything else must exist, or a caller
+  // would get "not a function" from somewhere far from the cause.
+  if (DIRECT_ONLY.has(name)) {
+    if (!direct.DIRECT[name]) {
+      throw new Error(`sheets.js: "${name}" is direct-only but sheets-direct.js does not implement it.`);
+    }
+    return;
+  }
   if (typeof IMPLEMENTATIONS[name] !== 'function') {
     throw new Error(`sheets.js: API_NAMES lists "${name}" but there is no such function.`);
   }

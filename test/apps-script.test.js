@@ -2427,3 +2427,71 @@ test('the queue actions are reachable over POST and answer with what they missed
   assert.equal(missing.success, false);
   assert.match(missing.error, /Missing subject or questionIds/);
 });
+
+// ===========================================================================
+// A poll deleted from Telegram
+// ===========================================================================
+// Mirrors the cases in test/sheets-direct.test.js: the two routes share every
+// sheet, so a curator must not be able to tell which one marked a row.
+
+test('a deleted poll is marked Deleted and keeps Posted = YES, so it is never re-sent', () => {
+  const { script, sheet, map } = tabWithQuestions(1, [
+    { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 }
+  ]);
+
+  assert.equal(script.markQuestionsDeleted('Polity', [2], 'Deleted from the Telegram group'), 1);
+
+  assert.equal(sheet.values[1][map['Status']], 'Deleted');
+  assert.equal(sheet.values[1][map['Posted']], 'YES',
+    'clearing Posted would put the question back in the queue and post it again');
+  assert.equal(sheet.values[1][map['Telegram Msg ID']], 901);
+  assert.equal(sheet.values[1][map['Updated By']], 'Deleted-poll check');
+  assert.match(String(sheet.values[1][map['Review Notes']]), /^\[.* IST\] Deleted from the Telegram group$/);
+});
+
+test('a note is added to whatever the row already said, not over it', () => {
+  const { script, sheet, map } = tabWithQuestions(1, [
+    { Posted: 'YES', Status: 'Posted', 'Review Notes': 'checked by Ravi' }
+  ]);
+  script.markQuestionsDeleted('Polity', [2], 'Deleted from the Telegram group');
+  assert.match(String(sheet.values[1][map['Review Notes']]), /^checked by Ravi\n\[.* IST\] Deleted from/);
+});
+
+test('marking skips a row that is not posted, and one already marked', () => {
+  const { script, sheet, map } = tabWithQuestions(3, [
+    { Posted: 'NO', Status: 'Approved' },
+    { Posted: 'YES', Status: 'Deleted' },
+    { Posted: 'YES', Status: 'Posted' }
+  ]);
+
+  assert.equal(script.markQuestionsDeleted('Polity', [2, 3, 4], 'gone'), 1);
+  assert.equal(sheet.values[1][map['Status']], 'Approved');
+  assert.equal(sheet.values[3][map['Status']], 'Deleted');
+});
+
+test('a marked question is not offered to the next sweep', () => {
+  const { script } = tabWithQuestions(2, [
+    { Posted: 'YES', Status: 'Posted', 'Telegram Msg ID': 901 },
+    { Posted: 'YES', Status: 'Deleted', 'Telegram Msg ID': 902 }
+  ]);
+  const posted = script.listPostedQuestions('Polity');
+  assert.deepEqual([...posted].map((p) => p.message_id), ['901']);
+});
+
+test('Deleted is a status the poster owns, not one a curator sets by hand', () => {
+  const { script, ids } = tabWithQuestions(1);
+  assert.throws(() => script.bulkSetStatus('Polity', [ids[0]], 'Deleted', 'C'), /set by the poster/);
+});
+
+test('markDeleted is reachable over POST and refuses an empty selection', () => {
+  const { script } = tabWithQuestions(1, [{ Posted: 'YES', Status: 'Posted' }]);
+  const post = (payload) => JSON.parse(script.doPost({ postData: { contents: JSON.stringify(payload) } }).text);
+
+  const marked = post({ action: 'markDeleted', subject: 'Polity', rowNumbers: [2], note: 'gone' });
+  assert.equal(marked.success, true);
+  assert.equal(marked.markedCount, 1);
+
+  const empty = post({ action: 'markDeleted', subject: 'Polity', rowNumbers: [] });
+  assert.equal(empty.success, false);
+  assert.match(empty.error, /Missing subject or rowNumbers/);
+});

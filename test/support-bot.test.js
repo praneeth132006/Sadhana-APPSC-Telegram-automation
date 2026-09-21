@@ -437,6 +437,11 @@ test('/start still greets when the settings sheet fails, and includes the welcom
     console.error = originalError;
   }
   assert.match(failing.messages(STUDENT.id)[0].args[1], /Hello Asha[\s\S]*\/support/);
+  // The greeting is one message with a Continue button, as the welcome screen
+  // is meant to be — not a wall of text followed by the pass unasked.
+  assert.equal(failing.messages(STUDENT.id).length, 1);
+  assert.equal(failing.messages(STUDENT.id)[0].args[2].reply_markup.inline_keyboard[0][0].callback_data,
+    'go:plans');
 
   const noted = makeBot({ sheet: fakeSheet({ getBotSettings: { welcome_note: 'Exam special this week' } }) });
   await noted.deliver(privateMessage('/start'));
@@ -912,7 +917,9 @@ test('a valid coupon shows the discounted price and a pay button that carries th
   const buttons = offer.args[2].reply_markup.inline_keyboard.flat();
   assert.equal(buttons[0].text, '💳 Pay ₹149');
   assert.equal(buttons[0].callback_data, 'buy:upsc:exam_pass:SAVE50');
-  assert.equal(buttons[1].callback_data, 'pick:upsc', 'the student can remove the coupon');
+  // "plain:" and not "pick:": choosing a group keeps whatever the student
+  // arrived with, while removing a coupon has to clear it.
+  assert.equal(buttons[1].callback_data, 'plain:upsc', 'the student can remove the coupon');
 });
 
 test('a refused coupon says why and offers another try or the full price', async () => {
@@ -922,7 +929,7 @@ test('a refused coupon says why and offers another try or the full price', async
 
   const [reply] = messages(STUDENT.id);
   assert.match(reply.args[1], /SAVE50<\/b>: You have already used that coupon code/);
-  assert.deepEqual(reply.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data), ['cpn:upsc', 'pick:upsc']);
+  assert.deepEqual(reply.args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data), ['cpn:upsc', 'plain:upsc']);
 });
 
 test('paying with a coupon re-checks it and charges the discounted amount, with the coupon in the notes', async () => {

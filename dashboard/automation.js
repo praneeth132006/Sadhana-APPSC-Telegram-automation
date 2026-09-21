@@ -430,9 +430,13 @@ async function postNow() {
 /**
  * reconcileChannel — finds posted questions whose poll is no longer in Telegram.
  *
- * Runs read-only first and reports what it found, because putting a question
- * back in the queue means it will be posted again — a decision that belongs to
- * a person, not to a background check.
+ * Runs read-only first and reports what it found before writing anything.
+ *
+ * The default is to mark those questions Deleted in the sheet and leave them
+ * out of the queue. Deleting a poll from the channel is nearly always a
+ * decision that the question should not be there, and the old default — put it
+ * back as Approved — meant it went out again on the next run. Re-queueing is
+ * still available, as the deliberate choice it should have been all along.
  */
 async function reconcileChannel() {
   const subject = $('postSubject').value;
@@ -466,10 +470,15 @@ async function reconcileChannel() {
     found.missing.forEach((m) =>
       log('reconcileLog', `• ${m.questionId} (row ${m.row}, msg ${m.messageId}) — not in the channel`, 'fail'));
 
+    const action = $('reconcileAction').value;
     const confirmed = window.confirm(
       `${found.missing.length} posted question(s) are no longer in the channel.\n\n` +
-      'Put them back in the queue as Approved?\n\n' +
-      'They will be eligible to post again, and their old message id is cleared.'
+      (action === 'requeue'
+        ? 'Put them back in the queue as Approved?\n\n' +
+          'They will be eligible to post again, and their old message id is cleared.'
+        : 'Mark them Deleted in the sheet?\n\n' +
+          'They stay out of the queue, so none of them will be posted again. ' +
+          'Nothing is erased — the row, the question and its message id all stay.')
     );
     if (!confirmed) {
       log('reconcileLog', 'Left as they are. Nothing changed.', 'muted');
@@ -478,7 +487,7 @@ async function reconcileChannel() {
 
     const applied = await api('/api/telegram/reconcile', {
       method: 'POST',
-      body: { subject, apply: true }
+      body: { subject, apply: true, action }
     });
     log('reconcileLog', applied.message, 'ok');
     showToast('success', applied.message);
@@ -719,10 +728,11 @@ function renderAutopilot() {
       `${s.batchSize} question(s) every ${s.intervalMinutes} min` +
         (s.requireApproved ? ', Approved or Scheduled only' : ', including Drafts'),
       `${job.totals.runs} run(s) so far — ${job.totals.posted} posted, ${job.totals.failed} failed` +
-        (job.totals.restored ? `, ${job.totals.restored} put back after being deleted` : '')
+        (job.totals.deleted ? `, ${job.totals.deleted} marked Deleted after being removed from Telegram` : '')
     ];
     if (s.reconcileEveryRuns) {
-      lines.push(`Checks for deleted polls every ${s.reconcileEveryRuns} run(s).`);
+      lines.push(`Every ${s.reconcileEveryRuns} run(s), checks whether any of this subject's ` +
+        'posted polls have been deleted from Telegram, and marks those questions Deleted.');
     }
     if (job.startedBy) lines.push(`Started by ${job.startedBy}.`);
     if (!job.running && job.stoppedReason) lines.push(job.stoppedReason);

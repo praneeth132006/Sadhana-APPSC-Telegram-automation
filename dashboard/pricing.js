@@ -85,7 +85,9 @@ function renderPass() {
       el('div', { class: 'pc-preview-name', text: `🎯 ${shownName}` }),
       el('div', { class: 'hint-text', text: description.value.trim() || defaults.description }),
       el('div', { class: 'pc-preview-facts' }, [
-        shownDate ? el('span', { text: `📅 Valid until ${shownDate}` }) : el('span', { class: 'pc-warn', text: '⚠️ No valid-until date set' }),
+        stored.lifetime
+          ? el('span', { text: '♾️ Lifetime access — pay once, never renew' })
+          : (shownDate ? el('span', { text: `📅 Valid until ${shownDate}` }) : el('span', { class: 'pc-warn', text: '⚠️ No valid-until date set' })),
         el('span', { class: 'pc-price', text: `💰 ${rupees(shownPrice)}` })
       ])
     );
@@ -99,7 +101,9 @@ function renderPass() {
       const result = await api('/api/pricing/pass', {
         method: 'POST',
         body: {
-          name: name.value, price: price.value, validUntil: fromInputDate(validUntil.value), description: description.value
+          name: name.value, price: price.value,
+          validUntil: stored.lifetime ? '' : fromInputDate(validUntil.value),
+          description: description.value
         }
       });
       showToast('success', `Saved. Students now see ${result.pass.name} at ${result.pass.priceText}.`, 7000);
@@ -116,7 +120,11 @@ function renderPass() {
       el('div', { class: 'support-fields' }, [
         field('Pass name (the exam it is for)', name, `e.g. "Target APPSC Group 2 – 2026". Built-in: ${defaults.name}`),
         field('Price in rupees', price, `Whole rupees. Built-in: ₹${defaults.price}`),
-        field('Valid until', validUntil, `Access ends at the end of this day. Built-in: ${defaults.validUntil || 'not set'}`),
+        // A lifetime pass has no end date, so there is no box to fill in —
+        // offering one that is silently ignored is worse than not offering it.
+        stored.lifetime
+          ? field('Access', el('div', { class: 'hint-text', text: '♾️ Lifetime — students pay once and keep access for good. There is no end date to set.' }), '')
+          : field('Valid until', validUntil, `Access ends at the end of this day. Built-in: ${defaults.validUntil || 'not set'}`),
         field('Description', description, 'One or two lines shown with the price.')
       ]),
       preview,

@@ -107,6 +107,24 @@ stub(sheets, 'holdQuestions', 1);
 stub(sheets, 'listPosted', []);
 stub(sheets, 'unpostQuestions', 0);
 stub(sheets, 'formatQuestions', (subject) => ({ subject, rows: 12 }));
+stub(sheets, 'markDeleted', 1);
+stub(sheets, 'listReferrals', [
+  { code: 'REFAJMXPQ', telegram_id: '111', username: 'asha', name: 'Asha K', status: 'active', created_at: 'then' },
+  { code: 'REFWMXD9N', telegram_id: '222', username: 'ravi', name: 'Ravi T', status: 'disabled', created_at: 'then' }
+]);
+stub(sheets, 'listReferralEarnings', [
+  { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+    referred_telegram_id: '333', referred_username: 'kiran', group: 'G', payment_id: 'pay_1',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'pending' },
+  { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+    referred_telegram_id: '444', referred_username: 'meena', group: 'G', payment_id: 'pay_2',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'paid' },
+  { code: 'REFWMXD9N', referrer_telegram_id: '222', referrer_username: 'ravi',
+    referred_telegram_id: '555', referred_username: 'sai', group: 'G', payment_id: 'pay_3',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'cancelled' }
+]);
+stub(sheets, 'settleReferralEarnings', { settled: 1, paise: 3582 });
+stub(sheets, 'setReferralStatus', 1);
 
 // Telegram: pretend the bot is healthy and every send succeeds.
 telegram.init = () => {};
@@ -115,7 +133,12 @@ telegram.sendQuizPoll = async () => ({ message_id: 999, poll: { id: 'poll-1' } }
 
 // Auth: accept exactly one token.
 auth.authorize = async (token) => {
-  if (token !== 'valid-token') throw new Error('Token signature is invalid.');
+  // Refused the way the real one refuses, so the routes see the same shapes:
+  // a bad token asks for a new one (401), a refused identity does not (403).
+  if (token === 'not-a-curator') {
+    throw auth.authError('Account nobody@example.com is not on the curator allowlist.', 'forbidden');
+  }
+  if (token !== 'valid-token') throw auth.authError('Token signature is invalid.', 'reauth');
   return {
     uid: 'uid-1', email: 'curator@example.com', name: 'Test Curator',
     emailVerified: true, signInProvider: 'google.com'
@@ -312,7 +335,8 @@ test('every data route refuses an unauthenticated caller', async () => {
     ['POST', '/api/questions'], ['POST', '/api/questions/update'],
     ['POST', '/api/questions/delete'], ['POST', '/api/questions/status'],
     ['POST', '/api/questions/schedule'], ['POST', '/api/questions/unschedule'],
-    ['POST', '/api/questions/format'],
+    ['POST', '/api/questions/format'], ['GET', '/api/referrals'],
+    ['POST', '/api/referrals/settle'], ['POST', '/api/referrals/status'],
     ['POST', '/api/telegram/post'], ['POST', '/api/telegram/reconcile'],
     ['GET', '/api/automation/autopilot'], ['POST', '/api/automation/autopilot'],
     ['POST', '/api/automation/autopilot/stop'],
@@ -326,10 +350,19 @@ test('every data route refuses an unauthenticated caller', async () => {
   }
 });
 
-test('an invalid token is rejected with 403', async () => {
+test('a bad token asks the browser to sign in again, rather than reading as a ban', async () => {
+  // 401 and not 403. Both used to be 403, so a session that had simply lapsed
+  // reached the dashboard as a permissions problem and told the curator to add
+  // themselves to CURATOR_EMAILS when all they had to do was sign in again.
   const res = await call('/api/analytics', { token: 'forged-token' });
-  assert.equal(res.status, 403);
+  assert.equal(res.status, 401);
   assert.match(res.json.error, /signature/i);
+});
+
+test('an identity that is refused stays 403, because a new token would not help', async () => {
+  const res = await call('/api/analytics', { token: 'not-a-curator' });
+  assert.equal(res.status, 403);
+  assert.match(res.json.error, /allowlist/i);
 });
 
 test('a valid token is accepted', async () => {
@@ -971,7 +1004,7 @@ test('reconcile reports deleted polls and changes nothing until asked', async ()
   }
 });
 
-test('reconcile puts deleted polls back in the queue when applied', async () => {
+test('reconcile puts deleted polls back in the queue when that is asked for', async () => {
   const originalPosted = clientStubs.listPosted;
   const originalExists = telegram.pollStillExists;
   const originalUnpost = clientStubs.unpostQuestions;
@@ -986,10 +1019,11 @@ test('reconcile puts deleted polls back in the queue when applied', async () => 
 
   try {
     const res = await authed('/api/telegram/reconcile', {
-      method: 'POST', body: { subject: 'Polity', apply: true }
+      method: 'POST', body: { subject: 'Polity', apply: true, action: 'requeue' }
     });
 
     assert.equal(res.json.restored, 1);
+    assert.equal(res.json.action, 'requeue');
     assert.equal(unpostArgs.length, 1);
     assert.equal(unpostArgs[0][0], 'Polity');
     assert.deepEqual(unpostArgs[0][1], [7]);
@@ -2188,7 +2222,9 @@ test('GET /api/pricing shows the pass with admin overrides and each coupon\'s st
   const original = clientStubs.getBotSettings;
   clientStubs.getBotSettings = async () => ({ pass_name: 'Target APPSC 2026', pass_price: '249', pass_valid_until: '31-05-2099' });
   try {
-    const res = await authed('/api/pricing');
+    // A group whose pass has an end date. The newspaper groups sell a lifetime
+    // pass, where "valid until" is deliberately ignored — see the test below.
+    const res = await authed('/api/pricing?group=appsc_q_en');
     assert.equal(res.status, 200);
     const { pass, coupons, redemptions, passSettings } = res.json.data;
     assert.equal(pass.name, 'Target APPSC 2026');
@@ -2696,19 +2732,22 @@ test('the autopilot cron runs the due jobs and reports them', async () => {
   }
 });
 
-test('the deleted-poll cron puts questions back across every ready group', async () => {
+test('the deleted-poll cron marks questions Deleted across every ready group', async () => {
   const original = process.env.CRON_SECRET;
   process.env.CRON_SECRET = 'cron-secret';
   const originalPosted = clientStubs.listPosted;
   const originalUnpost = clientStubs.unpostQuestions;
   const originalExists = telegram.pollStillExists;
 
+  const originalMark = clientStubs.markDeleted;
   clientStubs.listPosted = async () => ([
     { row: 4, question_id: 'POL-4', message_id: '904', status: 'Posted' }
   ]);
   telegram.pollStillExists = async () => false;
   const unposted = [];
+  const markedRows = [];
   clientStubs.unpostQuestions = async (...args) => { unposted.push(args); return 1; };
+  clientStubs.markDeleted = async (...args) => { markedRows.push(args); return 1; };
 
   try {
     const res = await call('/api/cron/reconcile', {
@@ -2716,12 +2755,17 @@ test('the deleted-poll cron puts questions back across every ready group', async
     });
 
     assert.equal(res.status, 200);
-    assert.ok(res.json.data.restored >= 1, 'a deleted poll was not put back in the queue');
-    assert.ok(unposted.length >= 1);
-    assert.equal(unposted[0][2], 'Approved', 'it comes back ready to post, not as a Draft');
+    assert.ok(res.json.data.marked >= 1, 'a deleted poll was not marked Deleted');
+    assert.ok(markedRows.length >= 1);
+    assert.deepEqual(markedRows[0][1], [4]);
+    assert.match(markedRows[0][2], /Deleted from the Telegram group/);
+    // The unattended path must never put a question back on its own: it would
+    // be posted again within the interval, with nobody watching.
+    assert.equal(unposted.length, 0, 'the nightly sweep re-queued a deleted question');
   } finally {
     clientStubs.listPosted = originalPosted;
     clientStubs.unpostQuestions = originalUnpost;
+    clientStubs.markDeleted = originalMark;
     telegram.pollStillExists = originalExists;
     if (original === undefined) delete process.env.CRON_SECRET;
     else process.env.CRON_SECRET = original;
@@ -2845,5 +2889,334 @@ test('repairing a group with no configured subjects says so', async () => {
     assert.match(res.json.error, /No subjects are configured/);
   } finally {
     clientStubs.readConfig = original;
+  }
+});
+
+// ===========================================================================
+// Deleting a question in Telegram, reflected in the sheet
+// ===========================================================================
+
+/** A subject with `n` posted questions, and control over which polls survive. */
+function postedChannel(gone = []) {
+  const restore = {
+    listPosted: clientStubs.listPosted,
+    markDeleted: clientStubs.markDeleted,
+    unpostQuestions: clientStubs.unpostQuestions,
+    pollStillExists: telegram.pollStillExists
+  };
+  const marked = [];
+  const unposted = [];
+
+  clientStubs.listPosted = async () => ([
+    { row: 2, question_id: 'POL-1', message_id: '901', status: 'Posted' },
+    { row: 3, question_id: 'POL-2', message_id: '902', status: 'Posted' },
+    { row: 4, question_id: 'POL-3', message_id: '903', status: 'Posted' }
+  ]);
+  telegram.pollStillExists = async (id) => !gone.includes(String(id));
+  clientStubs.markDeleted = async (...args) => { marked.push(args); return args[1].length; };
+  clientStubs.unpostQuestions = async (...args) => { unposted.push(args); return args[1].length; };
+
+  return {
+    marked,
+    unposted,
+    done: () => Object.assign(clientStubs, {
+      listPosted: restore.listPosted,
+      markDeleted: restore.markDeleted,
+      unpostQuestions: restore.unpostQuestions
+    }) && (telegram.pollStillExists = restore.pollStillExists)
+  };
+}
+
+test('a question deleted in Telegram is marked Deleted in the sheet', async () => {
+  const channel = postedChannel(['902']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true }
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.json.action, 'mark', 'marking is the default');
+    assert.equal(res.json.marked, 1);
+    assert.equal(res.json.restored, 0);
+
+    assert.equal(channel.marked.length, 1);
+    const [subject, rows, note] = channel.marked[0];
+    assert.equal(subject, 'Polity');
+    assert.deepEqual(rows, [3], 'only the row whose poll is gone');
+    assert.match(note, /no longer there/);
+    assert.match(note, /curator@example\.com/, 'the sheet records who noticed');
+
+    assert.equal(channel.unposted.length, 0, 'marking must not also re-queue');
+    assert.match(res.json.message, /will be posted again/);
+  } finally {
+    channel.done();
+  }
+});
+
+test('marking is what happens unless re-queueing is asked for by name', async () => {
+  // The old default put the question back as Approved, so a poll a curator
+  // had deliberately deleted went out again on the very next run.
+  const channel = postedChannel(['903']);
+  try {
+    for (const action of [undefined, '', 'nonsense', 'mark']) {
+      channel.marked.length = 0;
+      await authed('/api/telegram/reconcile', {
+        method: 'POST', body: { subject: 'Polity', apply: true, action }
+      });
+      assert.equal(channel.marked.length, 1, `action ${JSON.stringify(action)} did not mark`);
+    }
+    assert.equal(channel.unposted.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('re-queueing stays available for a poll deleted by accident', async () => {
+  const channel = postedChannel(['901']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true, action: 'requeue' }
+    });
+
+    assert.equal(res.json.action, 'requeue');
+    assert.equal(res.json.restored, 1);
+    assert.equal(res.json.marked, 0);
+    assert.deepEqual(channel.unposted[0][1], [2]);
+    assert.equal(channel.unposted[0][2], 'Approved');
+    assert.equal(channel.marked.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('a check that is only looking writes nothing either way', async () => {
+  const channel = postedChannel(['901', '902']);
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity' }
+    });
+
+    assert.equal(res.json.applied, false);
+    assert.equal(res.json.missing.length, 2);
+    assert.equal(res.json.marked, 0);
+    assert.equal(channel.marked.length, 0);
+    assert.equal(channel.unposted.length, 0);
+  } finally {
+    channel.done();
+  }
+});
+
+test('a poll Telegram will not answer about is never marked Deleted', async () => {
+  // Guessing "deleted" would retire a question that is live in the channel.
+  const restore = {
+    listPosted: clientStubs.listPosted,
+    markDeleted: clientStubs.markDeleted,
+    exists: telegram.pollStillExists
+  };
+  const marked = [];
+  clientStubs.listPosted = async () => ([
+    { row: 2, question_id: 'POL-1', message_id: '901', status: 'Posted' }
+  ]);
+  telegram.pollStillExists = async () => null;
+  clientStubs.markDeleted = async (...args) => { marked.push(args); return 1; };
+
+  try {
+    const res = await authed('/api/telegram/reconcile', {
+      method: 'POST', body: { subject: 'Polity', apply: true }
+    });
+    assert.deepEqual(res.json.unknown, ['POL-1']);
+    assert.equal(res.json.marked, 0);
+    assert.equal(marked.length, 0);
+  } finally {
+    clientStubs.listPosted = restore.listPosted;
+    clientStubs.markDeleted = restore.markDeleted;
+    telegram.pollStillExists = restore.exists;
+  }
+});
+
+test('the autopilot check marks and never re-queues, because nobody is watching', async () => {
+  const original = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'cron-secret';
+  const channel = postedChannel(['902']);
+
+  try {
+    // reconcileEveryRuns: 1 — the check runs on the very first batch.
+    await authed('/api/automation/autopilot', {
+      method: 'POST',
+      body: { subject: 'Polity', intervalMinutes: 720, batchSize: 1, reconcileEveryRuns: 1 }
+    });
+
+    const res = await call('/api/cron/autopilot', {
+      method: 'POST', headers: { Authorization: 'Bearer cron-secret' }
+    });
+
+    assert.equal(res.json.data.ran.length, 1);
+    assert.equal(res.json.data.ran[0].run.deleted, 1, 'the run did not record the deletion');
+    assert.equal(channel.marked.length, 1);
+    assert.equal(channel.unposted.length, 0,
+      'an unattended run put a deliberately deleted question back in the queue');
+  } finally {
+    await authed('/api/automation/autopilot/stop', { method: 'POST', body: { subject: 'Polity' } });
+    channel.done();
+    if (original === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = original;
+  }
+});
+
+// ===========================================================================
+// Referrals — the admin side
+// ===========================================================================
+
+test('the referrals page gets every code, every join, and what is owed', async () => {
+  const res = await authed('/api/referrals');
+  assert.equal(res.status, 200);
+  const data = res.json.data;
+
+  // The scheme, so the page can state the terms rather than hardcode them.
+  assert.equal(data.settings.discountPercent, 10);
+  assert.equal(data.settings.commissionPercent, 20);
+  assert.equal(data.settings.payoutThresholdPaise, 100000);
+
+  // Each code with its own standing, worked out the same way the bot does it.
+  const asha = data.codes.find((c) => c.code === 'REFAJMXPQ');
+  assert.equal(asha.joined, 2);
+  assert.equal(asha.pendingPaise, 3582);
+  assert.equal(asha.paidPaise, 3582);
+  assert.equal(asha.totalPaise, 7164);
+  assert.equal(asha.payable, false, '₹35.82 is under the ₹1000 threshold');
+
+  // A cancelled earning is neither money nor a join.
+  const ravi = data.codes.find((c) => c.code === 'REFWMXD9N');
+  assert.equal(ravi.joined, 0);
+  assert.equal(ravi.totalPaise, 0);
+  assert.equal(ravi.status, 'disabled');
+
+  // The whole picture, for the tiles.
+  assert.equal(data.totals.joined, 2);
+  assert.equal(data.totals.revenuePaise, 35820);
+  assert.equal(data.totals.discountPaise, 3980);
+  assert.equal(data.totals.pendingPaise, 3582);
+  assert.equal(data.totals.paidPaise, 3582);
+});
+
+test('who joined using whose code is answered by Telegram id, not by handle', async () => {
+  // A handle can be changed; an id cannot. "Who invited whom" has to survive
+  // somebody renaming themselves.
+  const res = await authed('/api/referrals');
+  const joins = res.json.data.earnings;
+
+  assert.equal(joins.length, 3);
+  const first = joins.find((e) => e.payment_id === 'pay_1');
+  assert.equal(first.referrer_telegram_id, '111');
+  assert.equal(first.referred_telegram_id, '333');
+  assert.equal(first.commission_paise, 3582);
+  // Newest first: the question is almost always "who joined just now".
+  assert.equal(joins[0].payment_id, 'pay_3');
+});
+
+test('a payout run names the exact payments it would close', async () => {
+  const res = await authed('/api/referrals');
+  // Nothing is over ₹1000 here, so nothing is due — which is the point: the
+  // page must not offer to settle a balance that has not reached the bar.
+  assert.deepEqual(res.json.data.due, []);
+});
+
+test('settling records that a payout was made, and who recorded it', async () => {
+  calls.length = 0;
+  const res = await authed('/api/referrals/settle', {
+    method: 'POST', body: { code: 'REFAJMXPQ', paymentIds: ['pay_1'] }
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.settled, 1);
+  assert.match(res.json.message, /₹35\.82/);
+
+  const [code, ids, note] = calls.find((c) => c.name === 'settleReferralEarnings').args;
+  assert.equal(code, 'REFAJMXPQ');
+  // The payments the admin was looking at, so one recorded in between is not
+  // silently closed with them.
+  assert.deepEqual(ids, ['pay_1']);
+  assert.match(note, /curator@example\.com/);
+});
+
+test('settling refuses anything that is not a referral code', async () => {
+  for (const code of ['', 'NOTACODE', 'REF123', '../../etc/passwd', 'SAVE20']) {
+    const res = await authed('/api/referrals/settle', { method: 'POST', body: { code } });
+    assert.equal(res.status, 400, `"${code}" was accepted as a referral code`);
+  }
+});
+
+test('a code can be switched off and back on', async () => {
+  calls.length = 0;
+  const off = await authed('/api/referrals/status', {
+    method: 'POST', body: { code: 'REFAJMXPQ', status: 'disabled' }
+  });
+  assert.equal(off.status, 200);
+  assert.equal(off.json.status, 'disabled');
+  assert.deepEqual(calls.find((c) => c.name === 'setReferralStatus').args, ['REFAJMXPQ', 'disabled']);
+
+  calls.length = 0;
+  await authed('/api/referrals/status', { method: 'POST', body: { code: 'REFAJMXPQ', status: 'active' } });
+  assert.equal(calls.find((c) => c.name === 'setReferralStatus').args[1], 'active');
+
+  // Anything that is not "disabled" means active, rather than writing a status
+  // nothing else in the system understands.
+  calls.length = 0;
+  await authed('/api/referrals/status', { method: 'POST', body: { code: 'REFAJMXPQ', status: 'banana' } });
+  assert.equal(calls.find((c) => c.name === 'setReferralStatus').args[1], 'active');
+});
+
+test('a code that is not in the sheet cannot be switched off', async () => {
+  const original = clientStubs.setReferralStatus;
+  clientStubs.setReferralStatus = async () => 0;
+  try {
+    const res = await authed('/api/referrals/status', {
+      method: 'POST', body: { code: 'REFWMXD9N', status: 'disabled' }
+    });
+    assert.equal(res.status, 404);
+    assert.match(res.json.error, /not in the sheet/);
+  } finally {
+    clientStubs.setReferralStatus = original;
+  }
+});
+
+test('a member over the threshold shows as due, with their payments listed', async () => {
+  const original = clientStubs.listReferralEarnings;
+  clientStubs.listReferralEarnings = async () => ([
+    { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+      referred_telegram_id: '333', payment_id: 'pay_1', paid_paise: 17910,
+      discount_paise: 1990, commission_paise: 60000, status: 'pending' },
+    { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+      referred_telegram_id: '444', payment_id: 'pay_2', paid_paise: 17910,
+      discount_paise: 1990, commission_paise: 60000, status: 'pending' }
+  ]);
+  try {
+    const res = await authed('/api/referrals');
+    const due = res.json.data.due;
+    assert.equal(due.length, 1);
+    assert.equal(due[0].code, 'REFAJMXPQ');
+    assert.equal(due[0].pendingPaise, 120000);
+    assert.equal(due[0].count, 2);
+    assert.deepEqual(due[0].paymentIds, ['pay_1', 'pay_2']);
+  } finally {
+    clientStubs.listReferralEarnings = original;
+  }
+});
+
+test('the Pass & Coupons page is told when a pass is lifetime, and has no end date to show', async () => {
+  // The newspaper groups (TEST_GROUP is one) sell a lifetime pass. Without
+  // `lifetime` the page would offer a "Valid until" box that does nothing.
+  const original = clientStubs.getBotSettings;
+  clientStubs.getBotSettings = async () => ({ pass_valid_until: '31-05-2099' });
+  try {
+    const news = await authed('/api/pricing');
+    assert.equal(news.json.data.pass.lifetime, true);
+    assert.equal(news.json.data.pass.validUntil, '', 'a stored end date leaked onto a lifetime pass');
+
+    const exam = await authed('/api/pricing?group=appsc_q_en');
+    assert.equal(exam.json.data.pass.lifetime, false);
+    assert.equal(exam.json.data.pass.validUntil, '31-05-2099');
+  } finally {
+    clientStubs.getBotSettings = original;
   }
 });

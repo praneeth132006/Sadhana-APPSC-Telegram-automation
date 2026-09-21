@@ -54,22 +54,43 @@ function rupees(amountPaise) {
  * @returns {Object|null} The plan plus `validUntil` (dd-mm-yyyy or '')
  */
 function currentPass(groupId, settings = {}) {
-  const base = groups.getPlanFor(groupId, PASS_PLAN_ID, { includeRetired: false });
+  const base = groups.getPlanFor(groupId, passPlanIdFor(groupId), { includeRetired: false });
   if (!base) return null;
 
   const price = String(settings.pass_price || '').trim();
   const amountPaise = /^\d+$/.test(price) && Number(price) >= 1 ? Number(price) * 100 : base.amountPaise;
 
-  const configured = String(settings.pass_valid_until || '').trim();
-  const fromEnv = String(process.env[base.fixedEndDateEnv || 'EXAM_PASS_END_DATE'] || '').trim();
-  const validUntil = endOfDayIst(configured) ? configured : (endOfDayIst(fromEnv) ? fromEnv : '');
+  // A lifetime pass has no end date, and must not pick one up from the family's
+  // settings or from EXAM_PASS_END_DATE: either would quietly turn "pay once,
+  // keep it for life" back into "valid until the exam".
+  const lifetime = plans.isLifetimePlan(base);
+  let validUntil = '';
+  if (!lifetime) {
+    const configured = String(settings.pass_valid_until || '').trim();
+    const fromEnv = String(process.env[base.fixedEndDateEnv || 'EXAM_PASS_END_DATE'] || '').trim();
+    validUntil = endOfDayIst(configured) ? configured : (endOfDayIst(fromEnv) ? fromEnv : '');
+  }
 
   return Object.assign({}, base, {
     label: String(settings.pass_name || '').trim() || base.label,
     description: String(settings.pass_description || '').trim() || base.description,
     amountPaise,
-    validUntil
+    validUntil,
+    lifetime
   });
+}
+
+/**
+ * passPlanIdFor — which pass a group sells.
+ *
+ * Set per group in groups.config.json as `passPlanId`, and exam_pass when it
+ * is not. That is what lets the two newspaper groups sell a lifetime pass
+ * while every other group keeps its exam pass, without the pass definitions
+ * themselves — which all groups share — having to know about it.
+ */
+function passPlanIdFor(groupId) {
+  const group = groups.getGroup(groupId);
+  return (group && String(group.passPlanId || '').trim()) || PASS_PLAN_ID;
 }
 
 /** Upper-cases and trims a code. */
@@ -223,6 +244,7 @@ function validatePassInput(raw, now = new Date()) {
 }
 
 module.exports = {
+  passPlanIdFor,
   PASS_PLAN_ID,
   MIN_PAYABLE_PAISE,
   COUPON_CODE_PATTERN,

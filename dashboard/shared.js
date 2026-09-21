@@ -52,6 +52,15 @@ const googleProvider = new GoogleAuthProvider();
 /** The signed-in Firebase user, or null. */
 export let currentUser = null;
 
+/**
+ * Sets the signed-in user without going through Firebase. Tests only: the
+ * request path is what test/dashboard-auth.test.mjs exercises, and signing in
+ * for real needs a browser and a Google account. Nothing in a page calls this.
+ */
+export function __setCurrentUserForTests(user) {
+  currentUser = user;
+}
+
 /** Server bootstrap data from /api/config. */
 export let serverConfig = {};
 
@@ -67,6 +76,7 @@ const PAGES = [
   { id: 'automation', href: 'automation.html', icon: '🤖', label: 'Automation', hint: 'Post to Telegram now and manage schedules' },
   { id: 'members',    href: 'members.html',    icon: '💳', label: 'Members',    hint: 'Paying members, revenue and expiry sweep' },
   { id: 'pricing',    href: 'pricing.html',    icon: '🎟', label: 'Pass & Coupons', hint: 'The pass students buy, its price, and coupon codes' },
+  { id: 'referrals',  href: 'referrals.html',  icon: '🎁', label: 'Referrals',  hint: 'Who invited whom, what is owed, and payouts' },
   { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets: reply, send invite links, check payments' },
   { id: 'health',     href: 'health.html',     icon: '🩺', label: 'Health',     hint: 'System status and security posture' }
 ];
@@ -79,13 +89,15 @@ export const SUBJECTS = [
 ];
 
 /** Workflow states a question can be in. */
-export const STATUSES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived'];
+export const STATUSES = ['Draft', 'Review', 'Approved', 'Scheduled', 'Sending', 'Posted', 'Rejected', 'Archived', 'Deleted'];
 
-/** Statuses a curator may set. Posted and Sending are written by the poster
- *  together with the Posted column and the message id; setting one by hand
- *  desynchronises the row, so the question claims to be posted and is sent
- *  again. Offered for FILTERING, never for assignment. */
-export const ASSIGNABLE_STATUSES = STATUSES.filter((s) => s !== 'Posted' && s !== 'Sending');
+/** Statuses a curator may set. Posted, Sending and Deleted are written by the
+ *  poster and the deleted-poll check, together with the Posted column and the
+ *  message id; setting one by hand desynchronises the row, so the question
+ *  claims to be posted and is sent again. Offered for FILTERING, never for
+ *  assignment. */
+export const ASSIGNABLE_STATUSES =
+  STATUSES.filter((s) => s !== 'Posted' && s !== 'Sending' && s !== 'Deleted');
 
 /** Difficulty levels. */
 export const DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
@@ -331,7 +343,8 @@ function activityEnd() {
 }
 
 /** Builds the URL and fetch options shared by api() and apiStream(). */
-async function buildRequest(path, { method = 'GET', body = null, query = null } = {}) {
+async function buildRequest(path, { method = 'GET', body = null, query = null } = {},
+  forceFreshToken = false) {
   const params = new URLSearchParams();
   if (query) {
     Object.entries(query).forEach(([k, v]) => {
@@ -352,7 +365,7 @@ async function buildRequest(path, { method = 'GET', body = null, query = null } 
 
   const headers = {};
   if (currentUser) {
-    headers['Authorization'] = 'Bearer ' + (await currentUser.getIdToken());
+    headers['Authorization'] = 'Bearer ' + (await currentUser.getIdToken(forceFreshToken));
   }
   if (body) headers['Content-Type'] = 'application/json';
 
@@ -405,11 +418,75 @@ export async function api(path, options = {}) {
   activityStart();
   try {
     const { url, init } = await buildRequest(path, options);
-    const res = await fetch(url, init);
+    let res = await fetch(url, init);
+
+    // A 401 means the token is the problem, not the person: it has expired, or
+    // this laptop's clock has drifted past what the server will tolerate. The
+    // SDK hands out a cached token until it is close to expiry, so the fix is
+    // to demand a fresh one and try once more.
+    //
+    // Before this, a session that lapsed while a tab sat open turned every
+    // action into an error message with no way out but a manual reload — and
+    // the message talked about tokens, which is not something a curator can
+    // do anything about.
+    if (res.status === 401 && currentUser) {
+      const retry = await buildRequest(path, options, true);
+      res = await fetch(retry.url, retry.init);
+      // Still refused with a brand new token: the session really is over.
+      if (res.status === 401) {
+        sessionLapsed();
+        throw new Error('Your session has expired. Please sign in again.');
+      }
+    }
+
     return await readJsonAnswer(res);
   } finally {
     activityEnd();
   }
+}
+
+/**
+ * sessionLapsed — puts the sign-in gate back, once.
+ *
+ * Signing out is what makes onAuthStateChanged fire, which is the one place
+ * that knows how to show the gate and hide everything behind it. Doing it by
+ * hand from here would leave half the page still displaying data the visitor
+ * can no longer load.
+ */
+let lapsing = false;
+function sessionLapsed() {
+  if (lapsing) return;
+  lapsing = true;
+
+  // Forget the user NOW, not when Firebase gets round to telling us. A page
+  // fires several requests at once; every one already in flight comes back 401
+  // too, and while currentUser is still set each would retry and call this
+  // again. Firebase delivers the signed-out state asynchronously, so leaving
+  // it to onAuthStateChanged meant one lapse stacked a toast per request.
+  currentUser = null;
+
+  // The toast is decoration; the sign-out is the point. A toast that fails to
+  // render must never be what leaves a dead session on screen.
+  try {
+    showToast('error', 'Your session expired. Please sign in again.', 8000);
+  } catch (err) {
+    console.error('[auth] could not show the session toast', err);
+  }
+  Promise.resolve()
+    .then(() => signOut(auth))
+    .catch((err) => {
+      // Signing out is what brings the gate back. If it fails, currentUser is
+      // already gone and the gate never appears: a page that can load nothing
+      // and offers no way to sign in. A reload starts the auth check over and
+      // always ends at one or the other.
+      console.error('[auth] could not end the lapsed session, reloading', err);
+      if (typeof window !== 'undefined' && window.location && window.location.reload) {
+        window.location.reload();
+      }
+    });
+  // Deliberately NOT reset here. It is reset when someone actually signs in
+  // again (onAuthStateChanged), so a lapse is reported exactly once however
+  // many requests discover it.
 }
 
 /**
@@ -430,7 +507,20 @@ export async function apiStream(path, { body = {}, onEvent = () => {}, signal } 
     method: 'POST',
     body: Object.assign({}, body, { stream: true })
   });
-  const res = await fetch(url, Object.assign(init, { signal }));
+  let res = await fetch(url, Object.assign(init, { signal }));
+
+  // Same recovery as api(): a batch that starts just as the token expires
+  // should refresh and go, not fail with a message about tokens.
+  if (res.status === 401 && currentUser) {
+    const retry = await buildRequest(path, {
+      method: 'POST', body: Object.assign({}, body, { stream: true })
+    }, true);
+    res = await fetch(retry.url, Object.assign(retry.init, { signal }));
+    if (res.status === 401) {
+      sessionLapsed();
+      throw new Error('Your session has expired. Please sign in again.');
+    }
+  }
 
   const type = res.headers.get('content-type') || '';
   if (!type.includes('ndjson') || !res.body) return readJsonAnswer(res);
@@ -916,16 +1006,39 @@ export async function initDashboard({ page, onReady }) {
   // Advisory only, and it fails open — never let it block startup.
   warnIfOriginNotAuthorised().catch(() => {});
 
-  refreshConnectionStatus();
-  // Re-check the sheet connection every couple of minutes.
-  setInterval(refreshConnectionStatus, 120000);
+  // The sheet connection is checked only while someone is signed in. Before,
+  // it ran on the sign-in screen too: a visitor who was not a curator could
+  // be shown "the Apps Script needs upgrading" over the login card, and every
+  // idle tab left on that screen probed Google every two minutes for nobody.
+  let connectionTimer = null;
+  function watchConnection(on) {
+    if (on && !connectionTimer) {
+      refreshConnectionStatus();
+      connectionTimer = setInterval(refreshConnectionStatus, 120000);
+    } else if (!on && connectionTimer) {
+      clearInterval(connectionTimer);
+      connectionTimer = null;
+    }
+  }
 
   let started = false;
 
-  /** Removes the splash once we know whether anyone is signed in. */
-  function dismissBootScreen() {
+  /**
+   * Removes the splash once we know whether anyone is signed in.
+   *
+   * The fade is for arriving at the dashboard, where there is something
+   * underneath worth easing into. Over the sign-in gate it is the opposite:
+   * the splash fades to transparent with the gate already painted behind it,
+   * so for a quarter of a second "Restoring your session…" and "Questions
+   * Dashboard" are legible on top of each other, which reads as a broken page.
+   * There, the swap is instant.
+   *
+   * @param {boolean} [fade] false to remove it immediately
+   */
+  function dismissBootScreen(fade = true) {
     const boot = $('bootScreen');
     if (!boot) return;
+    if (!fade) { boot.remove(); return; }
     boot.classList.add('done');
     setTimeout(() => boot.remove(), 260);
   }
@@ -938,10 +1051,8 @@ export async function initDashboard({ page, onReady }) {
       /* What it brings: Revokes client access to signed API requests */
       /* Where changes can be seen: Client-side session state */
       currentUser = null;
-      /* What this line does: Resets started flag to false */
-      /* What it brings: Allows re-running initialization when user signs in */
-      /* Where changes can be seen: Re-executing page onReady callback upon login */
       started = false;
+      watchConnection(false);
       /* What this line does: Makes the authentication gate modal visible with flex centering */
       /* What it brings: Prompts visitor with sign-in controls */
       /* Where changes can be seen: Center of the screen */
@@ -968,17 +1079,15 @@ export async function initDashboard({ page, onReady }) {
       /* Where changes can be seen: Top right corner of header */
       const chip = $('userProfileChip');
       if (chip) chip.style.display = 'none';
-      /* What this line does: Dismisses the dark loading splash screen */
-      /* What it brings: Smooth transition to the login gate */
-      /* Where changes can be seen: Splash fade-out */
-      dismissBootScreen();
+      // Instant, not faded: the gate is already painted behind the splash.
+      dismissBootScreen(false);
       return;
     }
 
-    /* What this line does: Stores verified Firebase user session */
-    /* What it brings: Supplies auth tokens to all backend API calls */
-    /* Where changes can be seen: Active user credentials */
     currentUser = user;
+    // A fresh sign-in ends any earlier lapse, so the next one is reported.
+    lapsing = false;
+    watchConnection(true);
     /* What this line does: Hides the authentication gate modal */
     /* What it brings: Dismisses login card upon successful sign-in */
     /* Where changes can be seen: Center modal disappears */
@@ -1042,13 +1151,24 @@ export async function initDashboard({ page, onReady }) {
     try {
       await onReady(user);
     } catch (err) {
-      if (/allowlist|not verified|Sign in required|Server auth is not configured/i.test(err.message)) {
-        // A permissions problem, not a transient failure — say it once, clearly,
-        // and leave it on screen.
+      if (/allowlist|not verified/i.test(err.message)) {
+        // The identity is refused. Signing in again with the same account
+        // changes nothing, so this stays on screen and names the fix.
         showBanner('error', 'Signed in, but this account cannot use the dashboard.',
           err.message + ' Add the address to CURATOR_EMAILS in the server\u2019s .env file and restart it.');
+      } else if (/Server auth is not configured/i.test(err.message)) {
+        showBanner('error', 'The server is not set up for sign-in.',
+          err.message + ' Nobody can use the dashboard until that is done.');
+      } else if (/session has expired|Sign in required/i.test(err.message)) {
+        // Already handled: the gate is on its way back. Saying it twice would
+        // stack a toast on top of the sign-in card.
+        console.warn('[dashboard] init stopped: the session lapsed');
       } else {
         showToast('error', err.message, 10000);
+        // A transient failure — a slow sheet, a dropped connection — must not
+        // leave the page half-started for the rest of the session. Letting it
+        // run again means the next sign-in, or a token refresh, retries.
+        started = false;
       }
       console.error('[dashboard] init failed', err);
     }
@@ -1135,7 +1255,8 @@ export function pill(text, tone) {
 export function statusTone(status) {
   return {
     Approved: 'ok', Posted: 'info', Scheduled: 'warn',
-    Review: 'warn', Rejected: 'danger', Archived: 'muted', Draft: 'muted'
+    Review: 'warn', Rejected: 'danger', Archived: 'muted', Draft: 'muted',
+    Deleted: 'danger'
   }[status] || 'muted';
 }
 
