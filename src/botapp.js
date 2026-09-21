@@ -264,7 +264,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     esc(pass.description),
     ''
   ];
-  if (pass.validUntil) lines.push(`📅 Valid until <b>${esc(pass.validUntil)}</b>`);
+  if (pass.lifetime) {
+    lines.push('♾️ <b>Lifetime access</b> — pay once, never renew');
+  } else if (pass.validUntil) {
+    lines.push(`📅 Valid until <b>${esc(pass.validUntil)}</b>`);
+  }
   if (applied) {
     lines.push(applied.kind === 'referral'
       ? `🎁 Referral <b>${esc(applied.code)}</b> applied — ${esc(applied.label)}`
@@ -875,7 +879,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
             'into the other one, and forwarding it will not let anyone else in.</i>\n\n'
           : '<i>The invite is tied to your account — forwarding it will not let ' +
             'anyone else in.</i>\n\n') +
-    'You will get a reminder before your pass ends. Check /status any time.\n\n' +
+    (familyGroups().some((g) => { const p = pricing.currentPass(g.id, {}); return p && p.lifetime; })
+      ? 'Your pass is for life — you pay once and never renew. Check /status any time.\n\n'
+      : 'You will get a reminder before your pass ends. Check /status any time.\n\n') +
     'Trouble? Send /support, or just type your question here.' +
     (helpSettings && support.emailFallbackLine(helpSettings)
       ? '\n\n' + support.emailFallbackLine(helpSettings) : ''),
@@ -1077,7 +1083,17 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   try {
     // Buying the same fixed-date pass twice buys nothing: say so instead.
     const existing = await sheetFor(groupId).getSubscriber(user.id);
-    if (existing && existing.status === 'active') {
+
+    // Paying twice for a pass that never ends buys nothing at all.
+    if (existing && existing.status === 'active' && membership.isLifetimeSubscriber(existing)) {
+      await bot.sendMessage(user.id,
+        `✅ You already have <b>lifetime access</b> to <b>${esc(group.shortName)}</b>, so there is ` +
+        'nothing to buy — you paid once and that was it.\n\nSend /status for your invite button.',
+        { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (existing && existing.status === 'active' && !pass.lifetime) {
       const heldUntil = membership.parseIst(existing.expiry_date);
       const newUntil = pricing.endOfDayIst(pass.validUntil);
       // Stored expiries have whole seconds; the pass date ends at .999.
@@ -1097,7 +1113,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     await bot.sendMessage(user.id,
       `${esc(pass.emoji)} <b>${esc(pass.label)}</b>\n` +
       `for <b>${esc(group.shortName)}</b>\n\n` +
-      (pass.validUntil ? `📅 Valid until <b>${esc(pass.validUntil)}</b>\n` : '') +
+      (pass.lifetime
+        ? '♾️ <b>Lifetime access</b> — this is the only payment\n'
+        : (pass.validUntil ? `📅 Valid until <b>${esc(pass.validUntil)}</b>\n` : '')) +
       `💰 You pay <b>${pricing.rupees(amount)}</b>` +
       (applied ? ` (coupon ${esc(applied.code)}, you save ${pricing.rupees(applied.discountPaise)})` : '') +
       '\n\nTap below to pay. Your private invite arrives here the moment payment clears. ' +

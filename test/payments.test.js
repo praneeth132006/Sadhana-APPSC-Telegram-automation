@@ -33,6 +33,7 @@ process.env.LEGACY_GROUP_ID = '';
 
 const razorpay = require('../src/razorpay');
 const plans = require('../src/plans');
+const pricing = require('../src/pricing');
 
 // ===========================================================================
 // Plans and expiry arithmetic
@@ -69,12 +70,24 @@ test('a 30-day pass expires 30 days out', () => {
   assert.equal(Math.round((expiry - now) / 86400000), 30);
 });
 
-test('only the exam pass is sold, and the 5-minute test pass is gone', () => {
+/** The two groups that sell a lifetime pass; every other group sells the exam pass. */
+const LIFETIME_GROUPS = ['appsc_news_en', 'appsc_news_te'];
+
+test('the newspaper groups sell a lifetime pass and every other group the exam pass', () => {
   assert.equal(plans.getPlan('test_5min'), null);
 
   for (const group of groups.listGroups()) {
     const sold = groups.plansFor(group.id).map((p) => p.id);
-    assert.deepEqual(sold, ['exam_pass'], `${group.id} sells the wrong set`);
+    const onSale = pricing.passPlanIdFor(group.id);
+    if (LIFETIME_GROUPS.includes(group.id)) {
+      assert.equal(onSale, 'lifetime_pass', `${group.id} should be selling the lifetime pass`);
+      // exam_pass is still listed, not on sale: people who bought it before
+      // the change must keep resolving to a real plan.
+      assert.deepEqual(sold, ['exam_pass', 'lifetime_pass'], `${group.id} lists the wrong set`);
+    } else {
+      assert.equal(onSale, 'exam_pass', `${group.id} was changed, and was meant to be left alone`);
+      assert.deepEqual(sold, ['exam_pass'], `${group.id} sells the wrong set`);
+    }
   }
 });
 
@@ -93,10 +106,10 @@ test('retired passes are off sale but still found for the members who hold one',
   }
 });
 
-test('every group sells the exam pass at Rs 199', () => {
+test('every group\'s pass is Rs 199', () => {
   for (const group of groups.listGroups()) {
-    const priced = Object.fromEntries(groups.plansFor(group.id).map((p) => [p.id, p.amountPaise]));
-    assert.deepEqual(priced, { exam_pass: 19900 }, `${group.id} is not at Rs 199`);
+    const pass = pricing.currentPass(group.id, {});
+    assert.equal(pass.amountPaise, 19900, `${group.id} is not at Rs 199`);
   }
 });
 test('a timestamp survives a round trip whatever timezone the server is in', () => {
@@ -1332,5 +1345,75 @@ test('a payment naming a code that is not in the sheet credits nobody', async ()
     paybotModule.createJoinRequestInvite = originalInvite;
     paybotModule.sendDirectMessage = originalDm;
     console.error = originalError;
+  }
+});
+
+// ===========================================================================
+// A lifetime pass, paid for once
+// ===========================================================================
+
+test('paying for the newspaper lifetime pass grants access with no real end date', async () => {
+  const GROUP = 'appsc_news_en';
+
+  for (const key of Object.keys(require.cache)) {
+    if (/server\.js|membership\.js|sheets\.js|paybot\.js/.test(key)) delete require.cache[key];
+  }
+  const sheetsModule = require('../src/sheets');
+  const paybotModule = require('../src/paybot');
+  const membershipModule = require('../src/membership');
+  const serverModule = require('../server');
+  const plansModule = require('../src/plans');
+
+  const sheetRows = {};
+  const dms = [];
+  const originalForGroup = sheetsModule.forGroup;
+  const originalInvite = paybotModule.createJoinRequestInvite;
+  const originalDm = paybotModule.sendDirectMessage;
+
+  sheetsModule.forGroup = (groupId) => ({
+    groupId,
+    getSubscriber: async (id) => sheetRows[`${groupId}:${id}`] || null,
+    upsertSubscriber: async (row) => {
+      const saved = Object.assign({}, sheetRows[`${groupId}:${row.telegram_id}`], row);
+      sheetRows[`${groupId}:${row.telegram_id}`] = saved;
+      return saved;
+    }
+  });
+  paybotModule.createJoinRequestInvite = async () => 'https://t.me/+invite-for-one';
+  paybotModule.sendDirectMessage = async (botEnv, userId, text) => { dms.push({ userId, text }); };
+
+  try {
+    // What the bot puts in the link for a lifetime pass: a plan, and no
+    // valid_until — there is no date to promise.
+    const handled = await serverModule.handlePaymentEvent({
+      event: 'payment_link.paid',
+      payload: {
+        payment_link: { entity: { id: 'plink_life', notes: {
+          telegram_id: '90905', telegram_username: 'lifer', plan_id: 'lifetime_pass',
+          group_id: GROUP, plan_label: 'Lifetime Pass'
+        } } },
+        payment: { entity: { id: 'pay_life', amount: 19900 } }
+      }
+    });
+    assert.equal(handled.handled, true, handled.reason || 'the webhook did nothing');
+
+    const row = sheetRows[`${GROUP}:90905`];
+    assert.ok(row, 'nothing was written to the sheet');
+    assert.equal(row.status, 'active');
+    assert.equal(row.plan, 'lifetime_pass', 'the member was recorded against the wrong pass');
+    assert.equal(row.amount, 199);
+
+    const expiry = membershipModule.parseIst(row.expiry_date);
+    assert.ok(expiry, `expiry "${row.expiry_date}" could not be read back`);
+    assert.equal(expiry.getTime(), plansModule.LIFETIME_EXPIRY.getTime(),
+      'a lifetime pass was given a real end date');
+
+    // And the one thing that matters to the student: the sweep leaves them be.
+    assert.equal(membershipModule.isLifetimeSubscriber(row), true);
+    assert.equal(dms.length, 1, 'the student was never sent their invite');
+  } finally {
+    sheetsModule.forGroup = originalForGroup;
+    paybotModule.createJoinRequestInvite = originalInvite;
+    paybotModule.sendDirectMessage = originalDm;
   }
 });

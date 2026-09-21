@@ -2222,7 +2222,9 @@ test('GET /api/pricing shows the pass with admin overrides and each coupon\'s st
   const original = clientStubs.getBotSettings;
   clientStubs.getBotSettings = async () => ({ pass_name: 'Target APPSC 2026', pass_price: '249', pass_valid_until: '31-05-2099' });
   try {
-    const res = await authed('/api/pricing');
+    // A group whose pass has an end date. The newspaper groups sell a lifetime
+    // pass, where "valid until" is deliberately ignored — see the test below.
+    const res = await authed('/api/pricing?group=appsc_q_en');
     assert.equal(res.status, 200);
     const { pass, coupons, redemptions, passSettings } = res.json.data;
     assert.equal(pass.name, 'Target APPSC 2026');
@@ -3198,5 +3200,23 @@ test('a member over the threshold shows as due, with their payments listed', asy
     assert.deepEqual(due[0].paymentIds, ['pay_1', 'pay_2']);
   } finally {
     clientStubs.listReferralEarnings = original;
+  }
+});
+
+test('the Pass & Coupons page is told when a pass is lifetime, and has no end date to show', async () => {
+  // The newspaper groups (TEST_GROUP is one) sell a lifetime pass. Without
+  // `lifetime` the page would offer a "Valid until" box that does nothing.
+  const original = clientStubs.getBotSettings;
+  clientStubs.getBotSettings = async () => ({ pass_valid_until: '31-05-2099' });
+  try {
+    const news = await authed('/api/pricing');
+    assert.equal(news.json.data.pass.lifetime, true);
+    assert.equal(news.json.data.pass.validUntil, '', 'a stored end date leaked onto a lifetime pass');
+
+    const exam = await authed('/api/pricing?group=appsc_q_en');
+    assert.equal(exam.json.data.pass.lifetime, false);
+    assert.equal(exam.json.data.pass.validUntil, '31-05-2099');
+  } finally {
+    clientStubs.getBotSettings = original;
   }
 });

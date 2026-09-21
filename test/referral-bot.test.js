@@ -599,3 +599,107 @@ test('a code that cannot be used is not re-offered on every screen', async () =>
   const after = messages(STUDENT.id).slice(before).map((m) => m.args[1]).join('\n');
   assert.ok(!/could not be used/.test(after), 'the refusal was repeated on the next screen');
 });
+
+// ---------------------------------------------------------------------------
+// The lifetime pass, as a student sees it
+// ---------------------------------------------------------------------------
+
+test('the newspaper bot offers lifetime access, with no end date', async () => {
+  const { deliver, messages, groups } = makeNewsBot();
+  await deliver(tap(`pick:${groups[0].id}`, FRIEND));
+
+  const card = lastText(messages, FRIEND.id);
+  assert.match(card, /Lifetime access/);
+  assert.match(card, /pay once, never renew/);
+  assert.ok(!/Valid until/.test(card), 'a lifetime pass was shown an end date');
+});
+
+test('the other bots still show the exam pass and its end date', async () => {
+  // Deliberately the UPSC bot: the change is for the newspaper groups only.
+  const { deliver, messages } = makeBot();
+  await deliver(privateMessage('/plans', FRIEND));
+
+  const card = lastText(messages, FRIEND.id);
+  assert.match(card, /Valid until/, 'the UPSC pass lost its end date');
+  assert.ok(!/Lifetime/.test(card), 'the UPSC bot started offering lifetime access');
+});
+
+test('what reaches Razorpay for a lifetime pass names it, and carries no end date', async () => {
+  const { deliver, groups } = makeNewsBot();
+  const created = [];
+  const realCreate = razorpay.createPaymentLink;
+  razorpay.createPaymentLink = async (o) => { created.push(o); return { short_url: 'https://rzp.io/i/x' }; };
+  try {
+    await deliver(tap(`buy:${groups[0].id}:lifetime_pass`, FRIEND));
+  } finally {
+    razorpay.createPaymentLink = realCreate;
+  }
+
+  assert.equal(created.length, 1, 'no payment link was created');
+  assert.equal(created[0].plan.id, 'lifetime_pass');
+  assert.equal(created[0].plan.amountPaise, 19900);
+  // With no valid_until in the notes, the webhook falls back to the plan
+  // itself — which for a lifetime pass means no end.
+  assert.equal(created[0].extraNotes.valid_until, undefined);
+});
+
+test('an old exam-pass button in the newspaper bot is refused rather than sold', async () => {
+  // A tap on a message sent before the change must not sell the pass that is
+  // no longer on offer.
+  const { deliver, messages, groups } = makeNewsBot();
+  const created = [];
+  const realCreate = razorpay.createPaymentLink;
+  razorpay.createPaymentLink = async (o) => { created.push(o); return { short_url: 'x' }; };
+  try {
+    await deliver(tap(`buy:${groups[0].id}:exam_pass`, FRIEND));
+  } finally {
+    razorpay.createPaymentLink = realCreate;
+  }
+  assert.equal(created.length, 0, 'a retired exam-pass button still sold a pass');
+  assert.ok(messages(FRIEND.id).some((m) => /Lifetime access/.test(m.args[1])),
+    'the student was not shown what IS on sale');
+});
+
+test('someone who already has lifetime access is not charged again', async () => {
+  const { deliver, messages, groups } = makeNewsBot({
+    subscriber: { status: 'active', plan: 'lifetime_pass', plan_label: 'Lifetime Pass',
+      expiry_date: '31-12-2099, 11:59:59 PM IST', payment_id: 'pay_1' }
+  });
+  const created = [];
+  const realCreate = razorpay.createPaymentLink;
+  razorpay.createPaymentLink = async (o) => { created.push(o); return { short_url: 'x' }; };
+  try {
+    await deliver(tap(`buy:${groups[0].id}:lifetime_pass`, FRIEND));
+  } finally {
+    razorpay.createPaymentLink = realCreate;
+  }
+  assert.equal(created.length, 0, 'a lifetime member was sold a second lifetime pass');
+  assert.match(lastText(messages, FRIEND.id), /already have <b>lifetime access<\/b>/);
+});
+
+test('an exam-pass holder in the newspaper group can upgrade to lifetime', async () => {
+  // Their exam pass runs out on exam day. Lifetime is genuinely more, so this
+  // is a real purchase — the "you already own this" guard must not block it.
+  const { deliver, groups } = makeNewsBot({
+    subscriber: { status: 'active', plan: 'exam_pass', plan_label: 'Target 2026 Pass',
+      expiry_date: '30-11-2026, 11:59:59 PM IST', payment_id: 'pay_1' }
+  });
+  const created = [];
+  const realCreate = razorpay.createPaymentLink;
+  razorpay.createPaymentLink = async (o) => { created.push(o); return { short_url: 'x' }; };
+  try {
+    await deliver(tap(`buy:${groups[0].id}:lifetime_pass`, FRIEND));
+  } finally {
+    razorpay.createPaymentLink = realCreate;
+  }
+  assert.equal(created.length, 1, 'an exam-pass holder could not upgrade to lifetime');
+  assert.equal(created[0].plan.id, 'lifetime_pass');
+});
+
+test('/help in the newspaper bot does not promise an expiry reminder', async () => {
+  const { deliver, messages } = makeNewsBot();
+  await deliver(privateMessage('/help', FRIEND));
+  const text = lastText(messages, FRIEND.id);
+  assert.match(text, /for life/);
+  assert.ok(!/reminder before your pass ends/.test(text));
+});

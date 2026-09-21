@@ -2485,6 +2485,9 @@ async function handlePricingRoute(pathname, method, req, res, query, groupId, ac
       price: pass.amountPaise / 100,
       priceText: pricing.rupees(pass.amountPaise),
       validUntil: pass.validUntil,
+      // The page needs to know, or it offers a "Valid until" box that does
+      // nothing: a lifetime pass ignores any end date by design.
+      lifetime: pass.lifetime === true,
       description: pass.description,
       defaults: (() => {
         const base = pricing.currentPass(primary.id, {});

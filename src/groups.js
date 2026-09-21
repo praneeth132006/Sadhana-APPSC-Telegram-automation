@@ -233,8 +233,14 @@ function getPlanFor(groupId, planId, options = {}) {
     .find((p) => p.id === planId) || null;
 }
 
+/** Every pass definition, keyed by plan id. */
+function planShapes() {
+  return loadConfig().planShapes || {};
+}
+
 module.exports = {
   reset,
+  planShapes,
   listGroups,
   getGroup,
   requireGroup,

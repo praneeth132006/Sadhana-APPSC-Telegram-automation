@@ -273,6 +273,29 @@ row the poster is holding, are each named rather than being folded into a count:
 
 ---
 
+## What each group sells
+
+| Groups | Pass | Pay | Ends |
+|---|---|---|---|
+| **Newspaper · English, Newspaper · Telugu** | ♾️ Lifetime Pass | once | never |
+| Sadhana APPSC · English, Sadhana APPSC · Telugu, UPSC | 🎯 Target 2026 Pass | once | on exam day (`EXAM_PASS_END_DATE`) |
+
+Which pass a group sells is `passPlanId` in `groups.config.json`, defaulting to
+`exam_pass`. Only the two newspaper groups set it. The pass definitions are shared by
+every group, so changing what one group sells never touches another.
+
+A lifetime member is written with an expiry of 31-12-2099 — a real date, so every
+column that sorts, filters and parses Expiry Date keeps working — but the daily sweep
+does not rely on that date: it reads the pass they bought and never reminds or removes
+a lifetime member.
+
+**Members who bought the exam pass in a newspaper group before the change keep what
+they paid for:** it still ends on exam day, and they can upgrade to lifetime from the
+bot. Lifetime is decided by the pass a member bought, never by the group they are in,
+so nobody is upgraded for free by the group changing.
+
+---
+
 ## The bot: what people see
 
 Three things live on Telegram's servers rather than in this repository — the
@@ -827,7 +850,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-663 tests. The ones worth knowing about:
+688 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -884,7 +907,7 @@ npm test
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 663 tests
+└── test/                     # 688 tests
 ```
 
 ## Notes

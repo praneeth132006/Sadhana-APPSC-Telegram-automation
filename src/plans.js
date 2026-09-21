@@ -122,6 +122,12 @@ function parseExamDate() {
  * @returns {Date} The new expiry
  */
 function computeExpiry(plan, from = new Date(), currentExpiry = null) {
+  // A lifetime pass does not run out. It still needs a date — every sheet,
+  // sweep and sort in this system reads Expiry Date — so it gets one far
+  // enough out that nothing will ever reach it, and isLifetimePlan() is what
+  // the sweep checks rather than trusting the date alone.
+  if (isLifetimePlan(plan)) return new Date(LIFETIME_EXPIRY.getTime());
+
   if (plan.fixedEndDateEnv) {
     const examDate = parseExamDate();
     if (examDate) return examDate;
@@ -143,11 +149,25 @@ function computeExpiry(plan, from = new Date(), currentExpiry = null) {
  * @param {Date} [from] Treated as now
  * @returns {number}
  */
+/**
+ * The expiry written for a lifetime pass: the last moment of 31-12-2099 in
+ * India. A real date rather than a blank or a sentinel string, so the columns
+ * that sort, filter and parse Expiry Date keep working unchanged.
+ */
+const LIFETIME_EXPIRY = new Date(Date.UTC(2099, 11, 31, 23, 59, 59) - IST_OFFSET_MS);
+
+/** True for a pass that never expires. */
+function isLifetimePlan(plan) {
+  return Boolean(plan && plan.lifetime === true);
+}
+
 function daysUntil(date, from = new Date()) {
   return Math.ceil((date.getTime() - from.getTime()) / DAY_MS);
 }
 
 module.exports = {
+  LIFETIME_EXPIRY,
+  isLifetimePlan,
   PLANS,
   IST_OFFSET_MS,
   PLAN_ORDER,
