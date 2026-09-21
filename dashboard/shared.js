@@ -119,7 +119,7 @@ export const $ = (id) => document.getElementById(id);
  * @param {Array} [children] Child nodes or strings
  * @returns {HTMLElement}
  */
-export function el(tag, attrs = {}, children = []) {
+export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
 
   Object.entries(attrs).forEach(([key, value]) => {
@@ -132,7 +132,15 @@ export function el(tag, attrs = {}, children = []) {
     else node.setAttribute(key, value);
   });
 
-  (Array.isArray(children) ? children : [children]).forEach((child) => {
+  // Children may arrive as one array — el('tr', {}, [a, b]) — or as separate
+  // arguments — el('tr', {}, a, b). Both are accepted and flattened.
+  //
+  // Only the first form used to work, and the second failed silently: every
+  // child after the first was dropped without an error. The Referrals page was
+  // written in the second form, so its tables rendered a single header cell
+  // and no rows at all, and the Telegram ids under each name never appeared —
+  // which looked like a page with nothing to show rather than a broken one.
+  children.flat(Infinity).forEach((child) => {
     if (child === null || child === undefined || child === false) return;
     node.append(child instanceof Node ? child : document.createTextNode(String(child)));
   });

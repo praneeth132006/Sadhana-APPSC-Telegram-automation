@@ -662,13 +662,27 @@ async function unpostQuestions(ctx, subject, rowNumbers, status) {
 // through setValue(), which does interpret a leading "=".
 const REFERRAL_TAB = 'Referrals';
 const REFERRAL_HEADERS = [
-  'Code',           // A  REF + 6 characters, the primary key
-  'Telegram ID',    // B  Who owns it
-  'Username',       // C  @handle, may be blank
-  'Name',           // D  Display name from Telegram
-  'Status',         // E  active | disabled
-  'Created At',     // F  IST stamp
-  'Notes'           // G  Free text, for an admin
+  'Code',               // A  REF + 6 characters, the primary key
+  'Telegram ID',        // B  Who owns it
+  'Username',           // C  @handle, may be blank
+  'Name',               // D  Display name from Telegram
+  'Status',             // E  active | disabled
+  'Created At',         // F  IST stamp
+  'Notes',              // G  Free text, for an admin
+  // Everything below is a live summary, rewritten from the Referral Log every
+  // time something changes for this code. It is there so the sheet answers
+  // "who did this person bring in" on its own, without the dashboard.
+  'Share Link',         // H  The link they send
+  'Link Opens',         // I  How many different people opened it
+  'Opened By (IDs)',    // J  Their Telegram ids — including those who have not paid
+  'Joined',             // K  How many paid using the code
+  'Joined IDs',         // L  Telegram ids of everyone who joined
+  'Joined Usernames',   // M  Their @handles, in the same order
+  'Total Earned',       // N  Rupees, pending + paid
+  'Pending',            // O  Rupees owed and not yet paid out
+  'Paid Out',           // P  Rupees already sent
+  'Last Joined At',     // Q  IST stamp of the latest join
+  'Updated At'          // R  When this summary was last rewritten
 ];
 
 const REFERRAL_LOG_TAB = 'Referral Log';
@@ -688,22 +702,103 @@ const REFERRAL_LOG_HEADERS = [
   'Commission',          // M  Rupees earned by the inviter
   'Status',              // N  pending | paid | cancelled
   'Paid At',             // O  IST stamp, when the inviter was paid
-  'Notes'                // P
+  'Notes',               // P
+  'Referral ID',         // Q  RL-0001… — one per referred payment, for talking about it
+  'Referrer Name',       // R  The inviter's display name at the time
+  'Plan'                 // S  Which pass was bought
 ];
 
-/** Reads a tab, creating it with its headers the first time. */
+/** Column widths, so both tabs are readable the moment they are opened. */
+const REFERRAL_WIDTHS = [110, 120, 130, 150, 80, 170, 180, 300, 90, 220, 70, 220, 200, 110, 90, 90, 170, 170];
+const REFERRAL_LOG_WIDTHS = [170, 110, 120, 140, 120, 140, 150, 170, 190, 110, 90, 100, 100, 80, 170, 200, 100, 150, 120];
+
+/**
+ * readOrCreate — a referral tab's rows, making or upgrading the tab first.
+ *
+ * Three cases, all handled here so no caller has to think about them:
+ *   missing   → created, with headers and formatting
+ *   old       → its header row is extended in place with the columns added
+ *               since (they are only ever appended, so every existing row
+ *               stays valid), then formatted
+ *   current   → read as it is
+ *
+ * @returns {Promise<{rows: Array<Array>}>}
+ */
 async function readOrCreate(ctx, tab, headers) {
+  const widths = tab === REFERRAL_TAB ? REFERRAL_WIDTHS : REFERRAL_LOG_WIDTHS;
+  const range = encodeURIComponent(`${quoteTab(tab)}!A1:ZZ`);
+  let values;
   try {
-    return await readTab(ctx, tab);
+    const body = await call('GET', `/${ctx.spreadsheetId}/values/${range}?valueRenderOption=UNFORMATTED_VALUE`);
+    values = body.values || [];
   } catch (err) {
-    if (!/not found/i.test(err.message)) throw err;
+    if (!/Unable to parse range|not found/i.test(err.message)) throw err;
     await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
       requests: [{ addSheet: { properties: { title: tab, gridProperties: { frozenRowCount: 1 } } } }]
     });
-    await call('PUT',
-      `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}?valueInputOption=RAW`,
-      { values: [headers] });
-    return { map: headerMap(headers), rows: [] };
+    await writeHeaderRow(ctx, tab, headers);
+    await formatPlainTab(ctx, tab, headers.length, widths);
+    return { rows: [] };
+  }
+
+  const current = (values[0] || []).map((h) => String(h || '').trim());
+  if (current.length < headers.length || headers.some((h, i) => current[i] !== h)) {
+    await writeHeaderRow(ctx, tab, headers);
+    await formatPlainTab(ctx, tab, headers.length, widths);
+  }
+  return { rows: values.slice(1) };
+}
+
+/** Writes a tab's header row, exactly as given. */
+async function writeHeaderRow(ctx, tab, headers) {
+  await call('PUT',
+    `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}?valueInputOption=RAW`,
+    { values: [headers] });
+}
+
+/**
+ * formatPlainTab — the same look as every other tab in the workbook: a bold
+ * navy header row, frozen, and columns wide enough to read. Best effort — a
+ * formatting failure must never cost a referral being recorded.
+ */
+async function formatPlainTab(ctx, tab, columns, widths) {
+  try {
+    const sheetId = await sheetIdOf(ctx, tab);
+    const requests = [
+      {
+        updateSheetProperties: {
+          properties: { sheetId, gridProperties: { frozenRowCount: 1 } },
+          fields: 'gridProperties.frozenRowCount'
+        }
+      },
+      {
+        repeatCell: {
+          range: { sheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: columns },
+          cell: {
+            userEnteredFormat: {
+              backgroundColor: rgb(HEADER_BACKGROUND),
+              textFormat: { bold: true, foregroundColor: rgb(HEADER_FOREGROUND) },
+              verticalAlignment: 'MIDDLE',
+              horizontalAlignment: 'CENTER',
+              wrapStrategy: 'WRAP'
+            }
+          },
+          fields: BODY_FORMAT_FIELDS
+        }
+      }
+    ];
+    (widths || []).slice(0, columns).forEach((pixelSize, i) => {
+      requests.push({
+        updateDimensionProperties: {
+          range: { sheetId, dimension: 'COLUMNS', startIndex: i, endIndex: i + 1 },
+          properties: { pixelSize },
+          fields: 'pixelSize'
+        }
+      });
+    });
+    await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, { requests });
+  } catch (err) {
+    console.warn(`[sheets] could not format "${tab}": ${err.message}`);
   }
 }
 
@@ -718,7 +813,7 @@ function plainHeaderMap(headers) {
 function rowToObject(row, headers) {
   const out = {};
   headers.forEach((header, i) => {
-    const key = header.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    const key = header.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
     const value = row[i];
     out[key] = value === null || value === undefined ? '' : String(value).trim();
   });
@@ -792,6 +887,13 @@ async function createReferral(ctx, referral) {
   row[map['Status']] = 'active';
   row[map['Created At']] = istNow();
   row[map['Notes']] = '';
+  row[map['Share Link']] = String(referral.share_link || '');
+  row[map['Link Opens']] = 0;
+  row[map['Joined']] = 0;
+  row[map['Total Earned']] = 0;
+  row[map['Pending']] = 0;
+  row[map['Paid Out']] = 0;
+  row[map['Updated At']] = row[map['Created At']];
 
   await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
   await appendRows(ctx, REFERRAL_TAB, [row]);
@@ -838,7 +940,10 @@ async function listReferralEarnings(ctx, code) {
         commission_paise: Math.round(Number(o.commission || 0) * 100),
         status: (o.status || 'pending').toLowerCase(),
         paid_at: o.paid_at,
-        notes: o.notes
+        notes: o.notes,
+        referral_id: o.referral_id,
+        referrer_name: o.referrer_name,
+        plan: o.plan
       };
     })
     .filter((r) => r.code && (!wanted || r.code === wanted));
@@ -880,9 +985,13 @@ async function recordReferralEarning(ctx, earning) {
   put('Status', 'pending');
   put('Paid At', '');
   put('Notes', String(earning.notes || ''));
+  // A short id a person can say out loud: "RL-0007 has not been paid".
+  put('Referral ID', `RL-${String(existing.length + 1).padStart(4, '0')}`);
+  put('Referrer Name', String(earning.referrer_name || ''));
+  put('Plan', String(earning.plan || ''));
 
-  await readOrCreate(ctx, REFERRAL_LOG_TAB, REFERRAL_LOG_HEADERS);
   await appendRows(ctx, REFERRAL_LOG_TAB, [row]);
+  await refreshReferralSummary(ctx, earning.code);
   return { recorded: true, commission_paise: Number(earning.commission_paise) || 0 };
 }
 
@@ -923,7 +1032,129 @@ async function settleReferralEarnings(ctx, code, paymentIds, note) {
   });
 
   await writeCells(ctx, cells);
+  if (settled) await refreshReferralSummary(ctx, wanted);
   return { settled, paise };
+}
+
+/**
+ * refreshReferralSummary — rewrites one code's summary columns from the log.
+ *
+ * Worked out again from every log row each time, never incremented. An
+ * increment is right until the first retried webhook or a row an admin edits
+ * by hand, and then silently wrong for ever after; a rebuild cannot drift.
+ *
+ * Best effort: the payment or the payout it follows is already recorded in
+ * the log, which is the source of truth. A summary that fails to update is
+ * repaired by the next change for that code, or by rebuildReferralSummaries.
+ */
+async function refreshReferralSummary(ctx, code) {
+  const wanted = String(code || '').trim().toUpperCase();
+  if (!wanted) return false;
+  try {
+    const { rows } = await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+    const index = rows.findIndex((r) => String(r[0] || '').trim().toUpperCase() === wanted);
+    if (index === -1) return false;
+
+    const earnings = await listReferralEarnings(ctx, wanted);
+    await writeCells(ctx, summaryCells(index + 2, earnings));
+    return true;
+  } catch (err) {
+    console.warn(`[sheets] could not refresh the referral summary for ${wanted}: ${err.message}`);
+    return false;
+  }
+}
+
+/** The summary cells for one Referrals row, from that code's earnings. */
+function summaryCells(sheetRow, earnings) {
+  const map = plainHeaderMap(REFERRAL_HEADERS);
+  const counted = earnings.filter((e) => e.status !== 'cancelled');
+  const rupees = (paise) => Math.round(paise) / 100;
+  const pending = counted.filter((e) => e.status !== 'paid').reduce((sum, e) => sum + e.commission_paise, 0);
+  const paid = counted.filter((e) => e.status === 'paid').reduce((sum, e) => sum + e.commission_paise, 0);
+  const cell = (header, value) => ({ tab: REFERRAL_TAB, row: sheetRow, col: map[header] + 1, value });
+
+  return [
+    cell('Joined', counted.length),
+    cell('Joined IDs', counted.map((e) => e.referred_telegram_id).filter(Boolean).join(', ')),
+    cell('Joined Usernames', counted.map((e) => (e.referred_username ? '@' + e.referred_username : '—')).join(', ')),
+    cell('Total Earned', rupees(pending + paid)),
+    cell('Pending', rupees(pending)),
+    cell('Paid Out', rupees(paid)),
+    cell('Last Joined At', counted.length ? counted[counted.length - 1].timestamp : ''),
+    cell('Updated At', istNow())
+  ];
+}
+
+/**
+ * recordReferralOpen — someone opened a share link, whether or not they pay.
+ *
+ * Kept as a list of distinct Telegram ids rather than a counter, so the same
+ * person tapping the link five times is one open, and so an inviter can be
+ * told how many people looked as well as how many joined.
+ *
+ * @returns {Promise<{recorded: boolean, opens: number}>}
+ */
+async function recordReferralOpen(ctx, code, telegramId) {
+  const wanted = String(code || '').trim().toUpperCase();
+  const id = String(telegramId || '').trim();
+  if (!wanted || !id) return { recorded: false, opens: 0 };
+
+  const map = plainHeaderMap(REFERRAL_HEADERS);
+  const { rows } = await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+  const index = rows.findIndex((r) => String(r[0] || '').trim().toUpperCase() === wanted);
+  if (index === -1) return { recorded: false, opens: 0 };
+
+  // The owner opening their own link is not a visitor.
+  if (String(rows[index][map['Telegram ID']] || '').trim() === id) return { recorded: false, opens: 0 };
+
+  const seen = String(rows[index][map['Opened By (IDs)']] || '')
+    .split(',').map((x) => x.trim()).filter(Boolean);
+  if (seen.includes(id)) return { recorded: false, opens: seen.length };
+
+  seen.push(id);
+  const n = index + 2;
+  await writeCells(ctx, [
+    { tab: REFERRAL_TAB, row: n, col: map['Opened By (IDs)'] + 1, value: seen.join(', ') },
+    { tab: REFERRAL_TAB, row: n, col: map['Link Opens'] + 1, value: seen.length }
+  ]);
+  return { recorded: true, opens: seen.length };
+}
+
+/**
+ * rebuildReferralSummaries — every code's summary, from the log.
+ *
+ * For rows made before the summary columns existed, and as the repair for any
+ * summary a failed update left behind. Safe to run any time: it only ever
+ * rewrites the summary columns, never a code, an owner or a payment.
+ */
+async function rebuildReferralSummaries(ctx, options = {}) {
+  const { rows } = await readOrCreate(ctx, REFERRAL_TAB, REFERRAL_HEADERS);
+  await readOrCreate(ctx, REFERRAL_LOG_TAB, REFERRAL_LOG_HEADERS);
+  const earnings = await listReferralEarnings(ctx);
+  const map = plainHeaderMap(REFERRAL_HEADERS);
+  const bot = String(options.botUsername || '').replace(/^@/, '').trim();
+
+  const cells = [];
+  let rebuilt = 0;
+  rows.forEach((row, i) => {
+    const code = String(row[0] || '').trim().toUpperCase();
+    if (!code) return;
+    cells.push(...summaryCells(i + 2, earnings.filter((e) => e.code === code)));
+    // Codes made before the Share Link column existed have it blank. Filled
+    // in, never overwritten: a link already there is the one the member sent.
+    if (bot && !String(row[map['Share Link']] || '').trim()) {
+      cells.push({ tab: REFERRAL_TAB, row: i + 2, col: map['Share Link'] + 1,
+        value: `https://t.me/${bot}?start=ref_${code}` });
+    }
+    // Same for the open count: a blank reads as "unknown", a 0 as "none yet".
+    if (String(row[map['Link Opens']] ?? '').trim() === '') {
+      const seen = String(row[map['Opened By (IDs)']] || '').split(',').map((x) => x.trim()).filter(Boolean);
+      cells.push({ tab: REFERRAL_TAB, row: i + 2, col: map['Link Opens'] + 1, value: seen.length });
+    }
+    rebuilt++;
+  });
+  await writeCells(ctx, cells);
+  return { rebuilt };
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,14 +1783,16 @@ const DIRECT = {
   holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions, markDeleted,
   scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions,
   listReferrals, getReferral, getReferralFor, createReferral, setReferralStatus,
-  listReferralEarnings, recordReferralEarning, settleReferralEarnings
+  listReferralEarnings, recordReferralEarning, settleReferralEarnings,
+  recordReferralOpen, rebuildReferralSummaries
 };
 
 /** Operations that change the sheet (they clear the Apps Script read cache). */
 const WRITES = new Set(['claimQuestions', 'releaseQuestions', 'markAsPosted', 'holdQuestions',
   'recoverStaleClaims', 'unpostQuestions', 'addQuestions', 'markDeleted',
   'scheduleQuestions', 'unscheduleQuestions', 'bulkStatus', 'formatQuestions',
-  'createReferral', 'setReferralStatus', 'recordReferralEarning', 'settleReferralEarnings']);
+  'createReferral', 'setReferralStatus', 'recordReferralEarning', 'settleReferralEarnings',
+  'recordReferralOpen', 'rebuildReferralSummaries']);
 
 module.exports = {
   DIRECT,

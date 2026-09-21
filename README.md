@@ -296,6 +296,13 @@ so nobody is upgraded for free by the group changing.
 
 ---
 
+## Tabs that are not subjects
+
+A group's workbook holds question tabs and tabs that are nothing of the kind — Config,
+Subscribers, Support, Coupons, Referrals. `src/sheet-tabs.js` names the second kind and the
+server filters them out of Analytics itself, so a new tab never shows up as a paused subject
+at 0% again, and fixing it never needs the Apps Script pasted into five sheets.
+
 ## The bot: what people see
 
 Three things live on Telegram's servers rather than in this repository — the
@@ -380,15 +387,38 @@ Referrals page, which records that they did.
 
 **Where it all lives**
 
-Two tabs on the family's primary sheet, created on first use:
+Two tabs on the family's primary sheet, created on first use and upgraded in place when
+columns are added (new ones only ever go on the end, so no existing row moves):
 
-- **Referrals** — one row per member: their code, who they are, whether it is active.
-- **Referral Log** — one row per referred payment: who invited whom (by Telegram id,
-  which cannot be changed the way a handle can), what was paid, what was taken off,
-  what was earned, and whether it has been paid out.
+**Referrals** — one row per member with a code. Besides who they are, every row carries a
+live summary rebuilt from the log whenever anything changes for that code:
 
-The **Referrals** dashboard page shows all of it: who joined using whose code, what is
-owed to each member, and totals. Everything is searchable by code, name or Telegram id.
+| Column | What it holds |
+|---|---|
+| Code, Telegram ID, Username, Name | who owns the code |
+| Share Link | the link they send |
+| Link Opens, Opened By (IDs) | every different person who opened it — including those who never paid |
+| Joined, Joined IDs, Joined Usernames | everyone who paid using it |
+| Total Earned, Pending, Paid Out | what it has earned, owes, and has paid |
+| Last Joined At, Updated At | when |
+
+**Referral Log** — one row per referred payment: a short referral id (`RL-0001`), who invited
+(id, username, name), who joined (id, username, name), the group and pass, the Razorpay
+payment id, the original price, discount, amount paid, commission, and payout status.
+
+The summary is always worked out again from the log, never incremented, so a retried webhook
+or a hand-edited row cannot leave it drifting. **🔁 Rebuild sheet** on the Referrals page
+rewrites every summary on demand and fills in any blank share links.
+
+The **Referrals** page shows the same, with detail: every referrer is a row that opens into
+everyone who joined through them — name, username, Telegram ID, group, pass, date, amounts,
+payment ID — and everyone who opened their link, marked joined or not. Filter by status,
+group or anything searchable; **⬇ Export CSV** downloads every referral with both sides' ids.
+
+In the bot, referrals are their own section — **🎁 My referral** on the welcome screen and
+`/referral` — rather than a button under Pay. The card shows the code to tap-copy, how many
+opened the link, who joined (first names only; another member's id is never shown), what
+is owed, and how far there is to go before they can claim.
 
 The percentages and the payout threshold are editable on **Pass & Coupons** without a
 deploy, and referrals can be switched off there entirely.
@@ -866,7 +896,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-699 tests. The ones worth knowing about:
+729 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -875,6 +905,9 @@ npm test
   failures ask for a new token and which do not, and surviving a Google outage.
 - `test/dashboard-auth.test.mjs` — the browser's `api()` loaded for real with Firebase
   stubbed, so the token refresh and the lapsed-session path actually run.
+- `test/referrals-page.test.mjs` — the real Referrals page rendered against a fake DOM, and
+  read back: rows, Telegram ids, the drill-down. Written after that page shipped showing
+  headers and nothing else.
 - `test/apps-script.test.js` — the Apps Script logic in a sandboxed Google runtime:
   header resolution, the migration, duplicate detection, filtering and the runway math.
 - `test/host-authorisation.test.js` — the Firebase authorised-domain matching rule,
@@ -921,10 +954,11 @@ npm test
 │   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
 │   ├── referrals.js          # referral codes, discounts, commission and payouts
 │   ├── bot-commands.js       # the one command menu and description every bot uses
+│   ├── sheet-tabs.js         # which workbook tabs are subjects and which are not
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 699 tests
+└── test/                     # 729 tests
 ```
 
 ## Notes

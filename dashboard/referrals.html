@@ -4,12 +4,33 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Referrals — Sadhana APPSC</title>
-  <meta name="description" content="Who invited whom, what each referral earned, what is owed to each member, and marking payouts as made.">
+  <meta name="description" content="Every referral code, who opened it, who joined using it, what each join was worth, what is owed, and marking payouts as made.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="shared.css">
+  <style>
+    .ref-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .ref-filters .field-input, .ref-filters .field-select { max-width: 240px; }
+    .ref-row { cursor: pointer; }
+    .ref-row:hover td { background: var(--surface-hover, rgba(255,255,255,0.03)); }
+    .ref-row .chev { display: inline-block; width: 1em; transition: transform 150ms ease; color: var(--text-muted); }
+    .ref-row.open .chev { transform: rotate(90deg); }
+    .ref-detail td { background: var(--surface-sunken, rgba(0,0,0,0.25)); padding: 16px 20px; }
+    .ref-detail h4 { margin: 4px 0 10px; font-size: 13px; letter-spacing: .02em; }
+    .ref-detail .data-table { margin-bottom: 18px; }
+    .ref-id { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    .ref-copy { margin-left: 6px; padding: 1px 6px; font-size: 11px; cursor: pointer; border-radius: 4px;
+      border: 1px solid var(--border-subtle, #333); background: transparent; color: var(--text-muted, #999); }
+    .ref-copy:hover { color: var(--text, #fff); }
+    .ref-sub { color: var(--text-muted, #999); font-size: 12px; }
+    .ref-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .ref-chip { font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 3px 8px; border-radius: 999px;
+      border: 1px solid var(--border-subtle, #333); }
+    .ref-chip.joined { border-color: #2e7d32; color: #81c784; }
+    @media (max-width: 720px) { .ref-filters .field-input, .ref-filters .field-select { max-width: 100%; flex: 1 1 100%; } }
+  </style>
 </head>
 <body>
   <div class="app-container">
@@ -18,12 +39,14 @@
         <div>
           <h1 class="page-title">Referrals</h1>
           <p class="page-subtitle">
-            Who invited whom, what each join was worth, what is still owed, and marking a
-            payout as made once you have actually sent the money.
+            Every referral code, who opened it, who joined using it, what each join was worth,
+            what is still owed — and marking a payout as made once you have sent the money.
           </p>
         </div>
         <div class="page-actions">
           <span id="schemeBadge" class="hint-text"></span>
+          <button id="exportBtn" class="btn btn-ghost" title="Download every referral as a spreadsheet">⬇ Export CSV</button>
+          <button id="rebuildBtn" class="btn btn-ghost" title="Bring the Referrals tab in the sheet up to date">🔁 Rebuild sheet</button>
           <button id="refreshBtn" class="btn btn-primary">Refresh</button>
         </div>
       </div>
@@ -34,39 +57,56 @@
         <div class="panel-head">
           <div>
             <h2 class="panel-title">Owed right now</h2>
-            <p class="panel-subtitle">Members with earnings waiting to be paid, largest first</p>
+            <p class="panel-subtitle">Members who have reached the payout amount, largest first</p>
           </div>
         </div>
-        <div class="panel-body tight">
-          <div id="dueArea" class="table-wrap"></div>
-        </div>
+        <div class="panel-body tight"><div id="dueArea" class="table-wrap"></div></div>
       </section>
 
       <section class="panel">
         <div class="panel-head">
           <div>
-            <h2 class="panel-title">Who joined using whose code</h2>
-            <p class="panel-subtitle">One row per referred payment, newest first</p>
-          </div>
-          <div class="page-actions">
-            <input id="search" class="field-input" type="search" style="max-width:260px"
-                   placeholder="Code, name or Telegram ID" aria-label="Filter referrals">
+            <h2 class="panel-title">Every referrer</h2>
+            <p class="panel-subtitle">Click a row to see everyone who opened and joined through that code</p>
           </div>
         </div>
-        <div class="panel-body tight">
-          <div id="joinsArea" class="table-wrap"></div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <div>
-            <h2 class="panel-title">Every referral code</h2>
-            <p class="panel-subtitle">Each member's code, how many it has brought in and what it has earned</p>
+        <div class="panel-body">
+          <div class="ref-filters" style="margin-bottom:12px">
+            <input id="codeSearch" class="field-input" type="search"
+                   placeholder="Code, name, @username or Telegram ID" aria-label="Filter referrers">
+            <select id="codeFilter" class="field-select" aria-label="Which referrers">
+              <option value="all">All codes</option>
+              <option value="joined">Brought someone in</option>
+              <option value="owed">Money owed</option>
+              <option value="payable">Ready to pay out</option>
+              <option value="none">Nobody joined yet</option>
+              <option value="disabled">Disabled</option>
+            </select>
           </div>
-        </div>
-        <div class="panel-body tight">
           <div id="codesArea" class="table-wrap"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="panel-title">Every referred payment</h2>
+            <p class="panel-subtitle">Who joined using whose code, one row per payment, newest first</p>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="ref-filters" style="margin-bottom:12px">
+            <input id="joinSearch" class="field-input" type="search"
+                   placeholder="Code, name, @username, ID or payment ID" aria-label="Filter payments">
+            <select id="joinStatus" class="field-select" aria-label="Payout status">
+              <option value="all">Any status</option>
+              <option value="pending">Pending</option>
+              <option value="paid">Paid</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+            <select id="joinGroup" class="field-select" aria-label="Group"><option value="all">Any group</option></select>
+          </div>
+          <div id="joinsArea" class="table-wrap"></div>
         </div>
       </section>
 

@@ -54,7 +54,8 @@ function sheetRowOf(q) {
 }
 const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions', 'markDeleted',
   'listReferrals', 'getReferral', 'getReferralFor', 'createReferral', 'setReferralStatus',
-  'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings'];
+  'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings',
+  'recordReferralOpen', 'rebuildReferralSummaries'];
 
 /**
  * Operations that exist only on the Sheets API route.
@@ -67,7 +68,8 @@ const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpos
  * five calls deeper.
  */
 const DIRECT_ONLY = new Set(['listReferrals', 'getReferral', 'getReferralFor', 'createReferral',
-  'setReferralStatus', 'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings']);
+  'setReferralStatus', 'listReferralEarnings', 'recordReferralEarning', 'settleReferralEarnings',
+  'recordReferralOpen', 'rebuildReferralSummaries']);
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
