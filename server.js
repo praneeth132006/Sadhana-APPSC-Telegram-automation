@@ -39,6 +39,7 @@ const botapp = require('./src/botapp');
 const support = require('./src/support');
 const pricing = require('./src/pricing');
 const referrals = require('./src/referrals');
+const sheetTabs = require('./src/sheet-tabs');
 const autopilotFactory = require('./src/autopilot');
 
 // ---------------------------------------------------------------------------
@@ -711,6 +712,8 @@ async function recordReferralEarning(notes, paymentId, paidPaise) {
       code,
       referrer_telegram_id: referral.telegram_id,
       referrer_username: referral.username,
+      referrer_name: referral.name,
+      plan: notes.plan_id || '',
       referred_telegram_id: notes.telegram_id,
       referred_username: notes.telegram_username || '',
       referred_name: notes.telegram_name || '',
@@ -2834,12 +2837,12 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
 
   // ---- Analytics -----------------------------------------------------------
   if (pathname === '/api/analytics' && method === 'GET') {
-    sendJSON(res, 200, { success: true, data: await db.getAnalytics() });
+    sendJSON(res, 200, { success: true, data: sheetTabs.cleanAnalytics(await db.getAnalytics()) });
     return true;
   }
 
   if (pathname === '/api/stats' && method === 'GET') {
-    sendJSON(res, 200, { success: true, data: await db.getStats() });
+    sendJSON(res, 200, { success: true, data: sheetTabs.cleanStats(await db.getStats()) });
     return true;
   }
 
@@ -3209,6 +3212,8 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     const byCode = codes.map((code) => {
       const mine = earnings.filter((e) => e.code === String(code.code).toUpperCase());
       const stats = referrals.summarise(mine, settings);
+      const joinedIds = new Set(mine.filter((e) => e.status !== 'cancelled').map((e) => String(e.referred_telegram_id)));
+      const openedBy = String(code.opened_by_ids || '').split(',').map((x) => x.trim()).filter(Boolean);
       return {
         code: code.code,
         telegramId: code.telegram_id,
@@ -3216,11 +3221,35 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
         name: code.name,
         status: code.status || 'active',
         createdAt: code.created_at,
+        shareLink: code.share_link || '',
         joined: stats.joined,
         pendingPaise: stats.pendingPaise,
         paidPaise: stats.paidPaise,
         totalPaise: stats.totalPaise,
-        payable: stats.payable
+        payable: stats.payable,
+        lastJoinedAt: mine.length ? mine[mine.length - 1].timestamp : '',
+        // Who looked, and which of them went on to pay — the answer to "is
+        // this person's link working, or just not being shared?"
+        linkOpens: openedBy.length,
+        openedBy: openedBy.map((id) => ({ telegramId: id, joined: joinedIds.has(id) })),
+        // Every person this code brought in, oldest first, with everything the
+        // sheet knows about them.
+        joins: mine.map((e) => ({
+          referralId: e.referral_id,
+          at: e.timestamp,
+          telegramId: e.referred_telegram_id,
+          username: e.referred_username,
+          name: e.referred_name,
+          group: e.group,
+          plan: e.plan,
+          paymentId: e.payment_id,
+          originalPaise: e.original_paise,
+          discountPaise: e.discount_paise,
+          paidPaise: e.paid_paise,
+          commissionPaise: e.commission_paise,
+          status: e.status,
+          paidAt: e.paid_at
+        }))
       };
     });
     byCode.sort((a, b) => b.pendingPaise - a.pendingPaise || b.joined - a.joined);
@@ -3234,6 +3263,8 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       else acc.pendingPaise += e.commission_paise;
       return acc;
     }, { joined: 0, revenuePaise: 0, discountPaise: 0, pendingPaise: 0, paidPaise: 0 });
+    totals.linkOpens = byCode.reduce((sum, c) => sum + c.linkOpens, 0);
+    totals.activeReferrers = byCode.filter((c) => c.joined > 0).length;
 
     sendJSON(res, 200, {
       success: true,
@@ -3284,6 +3315,27 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
       message: result.settled
         ? `${result.settled} earning(s) marked paid for ${code} (₹${(result.paise / 100).toFixed(2)}).`
         : `Nothing was pending for ${code}.`
+    });
+    return true;
+  }
+
+  // Rewrites every code's summary columns in the Referrals tab from the log.
+  // For rows made before those columns existed, and as the repair for any
+  // summary a failed write left behind. It only ever touches the summaries —
+  // never a code, an owner or a payment.
+  if (pathname === '/api/referrals/rebuild' && method === 'POST') {
+    let botUsername = '';
+    try {
+      botUsername = await paymentBotUsername(groupRegistry.requireGroup(groupId).paymentBotEnv) || '';
+    } catch (err) {
+      // Without it the summaries are still rebuilt; only blank share links stay blank.
+    }
+    const result = await referralSheetFor(groupId).rebuildReferralSummaries({ botUsername });
+    console.log(`[referrals] ${actor} rebuilt ${result.rebuilt} referral summary row(s)`);
+    sendJSON(res, 200, {
+      success: true,
+      rebuilt: result.rebuilt,
+      message: `${result.rebuilt} referrer row(s) in the sheet brought up to date.`
     });
     return true;
   }

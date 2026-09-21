@@ -35,6 +35,7 @@ const groupRegistry = require('./groups');
 const support = require('./support');
 const pricing = require('./pricing');
 const referrals = require('./referrals');
+const botCommands = require('./bot-commands');
 
 /**
  * createPaymentBot — builds one family's bot with all its handlers attached.
@@ -128,9 +129,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * shown before anyone presses Start) by `npm run bot-profile`, so the first
    * thing a stranger reads and the first thing /about says do not drift apart.
    */
-  const ABOUT_TEXT =
-    'Join our APPSC prep group via this bot. Get daily practice questions from ' +
-    'Eenadu, Sakshi &amp; Nipuna in poll format. Available in both Telugu and English mediums.';
+  // From src/bot-commands.js, so /about and the Telegram description screen can
+  // no longer drift apart. Escaped here because this one is sent as HTML.
+  const ABOUT_TEXT = esc(botCommands.ABOUT);
 
   /** The family's name, for the top of a greeting. */
   function botDisplayName() {
@@ -301,8 +302,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       applied
         ? [{ text: applied.kind === 'referral' ? '✖️ Remove referral' : '✖️ Remove coupon',
              callback_data: `plain:${group.id}` }]
-        : [{ text: '🎟 Apply coupon code', callback_data: `cpn:${group.id}` }],
-      [{ text: '🎁 Invite a friend, earn 20%', callback_data: 'ref:card' }]
+        : [{ text: '🎟 Apply coupon code', callback_data: `cpn:${group.id}` }]
+      // Referrals are not here any more. They have their own section — the
+      // 🎁 button on the welcome screen and /referral — because tucked under
+      // a Pay button they read as part of buying, and members could not find
+      // their own code again afterwards.
     ]
   };
   }
@@ -452,6 +456,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // Telugu one has one code and one balance, not two of each — splitting them
   // would mean neither half ever reached a payout.
 
+  /** How many recent joins the /referral card lists before summarising the rest. */
+  const REFERRAL_CARD_JOINS = 10;
+
   /** Guessing a code is guessing at someone else's discount. */
   const allowReferralCheck = support.createThrottle({ limit: 8, windowMs: 10 * 60 * 1000 });
 
@@ -489,11 +496,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // is retried rather than reasoned about.
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
+      const code = referrals.generateCode();
       return await sheet.createReferral({
         telegram_id: String(user.id),
         username: user.username || '',
         name: [user.first_name, user.last_name].filter(Boolean).join(' '),
-        code: referrals.generateCode()
+        code,
+        share_link: referrals.shareLink(await myUsername(), code)
       });
     } catch (err) {
       if (!err.codeTaken) throw err;
@@ -635,29 +644,50 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   const stats = referrals.summarise(earnings, settings);
   const link = referrals.shareLink(await myUsername(), record.code);
+  const opens = Number(record.link_opens) || 0;
+  const joins = earnings.filter((e) => e.status !== 'cancelled');
 
   const lines = [
-    '🎁 <b>Invite a friend</b>',
+    '🎁 <b>Your referral</b>',
     '',
-    `Your code: <code>${esc(record.code)}</code>`,
+    // <code> is tap-to-copy in Telegram, which is the whole point of showing it.
+    `🔑 Your code: <code>${esc(record.code)}</code>  <i>(tap to copy)</i>`,
     '',
-    `They get <b>${config.discountPercent}% off</b> their first pass.`,
-    `You earn <b>${config.commissionPercent}%</b> of what they pay.`,
+    `Friends get <b>${config.discountPercent}% off</b>. You earn <b>${config.commissionPercent}%</b> of what they pay.`,
     '',
+    '<b>📊 Your numbers</b>',
+    `👀 Opened your link: <b>${opens}</b>`,
     `👥 Joined using your code: <b>${stats.joined}</b>`,
     `💰 Earned so far: <b>${pricing.rupees(stats.totalPaise)}</b>`,
     `⏳ Waiting to be paid: <b>${pricing.rupees(stats.pendingPaise)}</b>`,
-    `✅ Already paid to you: <b>${pricing.rupees(stats.paidPaise)}</b>`,
-    ''
+    `✅ Already paid to you: <b>${pricing.rupees(stats.paidPaise)}</b>`
   ];
 
+  // Who joined, newest first. First names only: this is somebody else's
+  // account, and the member needs to recognise their friend, not see their
+  // Telegram id. The admin sees everything in the sheet and the dashboard.
+  if (joins.length) {
+    lines.push('', '<b>🧾 Who joined</b>');
+    joins.slice().reverse().slice(0, REFERRAL_CARD_JOINS).forEach((e, i) => {
+      const who = String(e.referred_name || '').split(/\s+/)[0] || 'A friend';
+      const day = String(e.timestamp || '').slice(0, 10);
+      const paid = e.status === 'paid' ? '✅ paid' : '⏳ pending';
+      lines.push(`${i + 1}. ${esc(who)} · ${esc(day)} · ${pricing.rupees(e.commission_paise)} ${paid}`);
+    });
+    if (joins.length > REFERRAL_CARD_JOINS) {
+      lines.push(`<i>…and ${joins.length - REFERRAL_CARD_JOINS} more.</i>`);
+    }
+  }
+
+  lines.push('');
   lines.push(stats.payable
-    ? `🎉 You have reached ${pricing.rupees(stats.thresholdPaise)} — tap below and an admin will arrange your payout.`
-    : `Payouts are made once you reach <b>${pricing.rupees(stats.thresholdPaise)}</b>, ` +
-      'or in the monthly run, whichever comes first.');
+    ? `🎉 You have reached <b>${pricing.rupees(stats.thresholdPaise)}</b> — tap <b>Claim</b> below and an admin will pay you.`
+    : `💸 You can claim once you reach <b>${pricing.rupees(stats.thresholdPaise)}</b> ` +
+      `(${pricing.rupees(Math.max(0, stats.thresholdPaise - stats.pendingPaise))} to go), ` +
+      'or you are paid in the monthly run.');
 
   if (link) {
-    lines.push('', 'Share this link — the code is applied for them automatically:', `${esc(link)}`);
+    lines.push('', '🔗 <b>Your link</b> — the code is applied for them automatically:', esc(link));
   }
 
   const keyboard = { inline_keyboard: [] };
@@ -670,9 +700,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }]);
   }
   if (stats.payable) {
-    keyboard.inline_keyboard.push([{ text: '💸 Request my payout', callback_data: 'ref:payout' }]);
+    keyboard.inline_keyboard.push([{ text: `💸 Claim ${pricing.rupees(stats.pendingPaise)}`, callback_data: 'ref:payout' }]);
   }
-  keyboard.inline_keyboard.push([{ text: '🆘 Support', callback_data: 'sup:menu' }]);
+  keyboard.inline_keyboard.push([
+    { text: '🔄 Refresh', callback_data: 'ref:card' },
+    { text: '🆘 Support', callback_data: 'sup:menu' }
+  ]);
 
   await bot.sendMessage(chatId, lines.join('\n'), {
     parse_mode: 'HTML',
@@ -776,7 +809,19 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // anything else, is what makes the link do its job: the student never has to
   // type a code, and the discount is already on the pass when they see it.
   const invited = referrals.codeFromStartPayload(match && match[1]);
-  if (invited) pendingReferral.set(String(msg.from.id), { code: invited, at: Date.now() });
+  if (invited) {
+    pendingReferral.set(String(msg.from.id), { code: invited, at: Date.now() });
+    // So an inviter can see how many people looked, not just how many paid.
+    // Never awaited on the greeting's path: a slow sheet must not be why
+    // someone who followed a friend's link waits for a reply.
+    //
+    // Started inside a promise so that anything which throws on the spot — an
+    // unreachable sheet client, a group that is not set up — becomes a logged
+    // rejection instead of an exception that takes the whole welcome with it.
+    Promise.resolve()
+      .then(() => referralSheet().recordReferralOpen(invited, msg.from.id))
+      .catch((err) => console.error(`[bot] ${payBotEnv}: could not record a referral open — ${err.message}`));
+  }
 
   // Bounded: a slow sheet must never hold up the greeting.
   const settings = await settingsWithin(START_SETTINGS_WAIT_MS);
@@ -787,10 +832,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     `Hello ${esc(name)}! ` + ABOUT_TEXT + '\n\n' +
     note +
     (invited ? '🎁 A friend invited you — your discount is applied on the next screen.\n\n' : '') +
-    'Tap <b>Continue →</b> to see the pass, or send /about, /status, /referral or /support.',
+    'Tap <b>Continue →</b> to see the pass, or <b>🎁 My referral</b> to invite friends and earn.\n\n' +
+    '<i>Need help? Send /support.</i>',
     {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] }
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Continue →', callback_data: 'go:plans' }],
+          [{ text: '🎁 My referral', callback_data: 'ref:card' }]
+        ]
+      }
     }
   );
   });

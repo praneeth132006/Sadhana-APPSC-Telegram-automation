@@ -125,6 +125,7 @@ stub(sheets, 'listReferralEarnings', [
 ]);
 stub(sheets, 'settleReferralEarnings', { settled: 1, paise: 3582 });
 stub(sheets, 'setReferralStatus', 1);
+stub(sheets, 'rebuildReferralSummaries', { rebuilt: 2 });
 
 // Telegram: pretend the bot is healthy and every send succeeds.
 telegram.init = () => {};
@@ -336,7 +337,7 @@ test('every data route refuses an unauthenticated caller', async () => {
     ['POST', '/api/questions/delete'], ['POST', '/api/questions/status'],
     ['POST', '/api/questions/schedule'], ['POST', '/api/questions/unschedule'],
     ['POST', '/api/questions/format'], ['GET', '/api/referrals'],
-    ['POST', '/api/referrals/settle'], ['POST', '/api/referrals/status'],
+    ['POST', '/api/referrals/settle'], ['POST', '/api/referrals/status'], ['POST', '/api/referrals/rebuild'],
     ['POST', '/api/telegram/post'], ['POST', '/api/telegram/reconcile'],
     ['GET', '/api/automation/autopilot'], ['POST', '/api/automation/autopilot'],
     ['POST', '/api/automation/autopilot/stop'],
@@ -3219,4 +3220,56 @@ test('the Pass & Coupons page is told when a pass is lifetime, and has no end da
   } finally {
     clientStubs.getBotSettings = original;
   }
+});
+
+// ===========================================================================
+// Analytics lists subjects only; referrals show every person
+// ===========================================================================
+
+test('Analytics never shows the referral tabs as subjects', async () => {
+  const original = clientStubs.getAnalytics;
+  clientStubs.getAnalytics = async () => ({
+    totals: { total: 10, subjects: 3, emptySubjects: 2, activeSubjects: 1, lowStockSubjects: 0 },
+    subjects: [
+      { subject: 'Polity', total: 10, pending: 10, active: true },
+      { subject: 'Referrals', total: 0, pending: 0, active: false },
+      { subject: 'Referral Log', total: 0, pending: 0, active: false }
+    ]
+  });
+  try {
+    const res = await authed('/api/analytics');
+    assert.deepEqual(res.json.data.subjects.map((s) => s.subject), ['Polity']);
+    assert.equal(res.json.data.totals.subjects, 1, 'the headline still counts the referral tabs');
+    assert.equal(res.json.data.totals.emptySubjects, 0);
+    assert.equal(res.json.data.totals.total, 10, 'question totals must not change');
+  } finally {
+    clientStubs.getAnalytics = original;
+  }
+});
+
+test('each referrer carries everyone who joined and everyone who opened the link', async () => {
+  const original = clientStubs.listReferrals;
+  clientStubs.listReferrals = async () => ([{
+    code: 'REFAJMXPQ', telegram_id: '111', username: 'asha', name: 'Asha K', status: 'active',
+    opened_by_ids: '333, 999', share_link: 'https://t.me/x?start=ref_REFAJMXPQ'
+  }]);
+  try {
+    const res = await authed('/api/referrals');
+    const asha = res.json.data.codes[0];
+    assert.equal(asha.linkOpens, 2);
+    assert.deepEqual(asha.openedBy, [{ telegramId: '333', joined: true }, { telegramId: '999', joined: false }]);
+    assert.equal(asha.joins.length, 2);
+    assert.deepEqual(asha.joins.map((j) => j.telegramId), ['333', '444']);
+    assert.equal(asha.joins[0].paymentId, 'pay_1');
+    assert.equal(asha.shareLink, 'https://t.me/x?start=ref_REFAJMXPQ');
+    assert.equal(res.json.data.totals.linkOpens, 2);
+  } finally {
+    clientStubs.listReferrals = original;
+  }
+});
+
+test('the sheet summaries can be rebuilt from the dashboard', async () => {
+  const res = await authed('/api/referrals/rebuild', { method: 'POST' });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.rebuilt, 2);
 });

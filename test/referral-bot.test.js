@@ -91,7 +91,8 @@ function fakeSheet(overrides = {}) {
       earnings.push(e);
       return { recorded: true };
     }),
-    settleReferralEarnings: record('settleReferralEarnings', async () => ({ settled: 0, paise: 0 }))
+    settleReferralEarnings: record('settleReferralEarnings', async () => ({ settled: 0, paise: 0 })),
+    recordReferralOpen: record('recordReferralOpen', async () => ({ recorded: true, opens: 1 }))
   };
   Object.entries(overrides.methods || {}).forEach(([name, fn]) => { client[name] = record(name, fn); });
   return client;
@@ -229,7 +230,7 @@ test('a member over the threshold can ask to be paid', async () => {
     earnings: [{ code: 'REFAJMXPQ', commission_paise: 120000, status: 'pending' }]
   });
   await deliver(privateMessage('/referral'));
-  assert.match(lastText(messages, STUDENT.id), /reached ₹1,?000/);
+  assert.match(lastText(messages, STUDENT.id), /reached <b>₹1,?000<\/b>/);
 
   await deliver(tap('ref:payout'));
   // A ticket, not an automatic transfer: money leaving the business is a
@@ -702,4 +703,95 @@ test('/help in the newspaper bot does not promise an expiry reminder', async () 
   const text = lastText(messages, FRIEND.id);
   assert.match(text, /for life/);
   assert.ok(!/reminder before your pass ends/.test(text));
+});
+
+// ---------------------------------------------------------------------------
+// /referral as its own section
+// ---------------------------------------------------------------------------
+
+test('the welcome screen has its own referral button, separate from buying', async () => {
+  const { deliver, messages } = makeBot();
+  await deliver(privateMessage('/start'));
+  const buttons = messages(STUDENT.id)[0].args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.deepEqual(buttons, ['go:plans', 'ref:card']);
+});
+
+test('the payment card no longer carries the referral button', async () => {
+  // Tucked under Pay, it read as part of buying and members could not find
+  // their own code again afterwards.
+  const { deliver, messages } = makeBot();
+  await deliver(privateMessage('/plans'));
+  const buttons = messages(STUDENT.id).pop().args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  assert.ok(!buttons.includes('ref:card'), 'referral is still inside the payment card');
+});
+
+test('the referral card shows the code to copy, the numbers, and who joined', async () => {
+  const { deliver, messages } = makeBot({
+    codes: [Object.assign({}, ASHA_CODE, { link_opens: '5' })],
+    earnings: [
+      { code: 'REFAJMXPQ', referred_name: 'Ravi Teja', referred_telegram_id: '222',
+        timestamp: '19-09-2026, 10:00:00 AM IST', commission_paise: 3582, status: 'paid' },
+      { code: 'REFAJMXPQ', referred_name: 'Meena', referred_telegram_id: '333',
+        timestamp: '21-09-2026, 11:30:00 AM IST', commission_paise: 3582, status: 'pending' }
+    ]
+  });
+  await deliver(privateMessage('/referral'));
+  const text = lastText(messages, STUDENT.id);
+
+  assert.match(text, /<code>REFAJMXPQ<\/code>/, 'the code is not tap-to-copy');
+  assert.match(text, /Opened your link: <b>5<\/b>/);
+  assert.match(text, /Joined using your code: <b>2<\/b>/);
+  assert.match(text, /Who joined/);
+  // Newest first, first names only — never another person's Telegram id.
+  assert.match(text, /1\. Meena · 21-09-2026 · ₹35\.82 ⏳ pending/);
+  assert.match(text, /2\. Ravi · 19-09-2026 · ₹35\.82 ✅ paid/);
+  assert.ok(!/222|333/.test(text), 'a friend\'s Telegram id was shown to another member');
+});
+
+test('the card says how far a member is from being able to claim', async () => {
+  const { deliver, messages } = makeBot({
+    codes: [ASHA_CODE],
+    earnings: [{ code: 'REFAJMXPQ', commission_paise: 60000, status: 'pending' }]
+  });
+  await deliver(privateMessage('/referral'));
+  assert.match(lastText(messages, STUDENT.id), /₹400 to go/);
+});
+
+test('a long list of joins is cut short rather than filling the chat', async () => {
+  const many = Array.from({ length: 14 }, (_, i) => ({
+    code: 'REFAJMXPQ', referred_name: 'Friend' + i, commission_paise: 3582, status: 'pending',
+    timestamp: '21-09-2026, 10:00:00 AM IST'
+  }));
+  const { deliver, messages } = makeBot({ codes: [ASHA_CODE], earnings: many });
+  await deliver(privateMessage('/referral'));
+  const text = lastText(messages, STUDENT.id);
+  assert.match(text, /…and 4 more/);
+  assert.ok(!/11\. /.test(text), 'more than ten joins were listed');
+});
+
+test('opening a friend\'s link is recorded, without holding up the welcome', async () => {
+  const { deliver, messages, sheet } = makeBot({ codes: [ASHA_CODE] });
+  await deliver(privateMessage('/start ref_REFAJMXPQ', FRIEND));
+  assert.match(lastText(messages, FRIEND.id), /A friend invited you/);
+
+  // Give the fire-and-forget write a moment to land.
+  await new Promise((r) => setImmediate(r));
+  const opens = sheet.calls.filter((c) => c.name === 'recordReferralOpen');
+  assert.equal(opens.length, 1);
+  assert.deepEqual(opens[0].args, ['REFAJMXPQ', FRIEND.id]);
+});
+
+test('a sheet that cannot record the open never costs the student their welcome', async () => {
+  const { deliver, messages } = makeBot({
+    codes: [ASHA_CODE],
+    methods: { recordReferralOpen: () => { throw new Error('sheet unreachable'); } }
+  });
+  const error = console.error;
+  console.error = () => {};
+  try {
+    await deliver(privateMessage('/start ref_REFAJMXPQ', FRIEND));
+  } finally {
+    console.error = error;
+  }
+  assert.match(lastText(messages, FRIEND.id), /Welcome to/);
 });
