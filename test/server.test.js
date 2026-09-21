@@ -108,6 +108,23 @@ stub(sheets, 'listPosted', []);
 stub(sheets, 'unpostQuestions', 0);
 stub(sheets, 'formatQuestions', (subject) => ({ subject, rows: 12 }));
 stub(sheets, 'markDeleted', 1);
+stub(sheets, 'listReferrals', [
+  { code: 'REFAJMXPQ', telegram_id: '111', username: 'asha', name: 'Asha K', status: 'active', created_at: 'then' },
+  { code: 'REFWMXD9N', telegram_id: '222', username: 'ravi', name: 'Ravi T', status: 'disabled', created_at: 'then' }
+]);
+stub(sheets, 'listReferralEarnings', [
+  { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+    referred_telegram_id: '333', referred_username: 'kiran', group: 'G', payment_id: 'pay_1',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'pending' },
+  { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+    referred_telegram_id: '444', referred_username: 'meena', group: 'G', payment_id: 'pay_2',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'paid' },
+  { code: 'REFWMXD9N', referrer_telegram_id: '222', referrer_username: 'ravi',
+    referred_telegram_id: '555', referred_username: 'sai', group: 'G', payment_id: 'pay_3',
+    original_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582, status: 'cancelled' }
+]);
+stub(sheets, 'settleReferralEarnings', { settled: 1, paise: 3582 });
+stub(sheets, 'setReferralStatus', 1);
 
 // Telegram: pretend the bot is healthy and every send succeeds.
 telegram.init = () => {};
@@ -313,7 +330,8 @@ test('every data route refuses an unauthenticated caller', async () => {
     ['POST', '/api/questions'], ['POST', '/api/questions/update'],
     ['POST', '/api/questions/delete'], ['POST', '/api/questions/status'],
     ['POST', '/api/questions/schedule'], ['POST', '/api/questions/unschedule'],
-    ['POST', '/api/questions/format'],
+    ['POST', '/api/questions/format'], ['GET', '/api/referrals'],
+    ['POST', '/api/referrals/settle'], ['POST', '/api/referrals/status'],
     ['POST', '/api/telegram/post'], ['POST', '/api/telegram/reconcile'],
     ['GET', '/api/automation/autopilot'], ['POST', '/api/automation/autopilot'],
     ['POST', '/api/automation/autopilot/stop'],
@@ -3026,5 +3044,145 @@ test('the autopilot check marks and never re-queues, because nobody is watching'
     channel.done();
     if (original === undefined) delete process.env.CRON_SECRET;
     else process.env.CRON_SECRET = original;
+  }
+});
+
+// ===========================================================================
+// Referrals — the admin side
+// ===========================================================================
+
+test('the referrals page gets every code, every join, and what is owed', async () => {
+  const res = await authed('/api/referrals');
+  assert.equal(res.status, 200);
+  const data = res.json.data;
+
+  // The scheme, so the page can state the terms rather than hardcode them.
+  assert.equal(data.settings.discountPercent, 10);
+  assert.equal(data.settings.commissionPercent, 20);
+  assert.equal(data.settings.payoutThresholdPaise, 100000);
+
+  // Each code with its own standing, worked out the same way the bot does it.
+  const asha = data.codes.find((c) => c.code === 'REFAJMXPQ');
+  assert.equal(asha.joined, 2);
+  assert.equal(asha.pendingPaise, 3582);
+  assert.equal(asha.paidPaise, 3582);
+  assert.equal(asha.totalPaise, 7164);
+  assert.equal(asha.payable, false, '₹35.82 is under the ₹1000 threshold');
+
+  // A cancelled earning is neither money nor a join.
+  const ravi = data.codes.find((c) => c.code === 'REFWMXD9N');
+  assert.equal(ravi.joined, 0);
+  assert.equal(ravi.totalPaise, 0);
+  assert.equal(ravi.status, 'disabled');
+
+  // The whole picture, for the tiles.
+  assert.equal(data.totals.joined, 2);
+  assert.equal(data.totals.revenuePaise, 35820);
+  assert.equal(data.totals.discountPaise, 3980);
+  assert.equal(data.totals.pendingPaise, 3582);
+  assert.equal(data.totals.paidPaise, 3582);
+});
+
+test('who joined using whose code is answered by Telegram id, not by handle', async () => {
+  // A handle can be changed; an id cannot. "Who invited whom" has to survive
+  // somebody renaming themselves.
+  const res = await authed('/api/referrals');
+  const joins = res.json.data.earnings;
+
+  assert.equal(joins.length, 3);
+  const first = joins.find((e) => e.payment_id === 'pay_1');
+  assert.equal(first.referrer_telegram_id, '111');
+  assert.equal(first.referred_telegram_id, '333');
+  assert.equal(first.commission_paise, 3582);
+  // Newest first: the question is almost always "who joined just now".
+  assert.equal(joins[0].payment_id, 'pay_3');
+});
+
+test('a payout run names the exact payments it would close', async () => {
+  const res = await authed('/api/referrals');
+  // Nothing is over ₹1000 here, so nothing is due — which is the point: the
+  // page must not offer to settle a balance that has not reached the bar.
+  assert.deepEqual(res.json.data.due, []);
+});
+
+test('settling records that a payout was made, and who recorded it', async () => {
+  calls.length = 0;
+  const res = await authed('/api/referrals/settle', {
+    method: 'POST', body: { code: 'REFAJMXPQ', paymentIds: ['pay_1'] }
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.settled, 1);
+  assert.match(res.json.message, /₹35\.82/);
+
+  const [code, ids, note] = calls.find((c) => c.name === 'settleReferralEarnings').args;
+  assert.equal(code, 'REFAJMXPQ');
+  // The payments the admin was looking at, so one recorded in between is not
+  // silently closed with them.
+  assert.deepEqual(ids, ['pay_1']);
+  assert.match(note, /curator@example\.com/);
+});
+
+test('settling refuses anything that is not a referral code', async () => {
+  for (const code of ['', 'NOTACODE', 'REF123', '../../etc/passwd', 'SAVE20']) {
+    const res = await authed('/api/referrals/settle', { method: 'POST', body: { code } });
+    assert.equal(res.status, 400, `"${code}" was accepted as a referral code`);
+  }
+});
+
+test('a code can be switched off and back on', async () => {
+  calls.length = 0;
+  const off = await authed('/api/referrals/status', {
+    method: 'POST', body: { code: 'REFAJMXPQ', status: 'disabled' }
+  });
+  assert.equal(off.status, 200);
+  assert.equal(off.json.status, 'disabled');
+  assert.deepEqual(calls.find((c) => c.name === 'setReferralStatus').args, ['REFAJMXPQ', 'disabled']);
+
+  calls.length = 0;
+  await authed('/api/referrals/status', { method: 'POST', body: { code: 'REFAJMXPQ', status: 'active' } });
+  assert.equal(calls.find((c) => c.name === 'setReferralStatus').args[1], 'active');
+
+  // Anything that is not "disabled" means active, rather than writing a status
+  // nothing else in the system understands.
+  calls.length = 0;
+  await authed('/api/referrals/status', { method: 'POST', body: { code: 'REFAJMXPQ', status: 'banana' } });
+  assert.equal(calls.find((c) => c.name === 'setReferralStatus').args[1], 'active');
+});
+
+test('a code that is not in the sheet cannot be switched off', async () => {
+  const original = clientStubs.setReferralStatus;
+  clientStubs.setReferralStatus = async () => 0;
+  try {
+    const res = await authed('/api/referrals/status', {
+      method: 'POST', body: { code: 'REFWMXD9N', status: 'disabled' }
+    });
+    assert.equal(res.status, 404);
+    assert.match(res.json.error, /not in the sheet/);
+  } finally {
+    clientStubs.setReferralStatus = original;
+  }
+});
+
+test('a member over the threshold shows as due, with their payments listed', async () => {
+  const original = clientStubs.listReferralEarnings;
+  clientStubs.listReferralEarnings = async () => ([
+    { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+      referred_telegram_id: '333', payment_id: 'pay_1', paid_paise: 17910,
+      discount_paise: 1990, commission_paise: 60000, status: 'pending' },
+    { code: 'REFAJMXPQ', referrer_telegram_id: '111', referrer_username: 'asha',
+      referred_telegram_id: '444', payment_id: 'pay_2', paid_paise: 17910,
+      discount_paise: 1990, commission_paise: 60000, status: 'pending' }
+  ]);
+  try {
+    const res = await authed('/api/referrals');
+    const due = res.json.data.due;
+    assert.equal(due.length, 1);
+    assert.equal(due[0].code, 'REFAJMXPQ');
+    assert.equal(due[0].pendingPaise, 120000);
+    assert.equal(due[0].count, 2);
+    assert.deepEqual(due[0].paymentIds, ['pay_1', 'pay_2']);
+  } finally {
+    clientStubs.listReferralEarnings = original;
   }
 });

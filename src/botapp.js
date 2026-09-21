@@ -34,6 +34,7 @@ const razorpay = require('./razorpay');
 const groupRegistry = require('./groups');
 const support = require('./support');
 const pricing = require('./pricing');
+const referrals = require('./referrals');
 
 /**
  * createPaymentBot — builds one family's bot with all its handlers attached.
@@ -119,6 +120,48 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // ---------------------------------------------------------------------------
   // Support: shared state
   // ---------------------------------------------------------------------------
+
+  /**
+   * ABOUT_TEXT — what this bot is, in the words the admin gave.
+   *
+   * The same paragraph is set as the bot's Telegram description (the screen
+   * shown before anyone presses Start) by `npm run bot-profile`, so the first
+   * thing a stranger reads and the first thing /about says do not drift apart.
+   */
+  const ABOUT_TEXT =
+    'Join our APPSC prep group via this bot. Get daily practice questions from ' +
+    'Eenadu, Sakshi &amp; Nipuna in poll format. Available in both Telugu and English mediums.';
+
+  /** The family's name, for the top of a greeting. */
+  function botDisplayName() {
+  const group = primaryGroup();
+  return group ? group.label : 'APPSC Prep';
+  }
+
+  /**
+   * Referral codes arrived by share link and not yet used, by Telegram id.
+   *
+   * A student taps a friend's link, reads the welcome, then taps Continue —
+   * three separate updates. The code has to survive that, and it is deliberately
+   * only in memory: it is a convenience, not a record. If the process restarts
+   * in between, the student can still type the code, and the earning itself is
+   * only ever written from a payment that succeeded.
+   */
+  const pendingReferral = new Map();
+
+  /** How long a code from a share link waits to be used. */
+  const PENDING_REFERRAL_MS = 24 * 60 * 60 * 1000;
+
+  /** The code this student arrived with, if it has not gone stale. */
+  function takePendingReferral(telegramId) {
+  const held = pendingReferral.get(String(telegramId));
+  if (!held) return '';
+  if (Date.now() - held.at > PENDING_REFERRAL_MS) {
+    pendingReferral.delete(String(telegramId));
+    return '';
+  }
+  return held.code;
+  }
 
   /** Keyboard with a single button that opens the support menu. */
   const SUPPORT_BUTTON = { inline_keyboard: [[{ text: '🆘 Support', callback_data: 'sup:menu' }]] };
@@ -223,7 +266,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   ];
   if (pass.validUntil) lines.push(`📅 Valid until <b>${esc(pass.validUntil)}</b>`);
   if (applied) {
-    lines.push(`🎟 Coupon <b>${esc(applied.code)}</b> applied — ${esc(applied.label)}`);
+    lines.push(applied.kind === 'referral'
+      ? `🎁 Referral <b>${esc(applied.code)}</b> applied — ${esc(applied.label)}`
+      : `🎟 Coupon <b>${esc(applied.code)}</b> applied — ${esc(applied.label)}`);
     lines.push(
       `💰 Price: <s>${pricing.rupees(pass.amountPaise)}</s> <b>${pricing.rupees(applied.finalPaise)}</b> ` +
       `(you save ${pricing.rupees(applied.discountPaise)})`);
@@ -240,6 +285,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    */
   function passKeyboard(group, pass, applied) {
   const amount = applied ? applied.finalPaise : pass.amountPaise;
+  // A referral code and a coupon code cannot collide — every referral starts
+  // with REF and is six characters longer than the prefix — so the code alone
+  // says which it is when the button comes back.
   return {
     inline_keyboard: [
       [{
@@ -247,23 +295,48 @@ function createPaymentBot({ payBotEnv, polling = false }) {
         callback_data: `buy:${group.id}:${pass.id}${applied ? ':' + applied.code : ''}`
       }],
       applied
-        ? [{ text: '✖️ Remove coupon', callback_data: `pick:${group.id}` }]
-        : [{ text: '🎟 Apply coupon code', callback_data: `cpn:${group.id}` }]
+        ? [{ text: applied.kind === 'referral' ? '✖️ Remove referral' : '✖️ Remove coupon',
+             callback_data: `pick:${group.id}` }]
+        : [{ text: '🎟 Apply coupon code', callback_data: `cpn:${group.id}` }],
+      [{ text: '🎁 Invite a friend, earn 20%', callback_data: 'ref:card' }]
     ]
   };
   }
 
   /** Sends one group's pass, optionally with a coupon applied. */
-  async function sendPass(chatId, group, applied = null) {
+  async function sendPass(chatId, group, applied = null, user = null) {
   const pass = await passFor(group.id);
   if (!pass) {
     await bot.sendMessage(chatId, 'Nothing is on sale for this group right now. Please check back soon.');
     return;
   }
-  await bot.sendMessage(chatId, passMessage(group, pass, applied), {
+
+  // A code that came in on a share link is applied here, where the student
+  // first sees a price — not silently at checkout, where a discount appearing
+  // from nowhere is indistinguishable from a bug.
+  let show = applied;
+  let refused = '';
+  if (!show && user) {
+    const waiting = takePendingReferral(user.id);
+    if (waiting) {
+      const { result } = await checkReferral(waiting, user, group);
+      if (result.ok) show = result;
+      else refused = result.reason;
+    }
+  }
+
+  await bot.sendMessage(chatId, passMessage(group, pass, show), {
     parse_mode: 'HTML',
-    reply_markup: passKeyboard(group, pass, applied)
+    reply_markup: passKeyboard(group, pass, show)
   });
+
+  // Said out loud rather than swallowed: someone who followed a friend's link
+  // and is being charged full price deserves to know why.
+  if (refused) {
+    await bot.sendMessage(chatId,
+      `🎁 The referral link you followed could not be used: ${esc(refused)}`,
+      { parse_mode: 'HTML' });
+  }
   }
 
   /**
@@ -273,11 +346,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * with two it asks first. Either way the student only ever sees groups this
    * bot is responsible for.
    */
-  async function offerGroups(chatId) {
+  async function offerGroups(chatId, user = null) {
   const groups = familyGroups();
 
   if (groups.length === 1) {
-    await sendPass(chatId, groups[0]);
+    await sendPass(chatId, groups[0], null, user);
     return;
   }
 
@@ -357,6 +430,245 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   await bot.sendMessage(msg.chat.id, passMessage(group, pass, result), {
     parse_mode: 'HTML',
     reply_markup: passKeyboard(group, pass, result)
+  });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Referrals
+  // ---------------------------------------------------------------------------
+  // A member invites someone; the person they invite pays 10% less and the
+  // member earns 20% of what that person actually paid.
+  //
+  // Codes and earnings live on the family's PRIMARY sheet, not the group's.
+  // A student who invites a friend to the English group and another to the
+  // Telugu one has one code and one balance, not two of each — splitting them
+  // would mean neither half ever reached a payout.
+
+  /** Guessing a code is guessing at someone else's discount. */
+  const allowReferralCheck = support.createThrottle({ limit: 8, windowMs: 10 * 60 * 1000 });
+
+  /** The sheet that holds this family's codes and earnings. */
+  function referralSheet() {
+  return sheetFor(primaryGroup().id);
+  }
+
+  /** This bot's @name, needed for share links. Asked once and remembered. */
+  let botUsername = null;
+  async function myUsername() {
+  if (botUsername !== null) return botUsername;
+  try {
+    const me = await bot.getMe();
+    botUsername = (me && me.username) || '';
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: could not read my own username — ${err.message}`);
+    botUsername = '';
+  }
+  return botUsername;
+  }
+
+  /**
+   * ownCode — this student's referral code, made on first use.
+   *
+   * Making it on demand rather than for everyone who ever typed /start keeps
+   * the tab to people who actually asked to invite someone.
+   */
+  async function ownCode(user) {
+  const sheet = referralSheet();
+  const existing = await sheet.getReferralFor(user.id);
+  if (existing) return existing;
+
+  // A collision is astronomically unlikely and completely survivable, so it
+  // is retried rather than reasoned about.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await sheet.createReferral({
+        telegram_id: String(user.id),
+        username: user.username || '',
+        name: [user.first_name, user.last_name].filter(Boolean).join(' '),
+        code: referrals.generateCode()
+      });
+    } catch (err) {
+      if (!err.codeTaken) throw err;
+    }
+  }
+  throw new Error('Could not issue a referral code. Please try again in a moment.');
+  }
+
+  /**
+   * checkReferral — may this student use this code, and what does it take off?
+   *
+   * @returns {Promise<{pass: Object|null, result: Object}>}
+   */
+  async function checkReferral(code, user, group) {
+  const pass = await passFor(group.id);
+  if (!pass) {
+    return { pass: null, result: { ok: false, reason: 'Nothing is on sale for this group right now.' } };
+  }
+  if (!allowReferralCheck(String(user.id))) {
+    return {
+      pass,
+      result: { ok: false, reason: 'Too many referral code attempts. Please wait a few minutes.' }
+    };
+  }
+
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  const clean = referrals.normaliseCode(code);
+  if (!referrals.isCode(clean)) {
+    return { pass, result: { ok: false, reason: 'That does not look like a referral code.' } };
+  }
+
+  let referral;
+  let alreadyUsed = 0;
+  let hasPaid = false;
+  try {
+    const sheet = referralSheet();
+    referral = await sheet.getReferral(clean);
+    // "First pass only" is checked against what the sheets actually say, not
+    // against anything the student tells us.
+    const earnings = await sheet.listReferralEarnings();
+    alreadyUsed = earnings.filter((e) => String(e.referred_telegram_id) === String(user.id) &&
+      e.status !== 'cancelled').length;
+    const held = await findSubscriptions(user.id);
+    hasPaid = held.some(({ subscriber }) => subscriber && subscriber.payment_id);
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: could not check referral ${clean} — ${err.message}`);
+    return {
+      pass,
+      result: {
+        ok: false,
+        reason: 'Referral codes cannot be checked right now. Please try again shortly, or pay the full price.'
+      }
+    };
+  }
+
+  return {
+    pass,
+    result: referrals.evaluateReferral(referral, {
+      amountPaise: pass.amountPaise,
+      buyerTelegramId: user.id,
+      buyerReferredCount: alreadyUsed,
+      buyerHasPaid: hasPaid,
+      settings
+    })
+  };
+  }
+
+  /**
+   * requestPayout — the student asks to be paid what they have earned.
+   *
+   * Deliberately a support ticket rather than anything automatic. Money leaving
+   * the business is a decision a person makes, with the sheet in front of them;
+   * this only makes sure the admin is told, with the numbers already worked out.
+   */
+  async function requestPayout(user) {
+  let record;
+  let earnings = [];
+  try {
+    record = await referralSheet().getReferralFor(user.id);
+    if (record) earnings = await referralSheet().listReferralEarnings(record.code);
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: payout request failed — ${err.message}`);
+  }
+
+  if (!record) {
+    await bot.sendMessage(user.id, 'You do not have a referral code yet. Send /referral to make one.');
+    return;
+  }
+
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  const stats = referrals.summarise(earnings, settings);
+
+  if (stats.pendingPaise <= 0) {
+    await bot.sendMessage(user.id,
+      'You have nothing waiting to be paid right now. Send /referral to see where you are.');
+    return;
+  }
+
+  // A ticket is opened from a message the student did not have to type, so the
+  // admin sees the request in the same queue as everything else, with the
+  // numbers already worked out.
+  await openTicket(
+    { text: `Referral payout requested — code ${record.code}, ` +
+            `${pricing.rupees(stats.pendingPaise)} pending across ${stats.joined} referral(s).` },
+    support.categoryById('other'),
+    user
+  );
+
+  await bot.sendMessage(user.id,
+    `✅ Your payout request for <b>${pricing.rupees(stats.pendingPaise)}</b> has gone to an admin.\n\n` +
+    'They will message you here to arrange it. Payouts are made once you reach ' +
+    `<b>${pricing.rupees(stats.thresholdPaise)}</b>, or in the monthly run.`,
+    { parse_mode: 'HTML' });
+  }
+
+  /** What a student sees when they ask about inviting people. */
+  async function sendReferralCard(chatId, user) {
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  const config = referrals.settingsFrom(settings);
+
+  if (!config.enabled) {
+    await bot.sendMessage(chatId, 'Referrals are not running at the moment. Please check back later.');
+    return;
+  }
+
+  let record;
+  let earnings = [];
+  try {
+    record = await ownCode(user);
+    earnings = await referralSheet().listReferralEarnings(record.code);
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: referral card failed — ${err.message}`);
+    await bot.sendMessage(chatId,
+      '⚠️ Could not read your referral details right now. Please try again shortly.',
+      { reply_markup: SUPPORT_BUTTON });
+    return;
+  }
+
+  const stats = referrals.summarise(earnings, settings);
+  const link = referrals.shareLink(await myUsername(), record.code);
+
+  const lines = [
+    '🎁 <b>Invite a friend</b>',
+    '',
+    `Your code: <code>${esc(record.code)}</code>`,
+    '',
+    `They get <b>${config.discountPercent}% off</b> their first pass.`,
+    `You earn <b>${config.commissionPercent}%</b> of what they pay.`,
+    '',
+    `👥 Joined using your code: <b>${stats.joined}</b>`,
+    `💰 Earned so far: <b>${pricing.rupees(stats.totalPaise)}</b>`,
+    `⏳ Waiting to be paid: <b>${pricing.rupees(stats.pendingPaise)}</b>`,
+    `✅ Already paid to you: <b>${pricing.rupees(stats.paidPaise)}</b>`,
+    ''
+  ];
+
+  lines.push(stats.payable
+    ? `🎉 You have reached ${pricing.rupees(stats.thresholdPaise)} — tap below and an admin will arrange your payout.`
+    : `Payouts are made once you reach <b>${pricing.rupees(stats.thresholdPaise)}</b>, ` +
+      'or in the monthly run, whichever comes first.');
+
+  if (link) {
+    lines.push('', 'Share this link — the code is applied for them automatically:', `${esc(link)}`);
+  }
+
+  const keyboard = { inline_keyboard: [] };
+  if (link) {
+    keyboard.inline_keyboard.push([{
+      text: '📤 Share with a friend',
+      url: `https://t.me/share/url?url=${encodeURIComponent(link)}` +
+        `&text=${encodeURIComponent('Join our APPSC prep group — use my link for ' +
+          config.discountPercent + '% off your first pass.')}`
+    }]);
+  }
+  if (stats.payable) {
+    keyboard.inline_keyboard.push([{ text: '💸 Request my payout', callback_data: 'ref:payout' }]);
+  }
+  keyboard.inline_keyboard.push([{ text: '🆘 Support', callback_data: 'sup:menu' }]);
+
+  await bot.sendMessage(chatId, lines.join('\n'), {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: keyboard
   });
   }
 
@@ -448,34 +760,56 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     });
   }
 
-  studentCommand(/^\/start(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand(/^\/start(?:@\w+)?(?:\s+(\S+))?\s*$/, async (msg, match) => {
   const name = msg.from.first_name || 'there';
-  const groups = familyGroups();
-  const what = groups.length === 1
-    ? `the <b>${esc(groups[0].shortName)}</b> group`
-    : `our <b>${esc(groups[0].label)}</b> groups`;
+
+  // A share link arrives as "/start ref_REFXXXXXX". Remembering it here, before
+  // anything else, is what makes the link do its job: the student never has to
+  // type a code, and the discount is already on the pass when they see it.
+  const invited = referrals.codeFromStartPayload(match && match[1]);
+  if (invited) pendingReferral.set(String(msg.from.id), { code: invited, at: Date.now() });
 
   // Bounded: a slow sheet must never hold up the greeting.
   const settings = await settingsWithin(START_SETTINGS_WAIT_MS);
   const note = settings.welcome_note ? `${esc(settings.welcome_note)}\n\n` : '';
 
   await bot.sendMessage(msg.chat.id,
-    `👋 Hello ${esc(name)}!\n\n` +
-    `This bot gives you access to ${what} — daily practice questions with ` +
-    'explanations.\n\n' +
+    `<b>Welcome to ${esc(botDisplayName())}</b> 👋\n\n` +
+    `Hello ${esc(name)}! ` + ABOUT_TEXT + '\n\n' +
     note +
+    (invited ? '🎁 A friend invited you — your discount is applied on the next screen.\n\n' : '') +
+    'Tap <b>Continue →</b> to see the pass, or send /about, /status, /referral or /support.',
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] }
+    }
+  );
+  });
+
+  studentCommand(/^\/about(?:@\w+)?(?:\s|$)/, async (msg) => {
+  await bot.sendMessage(msg.chat.id,
+    `<b>About ${esc(botDisplayName())}</b>\n\n` + ABOUT_TEXT + '\n\n' +
     'Commands:\n' +
-    '/plans — see the passes and subscribe\n' +
+    '/plans — see the pass and join\n' +
     '/status — check your current pass\n' +
+    '/referral — invite a friend and earn\n' +
     '/help — how it all works\n' +
     '/support — get help with a problem',
-    { parse_mode: 'HTML' }
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } }
   );
-  await offerGroups(msg.chat.id);
+  });
+
+  studentCommand(/^\/referral(?:@\w+)?(?:\s|$)/, async (msg) => {
+  await sendReferralCard(msg.chat.id, msg.from);
+  });
+
+  // The same thing under the name people actually guess.
+  studentCommand(/^\/invite(?:@\w+)?(?:\s|$)/, async (msg) => {
+  await sendReferralCard(msg.chat.id, msg.from);
   });
 
   studentCommand(/^\/plans(?:@\w+)?(?:\s|$)/, async (msg) => {
-  await offerGroups(msg.chat.id);
+  await offerGroups(msg.chat.id, msg.from);
   });
 
   studentCommand(/^\/status(?:@\w+)?(?:\s|$)/, async (msg) => {
@@ -486,7 +820,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       await bot.sendMessage(msg.chat.id,
         'You do not have a pass yet.\n\nSend /plans to see the options.',
         { parse_mode: 'HTML' });
-      await offerGroups(msg.chat.id);
+      await offerGroups(msg.chat.id, msg.from);
       return;
     }
 
@@ -593,6 +927,37 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
   };
 
+  // ---- the welcome's Continue button --------------------------------------
+  if (data === 'go:plans') {
+    await ack();
+    await offerGroups(user.id, user);
+    return;
+  }
+
+  // ---- referrals -----------------------------------------------------------
+  if (data === 'ref:card') {
+    await ack();
+    await sendReferralCard(user.id, user);
+    return;
+  }
+
+  if (data === 'ref:payout') {
+    await ack('Passing this to an admin…');
+    await requestPayout(user);
+    return;
+  }
+
+  if (data === 'ref:apply') {
+    await ack();
+    await bot.sendMessage(user.id,
+      '🎁 Type the referral code a friend gave you and send it as a reply to this message.',
+      {
+        parse_mode: 'HTML',
+        reply_markup: { force_reply: true, input_field_placeholder: 'Referral code' }
+      });
+    return;
+  }
+
   // ---- picking a group ----------------------------------------------------
   // pick:<groupId> also means "show the pass again without a coupon".
   if (data.startsWith('pick:')) {
@@ -602,6 +967,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       return;
     }
     await ack();
+    // Deliberately without the student: this button means "clear what is
+    // applied and show me the plain price".
     await sendPass(user.id, group);
     return;
   }
@@ -668,12 +1035,21 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
 
+  // The code is re-checked here, never trusted from the button: a tap on
+  // yesterday's message must not buy at yesterday's price, and a referral must
+  // not still apply to someone who has since bought a pass.
   let applied = null;
   if (code) {
-    const { result } = await checkCoupon(code, user.id, group);
+    const isReferral = referrals.isCode(code);
+    const { result } = isReferral
+      ? await checkReferral(code, user, group)
+      : await checkCoupon(code, user.id, group);
+
     if (!result.ok) {
-      await ack('That coupon cannot be used.');
-      await bot.sendMessage(user.id, `❌ <b>${esc(pricing.normaliseCode(code))}</b>: ${esc(result.reason)}`,
+      await ack(isReferral ? 'That referral code cannot be used.' : 'That coupon cannot be used.');
+      await bot.sendMessage(user.id,
+        `❌ <b>${esc(isReferral ? referrals.normaliseCode(code) : pricing.normaliseCode(code))}</b>: ` +
+        esc(result.reason),
         { parse_mode: 'HTML', reply_markup: couponRetryKeyboard(group) });
       return;
     }
@@ -748,10 +1124,22 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (pass.validUntil) extraNotes.valid_until = pass.validUntil;
   if (applied) {
     Object.assign(extraNotes, {
-      coupon_code: applied.code,
       original_amount: String(pass.amountPaise / 100),
       discount_amount: String(applied.discountPaise / 100)
     });
+    if (applied.kind === 'referral') {
+      // What is owed to the inviter rides in the link's notes, worked out from
+      // the price the student was actually shown. The webhook then records
+      // exactly that, rather than recomputing it against a price an admin may
+      // have changed while the link was open.
+      Object.assign(extraNotes, {
+        referral_code: applied.code,
+        referrer_telegram_id: applied.referrerTelegramId || '',
+        commission_amount: String((applied.commissionPaise || 0) / 100)
+      });
+    } else {
+      extraNotes.coupon_code = applied.code;
+    }
   }
 
   const base = String(process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');

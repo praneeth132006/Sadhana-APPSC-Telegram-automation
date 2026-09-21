@@ -272,6 +272,25 @@ const SETTINGS = [
     key: 'pass_description', section: 'pass', label: 'Description', type: 'textarea', maxLength: 300,
     default: '', optional: true,
     hint: 'One or two lines shown with the price. Blank uses the built-in description.'
+  },
+  {
+    key: 'referral_enabled', section: 'pass', label: 'Referrals enabled', type: 'toggle', default: 'yes',
+    hint: 'Switches "invite a friend" off without deleting anyone\'s code or their unpaid earnings.'
+  },
+  {
+    key: 'referral_discount_percent', section: 'pass', label: 'Referral discount (%)', type: 'percent',
+    maxLength: 2, default: '', optional: true,
+    hint: 'What the invited student saves on their first pass. Blank uses 10%.'
+  },
+  {
+    key: 'referral_commission_percent', section: 'pass', label: 'Referral commission (%)', type: 'percent',
+    maxLength: 3, default: '', optional: true,
+    hint: 'What the inviter earns, as a share of what the invited student actually paid. Blank uses 20%.'
+  },
+  {
+    key: 'referral_payout_threshold', section: 'pass', label: 'Payout at (₹)', type: 'price',
+    maxLength: 7, default: '', optional: true,
+    hint: 'Pending earnings at or above this can be claimed from the bot. Blank uses ₹1000.'
   }
 ];
 
@@ -347,6 +366,12 @@ function validateSettingsPatch(patch) {
       if (!/^(yes|no)$/i.test(text)) return { ok: false, error: `"${key}" must be yes or no.` };
       value[key] = text.toLowerCase();
       continue;
+    }
+    // Before the length check: a percentage's length is implied by its range,
+    // and "12.5 is 4 characters, the limit is 3" explains nothing about why a
+    // half-percent is not allowed.
+    if (def.type === 'percent' && text && (!/^\d{1,3}$/.test(text) || Number(text) > 100)) {
+      return { ok: false, error: `"${key}" must be a whole number from 0 to 100.` };
     }
     if (text.length > def.maxLength) {
       return { ok: false, error: `"${key}" is ${text.length} characters; the limit is ${def.maxLength}.` };

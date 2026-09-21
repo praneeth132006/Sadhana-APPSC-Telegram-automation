@@ -437,6 +437,11 @@ test('/start still greets when the settings sheet fails, and includes the welcom
     console.error = originalError;
   }
   assert.match(failing.messages(STUDENT.id)[0].args[1], /Hello Asha[\s\S]*\/support/);
+  // The greeting is one message with a Continue button, as the welcome screen
+  // is meant to be — not a wall of text followed by the pass unasked.
+  assert.equal(failing.messages(STUDENT.id).length, 1);
+  assert.equal(failing.messages(STUDENT.id)[0].args[2].reply_markup.inline_keyboard[0][0].callback_data,
+    'go:plans');
 
   const noted = makeBot({ sheet: fakeSheet({ getBotSettings: { welcome_note: 'Exam special this week' } }) });
   await noted.deliver(privateMessage('/start'));

@@ -273,6 +273,84 @@ row the poster is holding, are each named rather than being folded into a count:
 
 ---
 
+## The bot: what people see
+
+Three things live on Telegram's servers rather than in this repository — the
+description shown **before** anyone presses Start, the line under the bot's name,
+and the ☰ Menu. Nothing in a deploy touches them, so they drift. `npm run bot-profile`
+writes all three to every payment bot, and is safe to run as often as you like:
+
+```bash
+npm run bot-profile          # write commands and descriptions
+npm run bot-profile:status   # show what Telegram currently holds
+```
+
+The menu is `/start`, `/about`, `/plans`, `/status`, `/referral`, `/help`, `/support`.
+`/start` is one welcome message with a **Continue →** button — the pass is shown when
+they tap it, not unasked.
+
+---
+
+## Referrals — invite a friend
+
+A member sends `/referral` and gets a code and a share link. Whoever follows that link
+pays **10% less** on their first pass, and the member earns **20% of what that person
+actually paid**, in rupees.
+
+**Commission is on what was paid, never on the list price.** The discount comes off
+first, so a ₹199 pass sold through a referral is ₹179.10 to the buyer, ₹35.82 to the
+inviter, and ₹143.28 kept. Paying 20% of ₹199 would quietly pay out more than the sale
+brought in.
+
+**How a member uses it**
+
+| | |
+|---|---|
+| `/referral` | Their code, their share link, and their running total |
+| Share link | `https://t.me/<bot>?start=ref_REFXXXXXX` — the discount is applied on the first screen the friend sees |
+| Typing the code | Also works, in any case, with or without the `ref_` prefix |
+
+**The rules, and why**
+
+- **A code works once per person, on their first pass.** Otherwise a member renewing
+  monthly would earn their friend a commission every month for one introduction.
+- **You cannot invite yourself.** That is a discount you wrote yourself, plus
+  commission on your own purchase.
+- **A code is re-checked when the Pay button is tapped**, never trusted from the
+  button. A tap on yesterday's message must not buy at yesterday's terms.
+- **Commission is only ever created from a payment that succeeded**, recorded against
+  its Razorpay payment id. Razorpay retries a webhook on any non-2xx, and without that
+  id one sale would pay an inviter once per delivery.
+- **A code can be switched off** without touching what it has already earned.
+
+**Getting paid**
+
+Earnings sit as `pending`. A member can ask to be paid once they pass **₹1000**, and
+the monthly run pays everyone with anything pending. Asking raises a support ticket —
+nothing here moves money. An admin sends it, then presses **Mark paid** on the
+Referrals page, which records that they did.
+
+**Where it all lives**
+
+Two tabs on the family's primary sheet, created on first use:
+
+- **Referrals** — one row per member: their code, who they are, whether it is active.
+- **Referral Log** — one row per referred payment: who invited whom (by Telegram id,
+  which cannot be changed the way a handle can), what was paid, what was taken off,
+  what was earned, and whether it has been paid out.
+
+The **Referrals** dashboard page shows all of it: who joined using whose code, what is
+owed to each member, and totals. Everything is searchable by code, name or Telegram id.
+
+The percentages and the payout threshold are editable on **Pass & Coupons** without a
+deploy, and referrals can be switched off there entirely.
+
+> Referrals need the Google Sheets API — a service account and `SHEET_ID_<PREFIX>`.
+> They were built after that route replaced the Apps Script, and putting them in both
+> would mean pasting a script into five sheets by hand to turn the feature on.
+
+---
+
 ## Command line
 
 The CLI still does everything it did, and now records the fuller tracking trail.
@@ -285,6 +363,9 @@ node send.js --test                       # check the bot token and group
 
 node schedule.js                          # run the cron scheduler
 node schedule.js --dry-run                # show the schedule without sending
+
+npm run bot-profile                       # set each bot's menu and description
+npm run bot-profile:status                # see what Telegram currently holds
 
 node setup.js                             # create the Telegram forum topics
 node verify-topics.js                     # check every subject's topic still exists
@@ -687,7 +768,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-578 tests. The ones worth knowing about:
+638 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -706,6 +787,11 @@ npm test
 - `test/autopilot.test.js` — the unattended scheduler on a fake clock: overlapping
   runs, an empty queue, a Telegram outage being mistaken for an empty queue, and a
   restart neither forgetting its jobs nor stampeding through every missed run.
+- `test/referrals.test.js` — the money arithmetic: commission on what was paid rather
+  than the list price, self-referral, a code used twice, rounding, and what a member
+  is owed.
+- `test/referral-bot.test.js` — the student side, ending in what actually reaches
+  Razorpay's notes, since that is what the commission is later calculated from.
 
 ---
 
@@ -724,6 +810,7 @@ npm test
 │   ├── index.html/app.js     # Upload
 │   ├── analytics.html/.js    # Analytics
 │   ├── questions.html/.js    # Question bank
+│   ├── referrals.html/.js    # Referral tracking and payouts
 │   ├── automation.html/.js   # Automation
 │   └── health.html/.js       # System health
 ├── src/
@@ -731,10 +818,11 @@ npm test
 │   ├── sheets.js             # Apps Script client
 │   ├── sheets-direct.js      # Google Sheets API client (the posting path)
 │   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
+│   ├── referrals.js          # referral codes, discounts, commission and payouts
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 578 tests
+└── test/                     # 638 tests
 ```
 
 ## Notes

@@ -21,7 +21,9 @@
     "reset-topics": "node reset-topics.js",
     "set-webhooks": "node set-webhooks.js",
     "webhooks:status": "node set-webhooks.js --status",
-    "webhooks:delete": "node set-webhooks.js --delete"
+    "webhooks:delete": "node set-webhooks.js --delete",
+    "bot-profile": "node bot-profile.js",
+    "bot-profile:status": "node bot-profile.js --status"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
