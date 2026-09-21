@@ -310,7 +310,16 @@ brought in.
 | Share link | `https://t.me/<bot>?start=ref_REFXXXXXX` — the discount is applied on the first screen the friend sees |
 | Typing the code | Also works, in any case, with or without the `ref_` prefix |
 
-**The rules, and why**
+**The rules**
+
+- **One code per member**, however many times they ask. A second code would split
+  their earnings in two, and neither half would ever reach a payout.
+- **Any number of people can join on one code.** The limit is one referral per
+  *buyer*, never a cap on the code itself.
+- **A claim button appears at ₹1000** and not a rupee before. Claiming raises a
+  support ticket; an admin sends the money and presses **Mark paid**.
+
+**And why**
 
 - **A code works once per person, on their first pass.** Otherwise a member renewing
   monthly would earn their friend a commission every month for one introduction.
@@ -348,6 +357,30 @@ deploy, and referrals can be switched off there entirely.
 > Referrals need the Google Sheets API — a service account and `SHEET_ID_<PREFIX>`.
 > They were built after that route replaced the Apps Script, and putting them in both
 > would mean pasting a script into five sheets by hand to turn the feature on.
+
+---
+
+## When nobody answers
+
+Support is a chat, and a chat with nobody on the other end gives a student no way
+to tell whether they have been forgotten or are simply early. So there is a second
+door: **appscsadhana@gmail.com**, editable in Bot Settings.
+
+It is offered in the same words everywhere, so it reads as a standing promise rather
+than a special case:
+
+| Where | What it says |
+|---|---|
+| The support menu, `/help`, `/about` | *If you do not hear back, email us at …* |
+| When a ticket is raised | The same line, under the confirmation |
+| On a follow-up **no admin has ever replied to** | *Still waiting? Email us at … and we will pick it up there.* |
+| Tickets switched off, or a ticket that failed to submit | Alongside the fallback contact |
+| A referral payout request | The same line — it is money, and one door is not enough |
+
+The escalation counts **admin replies**, not who the ticket is waiting on: appending
+the student's own message sets "waiting on admin", so that field is true of every
+follow-up and would make the escalation meaningless. No reply ever, on a message they
+have now sent twice, is the real signal.
 
 ---
 
@@ -768,7 +801,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-638 tests. The ones worth knowing about:
+651 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -822,7 +855,7 @@ npm test
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 638 tests
+└── test/                     # 651 tests
 ```
 
 ## Notes

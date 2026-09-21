@@ -731,8 +731,11 @@ async function appendRows(ctx, tab, values) {
     `/${ctx.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(tab)}!A1`)}:append` +
     '?valueInputOption=RAW&insertDataOption=INSERT_ROWS', { values });
   const firstRow = Number(((appended.updates || {}).updatedRange || '').match(/![A-Z]+(\d+)/)?.[1]);
-  // The same inheritance that once turned a whole question tab navy.
-  if (firstRow) await resetAppendedRows(ctx, tab, firstRow, values.length);
+  // The same inheritance that once turned a whole question tab navy — and the
+  // width of THIS tab, not the 30-column question layout.
+  if (firstRow) {
+    await resetAppendedRows(ctx, tab, firstRow, values.length, (values[0] || []).length);
+  }
   return firstRow;
 }
 
@@ -998,13 +1001,13 @@ const BODY_FORMAT_FIELDS =
  * @param {number} startRow 1-based first row to reset
  * @param {number} endRow 1-based last row, inclusive
  */
-function bodyFormatRequests(sheetId, startRow, endRow) {
+function bodyFormatRequests(sheetId, startRow, endRow, columns = QUESTION_HEADERS.length) {
   const range = {
     sheetId,
     startRowIndex: startRow - 1,
     endRowIndex: endRow,
     startColumnIndex: 0,
-    endColumnIndex: QUESTION_HEADERS.length
+    endColumnIndex: columns
   };
 
   const requests = [{
@@ -1024,8 +1027,10 @@ function bodyFormatRequests(sheetId, startRow, endRow) {
   }];
 
   // The long-form columns wrap; the rest stay on one line so the row does not
-  // grow to the height of its longest cell.
-  for (const column of WRAP_COLUMNS) {
+  // grow to the height of its longest cell. Only the ones this tab actually
+  // has: the referral tabs are seven and sixteen columns wide, and asking
+  // Sheets to format column 30 of a seven-column tab is refused outright.
+  for (const column of WRAP_COLUMNS.filter((c) => c <= columns)) {
     requests.push({
       repeatCell: {
         range: Object.assign({}, range, { startColumnIndex: column - 1, endColumnIndex: column }),
@@ -1044,12 +1049,12 @@ function bodyFormatRequests(sheetId, startRow, endRow) {
  * upload that worked because its rows came out the wrong colour would be the
  * worse failure of the two.
  */
-async function resetAppendedRows(ctx, subject, firstRow, count) {
+async function resetAppendedRows(ctx, subject, firstRow, count, columns) {
   if (!firstRow || !count) return;
   try {
     const sheetId = await sheetIdOf(ctx, subject);
     await call('POST', `/${ctx.spreadsheetId}:batchUpdate`, {
-      requests: bodyFormatRequests(sheetId, firstRow, firstRow + count - 1)
+      requests: bodyFormatRequests(sheetId, firstRow, firstRow + count - 1, columns)
     });
   } catch (err) {
     console.warn(`[sheets] could not restore row formatting in "${subject}": ${err.message}`);

@@ -296,7 +296,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       }],
       applied
         ? [{ text: applied.kind === 'referral' ? '✖️ Remove referral' : '✖️ Remove coupon',
-             callback_data: `pick:${group.id}` }]
+             callback_data: `plain:${group.id}` }]
         : [{ text: '🎟 Apply coupon code', callback_data: `cpn:${group.id}` }],
       [{ text: '🎁 Invite a friend, earn 20%', callback_data: 'ref:card' }]
     ]
@@ -321,7 +321,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     if (waiting) {
       const { result } = await checkReferral(waiting, user, group);
       if (result.ok) show = result;
-      else refused = result.reason;
+      else {
+        refused = result.reason;
+        // It cannot be used, so stop offering it on every screen.
+        pendingReferral.delete(String(user.id));
+      }
     }
   }
 
@@ -407,7 +411,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return {
     inline_keyboard: [
       [{ text: '🎟 Try another code', callback_data: `cpn:${group.id}` }],
-      [{ text: '💳 Continue at full price', callback_data: `pick:${group.id}` }]
+      [{ text: '💳 Continue at full price', callback_data: `plain:${group.id}` }]
     ]
   };
   }
@@ -597,7 +601,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   await bot.sendMessage(user.id,
     `✅ Your payout request for <b>${pricing.rupees(stats.pendingPaise)}</b> has gone to an admin.\n\n` +
     'They will message you here to arrange it. Payouts are made once you reach ' +
-    `<b>${pricing.rupees(stats.thresholdPaise)}</b>, or in the monthly run.`,
+    `<b>${pricing.rupees(stats.thresholdPaise)}</b>, or in the monthly run.` +
+    (support.emailFallbackLine(settings) ? '\n\n' + support.emailFallbackLine(settings) : ''),
     { parse_mode: 'HTML' });
   }
 
@@ -787,6 +792,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   });
 
   studentCommand(/^\/about(?:@\w+)?(?:\s|$)/, async (msg) => {
+  const aboutSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
   await bot.sendMessage(msg.chat.id,
     `<b>About ${esc(botDisplayName())}</b>\n\n` + ABOUT_TEXT + '\n\n' +
     'Commands:\n' +
@@ -794,7 +800,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     '/status — check your current pass\n' +
     '/referral — invite a friend and earn\n' +
     '/help — how it all works\n' +
-    '/support — get help with a problem',
+    '/support — get help with a problem' +
+    (aboutSettings && support.emailFallbackLine(aboutSettings)
+      ? '\n\n' + support.emailFallbackLine(aboutSettings) : ''),
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } }
   );
   });
@@ -853,6 +861,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   studentCommand(/^\/help(?:@\w+)?(?:\s|$)/, async (msg) => {
   const many = familyGroups().length > 1;
+  const helpSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
   const steps = [
     many ? 'Send /plans and choose your group.' : 'Send /plans to see the pass.',
     'Got a coupon? Tap <b>🎟 Apply coupon code</b> and type it — the new price is shown before you pay.',
@@ -867,7 +876,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
           : '<i>The invite is tied to your account — forwarding it will not let ' +
             'anyone else in.</i>\n\n') +
     'You will get a reminder before your pass ends. Check /status any time.\n\n' +
-    'Trouble? Send /support, or just type your question here.',
+    'Trouble? Send /support, or just type your question here.' +
+    (helpSettings && support.emailFallbackLine(helpSettings)
+      ? '\n\n' + support.emailFallbackLine(helpSettings) : ''),
     { parse_mode: 'HTML', reply_markup: SUPPORT_BUTTON }
   );
   });
@@ -959,17 +970,22 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   // ---- picking a group ----------------------------------------------------
-  // pick:<groupId> also means "show the pass again without a coupon".
-  if (data.startsWith('pick:')) {
-    const group = familyGroup(data.slice(5));
+  // Two buttons, because they mean opposite things and sharing one callback
+  // made a referral impossible to use in a two-group family: choosing a group
+  // went through the same handler as "remove what is applied", so the code the
+  // student arrived with was dropped the moment they picked English or Telugu.
+  //
+  //   pick:<groupId>   — I choose this group (anything applied still applies)
+  //   plain:<groupId>  — show me this group's plain price
+  if (data.startsWith('pick:') || data.startsWith('plain:')) {
+    const plain = data.startsWith('plain:');
+    const group = familyGroup(data.slice(plain ? 6 : 5));
     if (!group) {
       await ack('That group is not available here.');
       return;
     }
     await ack();
-    // Deliberately without the student: this button means "clear what is
-    // applied and show me the plain price".
-    await sendPass(user.id, group);
+    await sendPass(user.id, group, null, plain ? null : user);
     return;
   }
 
@@ -1174,7 +1190,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   /** The line students see when tickets are switched off or cannot be raised. */
   function contactLine(settings) {
-  return settings.support_contact ? `\n\nYou can also reach us at ${esc(settings.support_contact)}.` : '';
+  const parts = [];
+  if (settings.support_contact) parts.push(`You can also reach us at ${esc(settings.support_contact)}.`);
+  const email = support.emailFallbackLine(settings);
+  if (email) parts.push(email);
+  return parts.length ? '\n\n' + parts.join('\n') : '';
   }
 
   /** The support chat, if one is configured for this family. */
@@ -1198,7 +1218,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
   await bot.sendMessage(chatId,
     '🆘 <b>Support</b>\n\nWhat do you need help with?\n\n' +
-    `<i>Support hours: ${esc(settings.support_hours)}</i>`,
+    `<i>Support hours: ${esc(settings.support_hours)}</i>` +
+    (support.emailFallbackLine(settings) ? '\n\n' + support.emailFallbackLine(settings) : ''),
     {
       parse_mode: 'HTML',
       reply_markup: {
@@ -1542,7 +1563,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     '<b>Status:</b> Open — waiting for our team\n\n' +
     `Our team will reply <b>${esc(settings.support_response_time)}</b>, right here in this chat.\n` +
     `<b>Support hours:</b> ${esc(settings.support_hours)}\n\n` +
-    '<i>Need to add something? Just send another message and it will be added to this ticket.</i>',
+    '<i>Need to add something? Just send another message and it will be added to this ticket.</i>' +
+    (support.emailFallbackLine(settings) ? '\n\n' + support.emailFallbackLine(settings) : ''),
     { parse_mode: 'HTML' });
   }
 
@@ -1587,12 +1609,26 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       '⚠️ Could not add that to your ticket just now. Please try again in a few minutes.');
     return;
   }
+  // This is a follow-up, so they have written at least twice. If no admin has
+  // ever replied on this ticket, they have been waiting with nothing back —
+  // which is exactly the moment to hand them the other door, rather than
+  // repeating "our team will reply here".
+  //
+  // Counting replies rather than reading waiting_on is deliberate: appending
+  // this very message sets waiting_on to "admin", so that field is true of
+  // every follow-up and would make the escalation meaningless.
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  const neverAnswered = Boolean(ticket) && Number(ticket.admin_replies || 0) === 0 &&
+    String(ticket.status || '') !== 'closed';
+  const escalation = support.emailFallbackLine(settings, neverAnswered);
+
   await bot.sendMessage(user.id,
     `${esc(support.receivedLine(ticketId))}\n\n` +
     ((ticket && ticket.reopened) || options.wasClosed
       ? '🔁 <b>Your earlier ticket has been reopened.</b> Our team will reply here.\n\n'
       : '✅ <b>Added to your ticket.</b> Our team will reply here.\n\n') +
-    '<i>Different problem? Send /support to open a new ticket.</i>',
+    '<i>Different problem? Send /support to open a new ticket.</i>' +
+    (escalation ? '\n\n' + escalation : ''),
     { parse_mode: 'HTML' });
   }
 

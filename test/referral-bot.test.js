@@ -352,3 +352,250 @@ test('a referral on the button is re-checked, never trusted', async () => {
   assert.equal(created.length, 0, 'a disabled code still bought at a discount');
   assert.match(lastText(messages, FRIEND.id), /no longer active/);
 });
+
+// ---------------------------------------------------------------------------
+// The rules, stated
+// ---------------------------------------------------------------------------
+// These four are what was asked for in words, pinned so a later change cannot
+// quietly undo one of them.
+
+test('one member has exactly one code, however many times they ask', async () => {
+  const { deliver, sheet } = makeBot();
+  for (let i = 0; i < 5; i++) await deliver(privateMessage('/referral'));
+  assert.equal(sheet.codes.length, 1, 'a second code would split their earnings in two');
+  assert.equal(sheet.codes[0].telegram_id, '42');
+});
+
+test('any number of people can join on one code', async () => {
+  // The limit is one referral per BUYER, never a cap on the code itself.
+  const many = Array.from({ length: 25 }, (_, i) => ({
+    code: 'REFAJMXPQ', referrer_telegram_id: '42',
+    referred_telegram_id: String(1000 + i), commission_paise: 3582, status: 'pending'
+  }));
+  const { deliver, messages } = makeBot({ codes: [ASHA_CODE], earnings: many });
+
+  await deliver(privateMessage('/referral'));
+  assert.match(lastText(messages, STUDENT.id), /Joined using your code: <b>25<\/b>/);
+
+  // And a twenty-sixth buyer is still allowed to use it.
+  const result = referrals.evaluateReferral(ASHA_CODE, {
+    amountPaise: 19900, buyerTelegramId: '9999', buyerReferredCount: 0
+  });
+  assert.equal(result.ok, true);
+});
+
+test('the claim button appears at ₹1000 and not a rupee before', async () => {
+  const cardFor = async (paise) => {
+    const { deliver, messages } = makeBot({
+      codes: [ASHA_CODE],
+      earnings: [{ code: 'REFAJMXPQ', commission_paise: paise, status: 'pending' }]
+    });
+    await deliver(privateMessage('/referral'));
+    const all = messages(STUDENT.id);
+    return all[all.length - 1].args[2].reply_markup.inline_keyboard.flat().map((b) => b.callback_data);
+  };
+
+  assert.ok(!(await cardFor(99999)).includes('ref:payout'), '₹999.99 offered a claim');
+  assert.ok((await cardFor(100000)).includes('ref:payout'), '₹1000 did not offer a claim');
+  assert.ok((await cardFor(250000)).includes('ref:payout'));
+});
+
+test('the member can see how many joined and what each state is worth', async () => {
+  const { deliver, messages } = makeBot({
+    codes: [ASHA_CODE],
+    earnings: [
+      { code: 'REFAJMXPQ', commission_paise: 60000, status: 'pending' },
+      { code: 'REFAJMXPQ', commission_paise: 60000, status: 'pending' },
+      { code: 'REFAJMXPQ', commission_paise: 40000, status: 'paid' },
+      { code: 'REFAJMXPQ', commission_paise: 99999, status: 'cancelled' }
+    ]
+  });
+  await deliver(privateMessage('/referral'));
+
+  const text = lastText(messages, STUDENT.id);
+  assert.match(text, /Joined using your code: <b>3<\/b>/, 'a cancelled earning is not a join');
+  assert.match(text, /Earned so far: <b>₹1600<\/b>/);
+  assert.match(text, /Waiting to be paid: <b>₹1200<\/b>/);
+  assert.match(text, /Already paid to you: <b>₹400<\/b>/);
+});
+
+// ---------------------------------------------------------------------------
+// The second way to reach a human
+// ---------------------------------------------------------------------------
+
+test('the support email is offered when a ticket is raised', async () => {
+  const { deliver, messages } = makeBot();
+
+  // Free text asks before it opens anything, so the ticket is confirmed first.
+  const typed = privateMessage('My payment failed');
+  await deliver(typed);
+  assert.match(lastText(messages, STUDENT.id), /send this message to our support team/);
+
+  // "Send to support" acts on the message it was offered under, so the tap has
+  // to carry it the way Telegram does.
+  await deliver({
+    callback_query: {
+      id: 'cb-send', from: STUDENT, data: 'sup:send',
+      message: {
+        message_id: seq++, chat: { id: STUDENT.id, type: 'private' }, from: BOT,
+        text: 'Would you like to send this message to our support team?',
+        reply_to_message: typed.message
+      }
+    }
+  });
+
+  const texts = messages(STUDENT.id).map((m) => m.args[1]).join('\n');
+  assert.match(texts, /appscsadhana@gmail\.com/);
+  assert.match(texts, /If you do not hear back/);
+});
+
+test('the support menu carries the email too', async () => {
+  const { deliver, messages } = makeBot();
+  await deliver(privateMessage('/support'));
+  assert.match(lastText(messages, STUDENT.id), /appscsadhana@gmail\.com/);
+});
+
+test('a follow-up nobody has answered offers the email more insistently', async () => {
+  // The case the email exists for: they have asked twice and had nothing back.
+  const { deliver, messages } = makeBot({
+    methods: {
+      getTicket: async () => ({
+        ticket_id: 'T-260921-AB2C', telegram_id: '42', status: 'open',
+        admin_replies: 0, updated_at: new Date().toISOString()
+      }),
+      listTickets: async () => ({
+        total: 1, counts: {},
+        tickets: [{ ticket_id: 'T-260921-AB2C', telegram_id: '42', status: 'open', admin_replies: 0,
+          updated_at: new Date().toISOString() }]
+      }),
+      appendTicketMessage: async (id) => ({ ticket_id: id, status: 'open', admin_replies: 0, waiting_on: 'admin' })
+    }
+  });
+
+  await deliver(privateMessage('Still nothing?'));
+  const text = messages(STUDENT.id).map((m) => m.args[1]).join('\n');
+  assert.match(text, /Still waiting\?/);
+  assert.match(text, /appscsadhana@gmail\.com/);
+});
+
+test('a follow-up on a ticket an admin HAS answered does not nag about email', async () => {
+  const { deliver, messages } = makeBot({
+    methods: {
+      getTicket: async () => ({
+        ticket_id: 'T-260921-AB2C', telegram_id: '42', status: 'in_progress',
+        admin_replies: 2, updated_at: new Date().toISOString()
+      }),
+      listTickets: async () => ({
+        total: 1, counts: {},
+        tickets: [{ ticket_id: 'T-260921-AB2C', telegram_id: '42', status: 'in_progress', admin_replies: 2,
+          updated_at: new Date().toISOString() }]
+      }),
+      appendTicketMessage: async (id) => ({ ticket_id: id, status: 'in_progress', admin_replies: 2, waiting_on: 'admin' })
+    }
+  });
+
+  await deliver(privateMessage('One more thing'));
+  const text = messages(STUDENT.id).map((m) => m.args[1]).join('\n');
+  assert.ok(!/Still waiting\?/.test(text), 'an answered ticket was told it was being ignored');
+});
+
+test('/help and /about both carry the email', async () => {
+  for (const command of ['/help', '/about']) {
+    const { deliver, messages } = makeBot();
+    await deliver(privateMessage(command));
+    assert.match(lastText(messages, STUDENT.id), /appscsadhana@gmail\.com/, `${command} omits the email`);
+  }
+});
+
+test('an admin can change the support email, and a blank cell keeps the default', async () => {
+  const { deliver, messages } = makeBot({ settings: { support_email: 'help@example.org' } });
+  await deliver(privateMessage('/help'));
+  assert.match(lastText(messages, STUDENT.id), /help@example\.org/);
+  assert.ok(!/appscsadhana/.test(lastText(messages, STUDENT.id)));
+
+  // Not optional on purpose: the second door is a standing promise, so an
+  // empty cell falls back to the default rather than quietly removing it.
+  const blank = makeBot({ settings: { support_email: '' } });
+  await blank.deliver(privateMessage('/help'));
+  assert.match(lastText(blank.messages, STUDENT.id), /appscsadhana@gmail\.com/);
+});
+
+// ---------------------------------------------------------------------------
+// Two groups in one family
+// ---------------------------------------------------------------------------
+// Found by running the real bot: the news family sells two groups, so Continue
+// shows a picker rather than a pass. Choosing a group used the same callback as
+// "remove what is applied", which dropped the code the student had arrived
+// with — referrals could never work at all in a two-group family.
+
+/** A bot for the two-group news family, wired to a fake sheet. */
+function makeNewsBot(sheetOptions = {}) {
+  const sheet = fakeSheet(sheetOptions);
+  sheets.forGroup = () => sheet;
+  process.env.TELEGRAM_PAYBOT_NEWS = process.env.TELEGRAM_PAYBOT_NEWS || '124:TEST';
+
+  const app = createPaymentBot({ payBotEnv: 'TELEGRAM_PAYBOT_NEWS', polling: false });
+  const sent = [];
+  let nextId = 5000;
+  ['sendMessage', 'answerCallbackQuery', 'copyMessage', 'editMessageText', 'deleteMessage']
+    .forEach((method) => {
+      app.bot[method] = async (...args) => { sent.push({ method, args }); return { message_id: nextId++ }; };
+    });
+  app.bot.getMe = async () => BOT;
+  app.bot.getChatMember = async () => ({ status: 'left' });
+
+  const deliver = async (update) => {
+    app.bot.processUpdate(Object.assign({ update_id: nextId++ }, update));
+    await app.settle();
+  };
+  const messages = (chatId) => sent.filter((s) => s.method === 'sendMessage' &&
+    (chatId === undefined || String(s.args[0]) === String(chatId)));
+  const groups = app.familyGroups();
+  return { app, sheet, deliver, messages, groups };
+}
+
+test('a referral survives the group picker in a two-group family', async () => {
+  const { deliver, messages, groups } = makeNewsBot({ codes: [ASHA_CODE] });
+  assert.ok(groups.length > 1, 'this family should sell more than one group');
+
+  await deliver(privateMessage('/start ref_REFAJMXPQ', FRIEND));
+  await deliver(tap('go:plans', FRIEND));
+  assert.match(lastText(messages, FRIEND.id), /Which group/);
+
+  // The moment the code used to be lost.
+  await deliver(tap(`pick:${groups[0].id}`, FRIEND));
+  const pass = lastText(messages, FRIEND.id);
+  assert.match(pass, /Referral <b>REFAJMXPQ<\/b> applied/,
+    'picking a group dropped the code the student arrived with');
+  assert.match(pass, /₹179\.10/);
+});
+
+test('"Remove referral" clears it, and picking a group afterwards does not bring it back', async () => {
+  const { deliver, messages, groups } = makeNewsBot({ codes: [ASHA_CODE] });
+
+  await deliver(privateMessage('/start ref_REFAJMXPQ', FRIEND));
+  await deliver(tap(`pick:${groups[0].id}`, FRIEND));
+  assert.match(lastText(messages, FRIEND.id), /Referral <b>REFAJMXPQ<\/b> applied/);
+
+  await deliver(tap(`plain:${groups[0].id}`, FRIEND));
+  const plain = lastText(messages, FRIEND.id);
+  assert.ok(!/Referral <b>/.test(plain), 'Remove did not remove it');
+  assert.match(plain, /₹199/);
+});
+
+test('a code that cannot be used is not re-offered on every screen', async () => {
+  const { deliver, messages, groups } = makeNewsBot({ codes: [ASHA_CODE] });
+
+  // Asha following her own link, in a two-group family.
+  await deliver(privateMessage('/start ref_REFAJMXPQ', STUDENT));
+  await deliver(tap(`pick:${groups[0].id}`, STUDENT));
+  const first = messages(STUDENT.id).map((m) => m.args[1]).join('\n');
+  assert.match(first, /could not be used/);
+  assert.match(first, /your own referral code/);
+
+  // Looking at the other group must not repeat the refusal.
+  const before = messages(STUDENT.id).length;
+  await deliver(tap(`pick:${groups[1].id}`, STUDENT));
+  const after = messages(STUDENT.id).slice(before).map((m) => m.args[1]).join('\n');
+  assert.ok(!/could not be used/.test(after), 'the refusal was repeated on the next screen');
+});

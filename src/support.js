@@ -228,7 +228,14 @@ const SETTINGS = [
   {
     key: 'support_contact', section: 'support', label: 'Fallback contact', type: 'text', maxLength: 120,
     default: '', optional: true,
-    hint: 'Optional, e.g. @YourAdminHandle or an email. Shown when tickets are switched off.'
+    hint: 'Optional, e.g. @YourAdminHandle. Shown when tickets are switched off.'
+  },
+  {
+    key: 'support_email', section: 'support', label: 'Support email', type: 'text', maxLength: 120,
+    default: 'appscsadhana@gmail.com',
+    hint: 'The second way to reach you. Shown whenever a student raises a ticket, and ' +
+      'prominently when one has been waiting for a reply — so nobody is ever stuck ' +
+      'waiting on a chat that nobody is answering.'
   },
   {
     key: 'welcome_note', section: 'support', label: 'Extra /start message', type: 'textarea', maxLength: 1000,
@@ -303,6 +310,26 @@ const MAX_MESSAGE_CHARS = 3500;
 function esc(text) {
   return String(text === null || text === undefined ? '' : text)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * emailFallbackLine — the second way to reach a human.
+ *
+ * A student waiting on a chat nobody is answering has no idea whether they
+ * have been forgotten or are simply early, and no other door to try. This is
+ * that other door, and it is deliberately the same sentence everywhere it is
+ * offered so it reads as a standing promise rather than a special case.
+ *
+ * @param {Object} settings Normalised settings
+ * @param {boolean} [waiting] true when they have already been waiting for a reply
+ * @returns {string} HTML, or '' when no email is configured
+ */
+function emailFallbackLine(settings, waiting = false) {
+  const email = String((settings && settings.support_email) || '').trim();
+  if (!email) return '';
+  return waiting
+    ? `📧 Still waiting? Email us at <b>${esc(email)}</b> and we will pick it up there.`
+    : `📧 If you do not hear back, email us at <b>${esc(email)}</b>.`;
 }
 
 /** A category by id, falling back to "other". */
@@ -849,6 +876,7 @@ module.exports = {
   STATUS_LABELS,
   STATUS_MEANINGS,
   WAITING_LABELS,
+  emailFallbackLine,
   normaliseStatus,
   statusLabel,
   statusLine,
