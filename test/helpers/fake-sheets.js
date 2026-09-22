@@ -35,7 +35,7 @@ function fakeSheetsApi(book, spreadsheetId, { fallback = null } = {}) {
       throw new Error('fake sheets: unexpected request to ' + u.split('?')[0]);
     }
     const path = u.slice((SHEETS_API + spreadsheetId).length);
-    calls.push({ method, path });
+    calls.push({ method, path, body: init.body ? JSON.parse(init.body) : null });
 
     // Spreadsheet metadata (sheet ids, for formatting requests).
     if (method === 'GET' && /^\?fields=sheets/.test(path)) {
@@ -45,6 +45,10 @@ function fakeSheetsApi(book, spreadsheetId, { fallback = null } = {}) {
     if (method === 'POST' && path.startsWith(':batchUpdate')) {
       for (const request of JSON.parse(init.body).requests || []) {
         if (request.addSheet) book[request.addSheet.properties.title] = [];
+        if (request.deleteSheet) {
+          const title = Object.keys(book)[request.deleteSheet.sheetId - 100];
+          if (title) delete book[title];
+        }
       }
       return reply(200, { replies: [] });
     }

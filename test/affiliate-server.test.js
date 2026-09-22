@@ -240,3 +240,47 @@ test('the influencer bot\'s webhook refuses anything Telegram did not sign', asy
   });
   assert.equal(signed.status, 200, 'the signed probe set-webhooks sends must be accepted');
 });
+
+test('the daily sweep puts back a bot menu that drifted, and leaves a correct one alone', async () => {
+  const botCommands = require('../src/bot-commands');
+  // What Telegram holds, per token: UPSC still shows the old /referral entry.
+  const menus = {
+    '333:TEST': ['start', 'about', 'plans', 'status', 'referral', 'help', 'support', 'terms'],
+    '444:TEST': botCommands.STUDENT_COMMANDS.map((c) => c.command),
+    '777:TEST': []
+  };
+  const writes = [];
+  const previous = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const m = String(url).match(/^https:\/\/api\.telegram\.org\/bot([^/]+)\/(\w+)$/);
+    if (!m) return previous(url, init);
+    const [, token, method] = m;
+    const body = JSON.parse(init.body || '{}');
+    const reply = (result) => ({ json: async () => ({ ok: true, result }) });
+    if (method === 'getMyCommands') {
+      const scope = body.scope && body.scope.type;
+      return reply(scope === 'all_private_chats' ? (menus[token] || []).map((command) => ({ command, description: 'x' })) : []);
+    }
+    writes.push({ token, method, body });
+    if (method === 'setMyCommands' && body.scope.type === 'all_private_chats') menus[token] = body.commands.map((c) => c.command);
+    return reply(true);
+  };
+  try {
+    const results = await server.syncBotMenus();
+    const byBot = Object.fromEntries(results.map((r) => [r.bot, r]));
+    assert.equal(byBot.TELEGRAM_PAYBOT_UPSC.changed, true);
+    assert.deepEqual(byBot.TELEGRAM_PAYBOT_UPSC.was.includes('referral'), true);
+    assert.equal(byBot.TELEGRAM_PAYBOT_EPFO.changed, false, 'a correct menu was rewritten for nothing');
+    assert.equal(byBot.TELEGRAM_AFFILIATE_BOT.changed, true);
+    assert.ok(!menus['333:TEST'].includes('referral'), '/referral is still on the UPSC menu');
+    assert.deepEqual(menus['777:TEST'], botCommands.AFFILIATE_COMMANDS.map((c) => c.command));
+    assert.ok(!writes.some((w) => w.token === '444:TEST'), 'the EPFO bot was written to');
+
+    // Run again: everything is right, so nothing is written.
+    writes.length = 0;
+    await server.syncBotMenus();
+    assert.equal(writes.length, 0);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});

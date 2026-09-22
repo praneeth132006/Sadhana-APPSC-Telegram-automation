@@ -71,6 +71,34 @@ test('the sheet builds its own tabs, styled, on first use', async () => {
   }
 });
 
+test('the sheet is made readable: ₹ on money, coloured dropdowns on Status, no blank Sheet1', async () => {
+  const book = { Sheet1: [] };
+  const { calls } = fakeSheetsApi(book, 'AFFILIATESHEET1234567890abc');
+  await store.ensureTabs();
+  const requests = calls.filter((c) => c.path.startsWith(':batchUpdate')).flatMap((c) => c.body.requests);
+
+  const money = requests.filter((r) => r.repeatCell && r.repeatCell.fields === 'userEnteredFormat.numberFormat');
+  assert.equal(money.length, 9, 'Codes ×4, Sales ×4, Payouts ×1');
+  assert.equal(money[0].repeatCell.cell.userEnteredFormat.numberFormat.pattern, '"₹"#,##0.00');
+
+  const dropdowns = requests.filter((r) => r.setDataValidation);
+  assert.equal(dropdowns.length, 5, 'one per Status column');
+  const values = dropdowns.map((r) => r.setDataValidation.rule.condition.values.map((v) => v.userEnteredValue));
+  assert.ok(values.some((v) => v.join() === 'pending,approved,rejected'));
+  assert.ok(values.some((v) => v.join() === 'earned,requested,paid,cancelled'));
+  assert.ok(dropdowns.every((r) => r.setDataValidation.rule.strict === false), 'a dropdown must never refuse a write');
+
+  assert.ok(requests.filter((r) => r.addConditionalFormatRule).length >= 14);
+  assert.equal(book.Sheet1, undefined, 'the blank starter tab was left behind');
+});
+
+test('a Sheet1 with anything in it is never deleted', async () => {
+  const book = { Sheet1: [['my notes']] };
+  fakeSheetsApi(book, 'AFFILIATESHEET1234567890abc');
+  await store.ensureTabs();
+  assert.deepEqual(book.Sheet1, [['my notes']]);
+});
+
 test('an application is recorded once per exam, and refused while one is waiting', async () => {
   const { book } = fresh();
   const first = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube @ravi_teaches, 40k subscribers');

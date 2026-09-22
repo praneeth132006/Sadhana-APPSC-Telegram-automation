@@ -83,9 +83,8 @@ function fakeDom() {
     querySelector: () => null, querySelectorAll: () => [], addEventListener() {}
   };
   // The select boxes the page reads start at their first option.
-  for (const id of ['codeExam', 'codeStatus', 'saleStatus']) document.getElementById(id).value = 'all';
-  document.getElementById('codeSearch').value = '';
-  document.getElementById('saleSearch').value = '';
+  document.getElementById('examFilter').value = 'all';
+  document.getElementById('searchInput').value = '';
   return { Node, document, byId };
 }
 
@@ -165,12 +164,26 @@ async function renderPage(payload = PAYLOAD) {
 }
 
 const { dom, posted } = await renderPage();
-const area = (id) => dom.document.getElementById(id);
-const button = (id, text) => walk(area(id)).find((n) => n.tagName === 'BUTTON' && n.textContent === text);
+const byId = (id) => dom.document.getElementById(id);
+const body = () => byId('tabBody');
+const button = (text) => walk(body()).find((n) => n.tagName === 'BUTTON' && n.textContent === text);
+const openTab = (id) => byId(`tab-${id}`).click();
 const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r)); };
 
+test('the page opens on what needs a decision, with counts on every tab', () => {
+  const tabs = byId('tabs').textContent;
+  assert.match(tabs, /Applications1/);
+  assert.match(tabs, /Withdrawals1/);
+  assert.match(tabs, /Promo codes1/);
+  assert.match(tabs, /Sales2/);
+  assert.match(body().textContent, /Applications waiting/, 'the first view should be the waiting application');
+  const alert = walk(byId('tabs')).filter((n) => /sp-tab-count alert/.test(n.className));
+  assert.equal(alert.length, 2, 'applications and withdrawals waiting should be flagged');
+});
+
 test('the waiting application is on the page with who, which exam and where', () => {
-  const text = area('requestsArea').textContent;
+  openTab('requests');
+  const text = body().textContent;
   assert.match(text, /Priya \(@priya_edu\)/);
   assert.match(text, /777/);
   assert.match(text, /EPFO/);
@@ -179,13 +192,14 @@ test('the waiting application is on the page with who, which exam and where', ()
 });
 
 test('approving sends the request id and every term, with the suggested code', async () => {
-  button('requestsArea', 'Approve…').click();
-  const codeInput = walk(area('requestsArea')).find((n) => n.tagName === 'INPUT' && /pc-code-input/.test(n.className));
+  openTab('requests');
+  button('Approve…').click();
+  const codeInput = walk(body()).find((n) => n.tagName === 'INPUT' && /pc-code-input/.test(n.className));
   assert.ok(codeInput, 'no approval form opened');
   assert.equal(codeInput.value, 'PRIYAEPFO42');
-  assert.match(area('requestsArea').textContent, /the student pays .*₹179\.10.*the influencer earns .*₹35\.82/,
+  assert.match(body().textContent, /the student pays .*₹179\.10.*the influencer earns .*₹35\.82/,
     'the live preview of one sale is missing');
-  button('requestsArea', 'Approve and send the code').click();
+  button('Approve and send the code').click();
   await settle();
   const sent = posted.find((p) => p.path === '/api/affiliates/approve');
   assert.ok(sent, 'nothing was sent');
@@ -196,50 +210,66 @@ test('approving sends the request id and every term, with the suggested code', a
 });
 
 test('a withdrawal shows the UPI ID and amount, and marking it paid sends the reference', async () => {
-  const text = area('payoutsArea').textContent;
+  openTab('payouts');
+  const text = body().textContent;
   assert.match(text, /ravi@okicici/);
   assert.match(text, /₹35\.82/);
-  button('payoutsArea', 'Mark paid…').click();
-  dom.document.getElementById('pay-WD-20260922-CCCCCC').value = 'UTR412345678901';
-  button('payoutsArea', 'I have sent ₹35.82 — mark paid').click();
+  button('Mark paid…').click();
+  byId('pay-WD-20260922-CCCCCC').value = 'UTR412345678901';
+  button('I have sent ₹35.82 — mark paid').click();
   await settle();
   const sent = posted.find((p) => p.path === '/api/affiliates/payout');
   assert.deepEqual(sent.body, { payoutId: 'WD-20260922-CCCCCC', decision: 'paid', reference: 'UTR412345678901', reason: '' });
 });
 
 test('each code shows its terms and what is owed, and opens into its sales', () => {
-  const text = area('codesArea').textContent;
+  openTab('codes');
+  const text = body().textContent;
   assert.match(text, /RAVI10/);
   assert.match(text, /10% off/);
   assert.match(text, /20% of paid/);
   assert.match(text, /min ₹100/);
   assert.match(text, /₹71\.64/, 'owed = available + requested');
-  const row = walk(area('codesArea')).find((n) => n.tagName === 'TR' && /inf-row/.test(n.className));
+  const row = walk(body()).find((n) => n.tagName === 'TR' && /inf-row/.test(n.className));
   row.click();
-  assert.match(area('codesArea').textContent, /pay_AAA/);
-  assert.match(area('codesArea').textContent, /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
+  assert.match(body().textContent, /pay_AAA/);
+  assert.match(body().textContent, /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
 });
 
 test('every sale is listed with both sides\' ids and the money', () => {
-  const text = area('salesArea').textContent;
+  openTab('sales');
+  const text = body().textContent;
   for (const s of ['pay_AAA', 'pay_BBB', '9001', '9002', '₹179.10', '₹35.82', 'SALE-1', 'WD-20260922-CCCCCC']) {
     assert.ok(text.includes(s), `${s} is missing from the sales table`);
   }
 });
 
-test('the headline numbers and the history are on the page', () => {
-  assert.match(area('statGrid').textContent, /Applications Waiting/);
-  assert.match(area('statGrid').textContent, /₹358\.20/);
-  assert.match(area('historyArea').textContent, /Approved → RAVI10/);
+test('the search box narrows whichever section is open', () => {
+  openTab('sales');
+  byId('searchInput').value = 'meena';
+  (byId('searchInput').listeners.input || []).forEach((fn) => fn({}));
+  const text = body().textContent;
+  assert.ok(text.includes('pay_BBB'));
+  assert.ok(!text.includes('pay_AAA'), 'the search did not filter');
+  byId('searchInput').value = '';
+  (byId('searchInput').listeners.input || []).forEach((fn) => fn({}));
 });
 
-test('before the sheet exists, the page says exactly what to set up', async () => {
+test('the headline numbers and the history are on the page', () => {
+  assert.match(byId('statGrid').textContent, /Applications Waiting/);
+  assert.match(byId('statGrid').textContent, /₹358\.20/);
+  openTab('history');
+  assert.match(body().textContent, /Approved → RAVI10/);
+});
+
+test('before the sheet exists, the page says exactly what to set up, as banners', async () => {
   const { dom: empty } = await renderPage({
     status: { sheet: false, bot: false, adminChat: false, serviceAccount: 'sheets-bot@x.iam.gserviceaccount.com' },
     notReady: true
   });
-  const text = empty.document.getElementById('setupArea').textContent;
+  const text = empty.document.getElementById('notices').textContent;
   assert.match(text, /sheets-bot@x\.iam\.gserviceaccount\.com/);
   assert.match(text, /AFFILIATE_SHEET_ID/);
   assert.match(text, /TELEGRAM_AFFILIATE_BOT/);
+  assert.match(empty.document.getElementById('tabBody').textContent, /not set up yet/);
 });

@@ -629,9 +629,142 @@ async function overview() {
   return { influencers, requests, codes, sales, payouts };
 }
 
-/** Creates every tab, for a freshly shared sheet. Safe to run again. */
+// ---------------------------------------------------------------------------
+// Making the sheet readable
+// ---------------------------------------------------------------------------
+
+/** Money columns, shown as ₹1,234.50. */
+const MONEY_COLUMNS = {
+  codes: ['Min Payout', 'Revenue', 'Commission Earned', 'Commission Paid'],
+  sales: ['List Price', 'Discount', 'Paid', 'Commission'],
+  payouts: ['Amount']
+};
+
+/** Every value a Status column can hold, and its colours — the Subscribers tab's palette. */
+const STATUS_COLOURS = {
+  influencers: { active: 'ok', blocked: 'bad' },
+  requests: { pending: 'wait', approved: 'ok', rejected: 'bad' },
+  codes: { active: 'ok', paused: 'off' },
+  sales: { earned: 'info', requested: 'wait', paid: 'ok', cancelled: 'off' },
+  payouts: { requested: 'wait', paid: 'ok', rejected: 'bad' }
+};
+const TONES = {
+  ok: ['#c8e6c9', '#1b5e20'],
+  wait: ['#fff9c4', '#f57f17'],
+  bad: ['#ffcdd2', '#b71c1c'],
+  off: ['#eceff1', '#455a64'],
+  info: ['#e3f2fd', '#0d47a1']
+};
+
+function colour(hex) {
+  return {
+    red: parseInt(hex.slice(1, 3), 16) / 255,
+    green: parseInt(hex.slice(3, 5), 16) / 255,
+    blue: parseInt(hex.slice(5, 7), 16) / 255
+  };
+}
+
+/**
+ * styleWorkbook — ₹ formatting on money, a coloured dropdown on every Status
+ * column, and the blank "Sheet1" a new spreadsheet starts with removed.
+ *
+ * Safe to run again: it clears the conditional rules on these tabs before
+ * adding its own, so they never pile up. Best effort — a formatting failure
+ * never costs a record.
+ */
+async function styleWorkbook() {
+  const c = ctx();
+  const columnsOf = {};
+  for (const table of Object.keys(TABLES)) columnsOf[table] = (await read(table)).columns;
+
+  const meta = await call('GET', `/${c.spreadsheetId}?fields=sheets(properties(sheetId,title),conditionalFormats)`);
+  const sheetsByTitle = new Map((meta.sheets || []).map((sh) => [sh.properties.title, sh]));
+  const requests = [];
+
+  for (const [table, { tab }] of Object.entries(TABLES)) {
+    const sheet = sheetsByTitle.get(tab);
+    if (!sheet) continue;
+    const sheetId = sheet.properties.sheetId;
+    const columns = columnsOf[table];
+
+    // Old rules first, last to first so the indexes stay valid.
+    for (let i = (sheet.conditionalFormats || []).length - 1; i >= 0; i--) {
+      requests.push({ deleteConditionalFormatRule: { sheetId, index: i } });
+    }
+
+    for (const header of MONEY_COLUMNS[table] || []) {
+      const col = columns.indexOf(header);
+      if (col === -1) continue;
+      requests.push({
+        repeatCell: {
+          range: { sheetId, startRowIndex: 1, startColumnIndex: col, endColumnIndex: col + 1 },
+          cell: { userEnteredFormat: { numberFormat: { type: 'CURRENCY', pattern: '"₹"#,##0.00' } } },
+          fields: 'userEnteredFormat.numberFormat'
+        }
+      });
+    }
+
+    const statusCol = columns.indexOf('Status');
+    const statuses = STATUS_COLOURS[table];
+    if (statusCol !== -1 && statuses) {
+      const range = { sheetId, startRowIndex: 1, startColumnIndex: statusCol, endColumnIndex: statusCol + 1 };
+      Object.entries(statuses).forEach(([value, tone], index) => {
+        requests.push({
+          addConditionalFormatRule: {
+            index,
+            rule: {
+              ranges: [range],
+              booleanRule: {
+                condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: value }] },
+                format: { backgroundColor: colour(TONES[tone][0]), textFormat: { foregroundColor: colour(TONES[tone][1]), bold: true } }
+              }
+            }
+          }
+        });
+      });
+      // A dropdown, so a status typed by hand is one the code understands.
+      // Not strict: a warning, never a refused write.
+      requests.push({
+        setDataValidation: {
+          range,
+          rule: {
+            condition: { type: 'ONE_OF_LIST', values: Object.keys(statuses).map((v) => ({ userEnteredValue: v })) },
+            strict: false,
+            showCustomUi: true
+          }
+        }
+      });
+    }
+  }
+
+  // The empty tab every new spreadsheet starts with, removed only if empty.
+  const blank = ['Sheet1', 'Sheet 1'].map((t) => sheetsByTitle.get(t)).find(Boolean);
+  if (blank && !Object.values(TABLES).some((t) => t.tab === blank.properties.title)) {
+    let empty = false;
+    try {
+      const body = await call('GET', `/${c.spreadsheetId}/values/${encodeURIComponent(`${quoteTab(blank.properties.title)}!A1:Z50`)}`);
+      empty = !(body.values || []).some((row) => row.some((v) => String(v || '').trim()));
+    } catch (err) {
+      empty = false;
+    }
+    if (empty) requests.push({ deleteSheet: { sheetId: blank.properties.sheetId } });
+  }
+
+  if (requests.length) {
+    try {
+      await call('POST', `/${c.spreadsheetId}:batchUpdate`, { requests });
+    } catch (err) {
+      console.warn(`[affiliates] could not style the sheet: ${err.message}`);
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Creates every tab, styled, for a freshly shared sheet. Safe to run again. */
 async function ensureTabs() {
   for (const table of Object.keys(TABLES)) await read(table);
+  await styleWorkbook();
   return Object.values(TABLES).map((t) => t.tab);
 }
 
@@ -640,6 +773,7 @@ module.exports = {
   isConfigured,
   spreadsheetId,
   ensureTabs,
+  styleWorkbook,
   getInfluencer,
   upsertInfluencer,
   setUpi,

@@ -14,7 +14,7 @@
 // ============================================================================
 
 import {
-  initDashboard, api, el, replaceChildren, statCard, emptyState, pill, num, showToast, $
+  initDashboard, api, el, replaceChildren, statCard, emptyState, pill, num, showToast, panel, $
 } from './shared.js';
 
 /** Latest /api/affiliates payload. */
@@ -23,6 +23,10 @@ let data = null;
 /** Which code rows are open, and which request/payout has a form open. */
 const openCodes = new Set();
 let openForm = null;
+
+/** The section on screen, and the filters inside it. */
+let activeTab = null;
+const filters = { codeStatus: 'all', saleStatus: 'all' };
 
 /** Paise as "₹1,250.00". */
 function rupees(paise) {
@@ -93,7 +97,7 @@ async function post(path, body, button, label) {
       const result = await api(path, { method: 'POST', body });
       showToast('success', result.message || 'Done.', 7000);
       openForm = null;
-      await load();
+      await load({ quiet: true });
       return result;
     } catch (err) {
       showToast('error', err.message, 9000);
@@ -152,7 +156,7 @@ function termsForm({ initial, examId, codeEditable, submitLabel, onSubmit, onCan
   code.addEventListener('input', () => { code.value = code.value.toUpperCase().replace(/\s+/g, ''); });
   const discountType = select('dtype', [['percent', '% off'], ['flat', '₹ off']], t.discount_type);
   const discountValue = input('dval', { type: 'number', min: '1', step: '1', inputmode: 'numeric' }, t.discount_value);
-  const commissionType = select('ctype', [['percent', '% of what the student pays'], ['flat', '₹ per sale']], t.commission_type);
+  const commissionType = select('ctype', [['percent', '% of paid'], ['flat', '₹ per sale']], t.commission_type);
   const commissionValue = input('cval', { type: 'number', min: '1', step: '1', inputmode: 'numeric' }, t.commission_value);
   const cycle = select('cycle', [['weekly', 'Weekly'], ['monthly', 'Monthly']], t.payout_cycle);
   const minPayout = input('min', { type: 'number', min: '0', step: '1', inputmode: 'numeric' }, t.min_payout);
@@ -194,8 +198,8 @@ function termsForm({ initial, examId, codeEditable, submitLabel, onSubmit, onCan
   return el('div', { class: 'pc-form' }, [
     el('div', { class: 'support-fields' }, [
       field('Promo code', code, codeEditable ? 'Suggested from their name. Change it if you like — 3–20 letters or numbers.' : 'A code cannot be renamed.'),
-      field('Student discount', el('div', { class: 'inf-actions' }, discountType, discountValue), `On the ${rupees(pricePaise)} ${examLabel(examId)} pass.`),
-      field('Influencer commission', el('div', { class: 'inf-actions' }, commissionType, commissionValue), 'Worked out on what the student actually pays.'),
+      field('Student discount', el('div', { class: 'inf-pair' }, discountType, discountValue), `On the ${rupees(pricePaise)} ${examLabel(examId)} pass.`),
+      field('Influencer commission', el('div', { class: 'inf-pair' }, commissionType, commissionValue), 'Worked out on what the student actually pays.'),
       field('Withdrawals', cycle, 'How often they can ask to be paid.'),
       field('Minimum withdrawal (₹)', minPayout, '0 for no minimum.'),
       field('Code valid until', expires, 'Blank: no end date.'),
@@ -209,59 +213,161 @@ function termsForm({ initial, examId, codeEditable, submitLabel, onSubmit, onCan
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Filters shared by every section
 // ---------------------------------------------------------------------------
 
-function renderSetup() {
+function examMatches(examId) {
+  const exam = $('examFilter').value;
+  return !exam || exam === 'all' || examId === exam;
+}
+
+function searchMatches(...fields) {
+  const q = $('searchInput').value.trim().toLowerCase();
+  return !q || haystack(...fields).includes(q);
+}
+
+function filterBar(items) {
+  return el('div', { class: 'filter-bar' }, items.map(([label, input]) =>
+    el('div', { class: 'filter-item' }, [el('label', { text: label }), input])));
+}
+
+function statusSelect(key, options) {
+  const select = el('select', { class: 'field-select', 'aria-label': 'Status' },
+    options.map(([value, text]) => el('option', { value, text })));
+  select.value = filters[key];
+  select.addEventListener('change', () => { filters[key] = select.value; renderActiveTab(); });
+  return select;
+}
+
+// ---------------------------------------------------------------------------
+// Around the sections: notices, headline numbers, how it works, tabs
+// ---------------------------------------------------------------------------
+
+function banner(tone, title, text) {
+  return el('div', { class: `banner tone-${tone}` }, el('div', { class: 'banner-body' }, [
+    el('strong', { text: title + ' ' }), el('span', {}, text)
+  ]));
+}
+
+function renderNotices() {
   const s = data.status || {};
-  const missing = [];
+  const notes = [];
   if (!s.sheet) {
-    missing.push(el('li', {}, 'Create a blank Google Sheet, share it with ', el('code', { text: s.serviceAccount || 'the service account' }),
-      ' as an Editor, and set ', el('code', { text: 'AFFILIATE_SHEET_ID' }), ' to its link.'));
+    notes.push(banner('warn', 'No influencer sheet.', [
+      'Create a blank Google Sheet, share it with ', el('code', { text: s.serviceAccount || 'the service account' }),
+      ' as an Editor, and set AFFILIATE_SHEET_ID to its link.'
+    ]));
   }
-  if (!s.bot) missing.push(el('li', {}, 'Create the influencer bot with @BotFather and set ', el('code', { text: 'TELEGRAM_AFFILIATE_BOT' }), '.'));
-  if (!s.adminChat) missing.push(el('li', {}, 'No admin chat for alerts: set SUPPORT_CHAT_ID (or AFFILIATE_ADMIN_CHAT_ID) and add the influencer bot to it.'));
+  if (!s.bot) notes.push(banner('warn', 'No influencer bot.', 'Create it with @BotFather and set TELEGRAM_AFFILIATE_BOT.'));
+  if (s.bot && !s.adminChat) {
+    notes.push(banner('info', 'No admin chat.', 'New applications and withdrawals only appear on this page. Set SUPPORT_CHAT_ID and add the influencer bot to it.'));
+  }
+  replaceChildren($('notices'), notes.length ? el('div', { class: 'sp-notices' }, notes) : null);
 
-  $('botBadge').textContent = data.botUsername ? `Influencer bot: @${data.botUsername}` : '';
+  $('botBadge').textContent = data.botUsername ? `@${data.botUsername}` : '';
   const link = $('sheetLink');
-  if (s.sheetUrl) { link.href = s.sheetUrl; link.style.display = ''; } else link.style.display = 'none';
+  link.hidden = !s.sheetUrl;
+  if (s.sheetUrl) link.href = s.sheetUrl;
+}
 
-  replaceChildren($('setupArea'), missing.length
-    ? el('section', { class: 'panel' }, el('div', { class: 'panel-body inf-setup' },
-      el('strong', { text: '⚙️ Finish setting up the influencer programme' }), el('ul', {}, missing)))
-    : null);
+function renderHowItWorks() {
+  const steps = (items) => el('ol', {}, items.map((t) => el('li', { text: t })));
+  replaceChildren($('howItWorks'), el('div', { class: 'panel-body inf-howto' }, [
+    el('div', {}, [el('h3', { text: 'What an influencer does' }), steps([
+      `Opens ${data && data.botUsername ? '@' + data.botUsername : 'the influencer bot'}, taps Apply, picks an exam and says where they will promote it.`,
+      'Gets their promo code and link the moment you approve — the link opens that exam\'s payment bot with the code applied.',
+      'Is messaged on every sale, and taps Withdraw when their weekly or monthly cycle comes round.'
+    ])]),
+    el('div', {}, [el('h3', { text: 'What you do here' }), steps([
+      'Applications: approve with the student discount, their commission, the payout cycle and minimum — or reject with a reason.',
+      'Withdrawals: send the money over UPI first, then mark it paid with the UPI reference. Rejecting puts it back in their balance.',
+      'Promo codes: pause a code to stop it being used, or change its terms. Past sales keep what they earned.'
+    ])]),
+    el('div', {}, [el('h3', { text: 'Rules the bots enforce' }), steps([
+      'A code works only in the payment bot of the exam it was approved for.',
+      'An influencer cannot use their own code, and a code can never clash with a coupon.',
+      'Commission is counted once per payment, on what the student actually paid.'
+    ])])
+  ]));
 }
 
 function renderStats() {
-  const t = data.totals;
+  const t = data.totals || {};
   replaceChildren($('statGrid'),
-    statCard('Influencers', num(t.influencers), { tone: 'info', sub: `${num(t.activeCodes)} active code(s)` }),
-    statCard('Applications Waiting', num(t.pendingRequests), { tone: t.pendingRequests ? 'warn' : 'ok', sub: 'need a decision' }),
-    statCard('Students via Codes', num(t.uses), { tone: 'ok', sub: `paid ${rupees(t.revenuePaise)}` }),
+    statCard('Influencers', num(t.influencers || 0), { tone: 'info', sub: `${num(t.activeCodes || 0)} active code(s)` }),
+    statCard('Applications Waiting', num(t.pendingRequests || 0), { tone: t.pendingRequests ? 'warn' : 'ok', sub: 'need a decision' }),
+    statCard('Students via Codes', num(t.uses || 0), { tone: 'ok', sub: `paid ${rupees(t.revenuePaise)}` }),
     statCard('Commission Earned', rupees(t.earnedPaise), { tone: 'info', sub: `students saved ${rupees(t.discountPaise)}` }),
-    statCard('Owed to Influencers', rupees(t.availablePaise + t.requestedPaise), {
-      tone: t.requestedPaise ? 'warn' : 'ok', sub: `${rupees(t.requestedPaise)} requested (${num(t.openPayouts)})`
+    statCard('Owed to Influencers', rupees((t.availablePaise || 0) + (t.requestedPaise || 0)), {
+      tone: t.requestedPaise ? 'warn' : 'ok', sub: `${rupees(t.requestedPaise)} requested (${num(t.openPayouts || 0)})`
     }),
     statCard('Paid Out', rupees(t.paidPaise), { tone: 'muted', sub: 'withdrawals sent' })
   );
 }
 
-function renderRequests() {
-  const pending = data.requests.filter((r) => r.status === 'pending');
-  if (!pending.length) {
-    replaceChildren($('requestsArea'), emptyState('✅', 'No applications waiting.',
-      data.botUsername ? `Influencers apply in @${data.botUsername}.` : 'Influencers apply through the influencer bot.'));
+const TABS = [
+  { id: 'requests', label: 'Applications', count: () => pendingRequests().length, alert: true },
+  { id: 'payouts', label: 'Withdrawals', count: () => openPayouts().length, alert: true },
+  { id: 'codes', label: 'Promo codes', count: () => (data.codes || []).length },
+  { id: 'sales', label: 'Sales', count: () => (data.sales || []).length },
+  { id: 'history', label: 'History', count: () => historyRows().length }
+];
+
+function renderTabs() {
+  replaceChildren($('tabs'), TABS.map((tab) => {
+    const count = data.notReady ? 0 : tab.count();
+    return el('button', {
+      id: `tab-${tab.id}`,
+      class: 'sp-tab' + (activeTab === tab.id ? ' active' : ''),
+      role: 'tab',
+      'aria-selected': activeTab === tab.id ? 'true' : 'false',
+      onclick: () => { activeTab = tab.id; openForm = null; renderTabs(); renderActiveTab(); }
+    }, [
+      el('span', { text: tab.label }),
+      el('span', { class: 'sp-tab-count' + (tab.alert && count ? ' alert' : ''), text: num(count) })
+    ]);
+  }));
+}
+
+function renderActiveTab() {
+  const host = $('tabBody');
+  if (data.notReady) {
+    replaceChildren(host, panel('Nothing to show yet', 'Finish the setup above, then refresh',
+      emptyState('⚙️', 'The influencer programme is not set up yet.', 'Once the sheet and the bot are in place, applications appear here.')));
     return;
+  }
+  const view = {
+    requests: requestsPanel, payouts: payoutsPanel, codes: codesPanel, sales: salesPanel, history: historyPanel
+  }[activeTab] || requestsPanel;
+  replaceChildren(host, view());
+}
+
+// ---------------------------------------------------------------------------
+// Applications
+// ---------------------------------------------------------------------------
+
+function pendingRequests() {
+  return (data.requests || []).filter((r) => r.status === 'pending');
+}
+
+function requestsPanel() {
+  const pending = pendingRequests().filter((r) => examMatches(r.exam) &&
+    searchMatches(r.name, r.username, r.telegram_id, r.details, r.request_id));
+  const title = '📝 Applications waiting';
+  const subtitle = 'Approve with the terms you choose — the code is created and sent to the influencer — or reject';
+  if (!pending.length) {
+    return panel(title, subtitle, emptyState('✅', pendingRequests().length ? 'No application matches the filters.' : 'No applications waiting.',
+      data.botUsername ? `Influencers apply in @${data.botUsername}.` : 'Influencers apply through the influencer bot.'));
   }
   const rows = [];
   for (const r of pending) {
     const approve = el('button', { class: 'btn btn-primary', text: 'Approve…' });
     const reject = el('button', { class: 'btn btn-ghost', text: 'Reject…' });
-    approve.addEventListener('click', () => { openForm = `approve:${r.request_id}`; renderRequests(); });
-    reject.addEventListener('click', () => { openForm = `reject:${r.request_id}`; renderRequests(); });
+    approve.addEventListener('click', () => { openForm = `approve:${r.request_id}`; renderActiveTab(); });
+    reject.addEventListener('click', () => { openForm = `reject:${r.request_id}`; renderActiveTab(); });
     rows.push(el('tr', {},
-      el('td', {}, el('div', { text: who(r.name, r.username, '') }), copyable(r.telegram_id)),
-      el('td', {}, el('strong', { text: examLabel(r.exam) })),
+      el('td', {}, el('div', { text: who(r.name, r.username, '') }), el('div', { class: 'inf-sub' }, copyable(r.telegram_id))),
+      el('td', {}, pill(examLabel(r.exam), 'info')),
       el('td', {}, el('div', { class: 'inf-details', text: r.details })),
       el('td', {}, el('div', { text: r.created_at }), el('div', { class: 'inf-sub inf-id', text: r.request_id })),
       el('td', {}, el('div', { class: 'inf-actions' }, approve, reject))));
@@ -269,8 +375,8 @@ function renderRequests() {
     if (openForm === `approve:${r.request_id}`) {
       rows.push(el('tr', { class: 'inf-form-row' }, el('td', { colspan: '5' }, termsForm({
         initial: { code: r.suggested_code }, examId: r.exam, codeEditable: true,
-        submitLabel: `Approve and send the code`,
-        onCancel: () => { openForm = null; renderRequests(); },
+        submitLabel: 'Approve and send the code',
+        onCancel: () => { openForm = null; renderActiveTab(); },
         onSubmit: (terms, button) => post('/api/affiliates/approve', { requestId: r.request_id, terms }, button, 'Approving…')
       }))));
     }
@@ -282,29 +388,40 @@ function renderRequests() {
       rows.push(el('tr', { class: 'inf-form-row' }, el('td', { colspan: '5' }, el('div', { class: 'pc-form' },
         field('Reason (optional)', reason),
         el('div', { class: 'support-actions end' },
-          el('button', { class: 'btn btn-ghost', text: 'Cancel', onclick: () => { openForm = null; renderRequests(); } }), confirm)))));
+          el('button', { class: 'btn btn-ghost', text: 'Cancel', onclick: () => { openForm = null; renderActiveTab(); } }), confirm)))));
     }
   }
-  replaceChildren($('requestsArea'), table(['Influencer', 'Exam', 'Where they will promote', 'Applied', ''], rows));
+  return panel(title, subtitle, el('div', { class: 'table-wrap' }, table(['Influencer', 'Exam', 'Where they will promote', 'Applied', ''], rows)));
 }
 
-function renderPayouts() {
-  const open = data.payouts.filter((p) => p.status === 'requested');
+// ---------------------------------------------------------------------------
+// Withdrawals
+// ---------------------------------------------------------------------------
+
+function openPayouts() {
+  return (data.payouts || []).filter((p) => p.status === 'requested');
+}
+
+function payoutsPanel() {
+  const open = openPayouts().filter((p) => examMatches(p.exam) &&
+    searchMatches(p.name, p.username, p.influencer_id, p.code, p.upi_id, p.payout_id));
+  const title = '💸 Withdrawals to pay';
+  const subtitle = 'Send the money over UPI first, then mark it paid with the reference — the influencer is told';
   if (!open.length) {
-    replaceChildren($('payoutsArea'), emptyState('✅', 'No withdrawals waiting.', 'Influencers request them from the bot once their cycle comes round.'));
-    return;
+    return panel(title, subtitle, emptyState('✅', openPayouts().length ? 'No withdrawal matches the filters.' : 'No withdrawals waiting.',
+      'Influencers request them from the bot once their cycle comes round.'));
   }
   const rows = [];
   for (const p of open) {
     const paid = el('button', { class: 'btn btn-primary', text: 'Mark paid…' });
     const reject = el('button', { class: 'btn btn-ghost', text: 'Reject…' });
-    paid.addEventListener('click', () => { openForm = `paid:${p.payout_id}`; renderPayouts(); });
-    reject.addEventListener('click', () => { openForm = `rejectpay:${p.payout_id}`; renderPayouts(); });
+    paid.addEventListener('click', () => { openForm = `paid:${p.payout_id}`; renderActiveTab(); });
+    reject.addEventListener('click', () => { openForm = `rejectpay:${p.payout_id}`; renderActiveTab(); });
     rows.push(el('tr', {},
-      el('td', {}, el('div', { text: who(p.name, p.username, '') }), copyable(p.influencer_id)),
-      el('td', {}, el('code', { text: p.code }), el('div', { class: 'inf-sub', text: examLabel(p.exam) })),
+      el('td', {}, el('div', { text: who(p.name, p.username, '') }), el('div', { class: 'inf-sub' }, copyable(p.influencer_id))),
+      el('td', {}, el('code', { class: 'pc-code', text: p.code }), el('div', { class: 'inf-sub', text: examLabel(p.exam) })),
       el('td', {}, copyable(p.upi_id)),
-      el('td', {}, el('strong', { text: rupees(p.amount_paise) }), el('div', { class: 'inf-sub', text: `${p.sales} sale(s)` })),
+      el('td', {}, el('div', { class: 'inf-money', text: rupees(p.amount_paise) }), el('div', { class: 'inf-sub', text: `${p.sales} sale(s)` })),
       el('td', {}, el('div', { text: p.requested_at }), el('div', { class: 'inf-sub inf-id', text: p.payout_id })),
       el('td', {}, el('div', { class: 'inf-actions' }, paid, reject))));
 
@@ -320,45 +437,48 @@ function renderPayouts() {
         field(isPaid ? `UPI reference for ${rupees(p.amount_paise)} to ${p.upi_id}` : 'Reason', input,
           isPaid ? 'Required. The influencer is sent this so they can find the payment.' : 'Its sales go back to their balance.'),
         el('div', { class: 'support-actions end' },
-          el('button', { class: 'btn btn-ghost', text: 'Cancel', onclick: () => { openForm = null; renderPayouts(); } }), confirm)))));
+          el('button', { class: 'btn btn-ghost', text: 'Cancel', onclick: () => { openForm = null; renderActiveTab(); } }), confirm)))));
     }
   }
-  replaceChildren($('payoutsArea'), table(['Influencer', 'Code', 'UPI ID', 'Amount', 'Requested', ''], rows));
+  return panel(title, subtitle, el('div', { class: 'table-wrap' }, table(['Influencer', 'Code', 'UPI ID', 'Amount', 'Requested', ''], rows)));
+}
+
+// ---------------------------------------------------------------------------
+// Promo codes and sales
+// ---------------------------------------------------------------------------
+
+function saleStatusPill(status) {
+  return pill(status === 'earned' ? 'available' : status, status === 'paid' ? 'ok' : status === 'requested' ? 'warn' : status === 'cancelled' ? 'muted' : 'info');
 }
 
 function saleRows(sales) {
   return sales.map((s) => el('tr', {},
     el('td', {}, el('div', { text: s.timestamp }), el('div', { class: 'inf-sub inf-id', text: s.sale_id })),
-    el('td', {}, el('code', { text: s.code })),
+    el('td', {}, el('code', { class: 'pc-code', text: s.code })),
     el('td', { text: s.group || examLabel(s.exam) }),
-    el('td', {}, el('div', { text: who(s.student_name, s.student_username, '') }), copyable(s.student_id)),
+    el('td', {}, el('div', { text: who(s.student_name, s.student_username, '') }), el('div', { class: 'inf-sub' }, copyable(s.student_id))),
     el('td', {}, copyable(s.payment_id)),
     el('td', { text: rupees(s.list_price_paise) }),
     el('td', { text: rupees(s.discount_paise) }),
     el('td', { text: rupees(s.paid_paise) }),
-    el('td', {}, el('strong', { text: rupees(s.commission_paise) })),
-    el('td', {}, pill(s.status === 'earned' ? 'available' : s.status, s.status === 'paid' ? 'ok' : s.status === 'requested' ? 'warn' : 'info'),
-      s.payout_id ? el('div', { class: 'inf-sub inf-id', text: s.payout_id }) : null)));
+    el('td', {}, el('span', { class: 'inf-money', text: rupees(s.commission_paise) })),
+    el('td', {}, saleStatusPill(s.status), s.payout_id ? el('div', { class: 'inf-sub inf-id', text: s.payout_id }) : null)));
 }
 const SALE_HEADERS = ['When', 'Code', 'Group', 'Student', 'Payment ID', 'List', 'Discount', 'Paid', 'Commission', 'Status'];
 
-function renderCodes() {
-  const q = $('codeSearch').value.trim().toLowerCase();
-  const exam = $('codeExam').value;
-  const status = $('codeStatus').value;
-  const codes = data.codes.filter((c) =>
-    (!q || haystack(c.code, c.name, c.username, c.telegram_id).includes(q)) &&
-    (exam === 'all' || c.exam === exam) &&
-    (status === 'all' || (status === 'owed' ? c.stats.availablePaise + c.stats.requestedPaise > 0 : c.status === status)));
+function codesPanel() {
+  const all = data.codes || [];
+  const codes = all.filter((c) => examMatches(c.exam) &&
+    searchMatches(c.code, c.name, c.username, c.telegram_id, c.upi_id) &&
+    (filters.codeStatus === 'all' || (filters.codeStatus === 'owed'
+      ? c.stats.availablePaise + c.stats.requestedPaise > 0 : c.status === filters.codeStatus)));
+  const bar = filterBar([['Status', statusSelect('codeStatus', [
+    ['all', 'Any status'], ['active', 'Active'], ['paused', 'Paused'], ['owed', 'Money owed']])]]);
+  const title = '🎁 Promo codes';
+  const subtitle = 'Click a code to see its sales. Pause a code to stop it being used — its history stays.';
 
-  if (!data.codes.length) {
-    replaceChildren($('codesArea'), emptyState('🎁', 'No promo codes yet.', 'A code is created when you approve an application.'));
-    return;
-  }
-  if (!codes.length) {
-    replaceChildren($('codesArea'), emptyState('🔍', 'No code matches those filters.'));
-    return;
-  }
+  if (!all.length) return panel(title, subtitle, emptyState('🎁', 'No promo codes yet.', 'A code is created when you approve an application.'));
+  if (!codes.length) return panel(title, subtitle, [bar, emptyState('🔍', 'No code matches those filters.')]);
 
   const rows = [];
   for (const c of codes) {
@@ -372,74 +492,91 @@ function renderCodes() {
     edit.addEventListener('click', (event) => {
       event.stopPropagation();
       openForm = openForm === `edit:${c.code}` ? null : `edit:${c.code}`;
-      renderCodes();
+      renderActiveTab();
     });
 
     const row = el('tr', { class: 'inf-row' + (isOpen ? ' open' : '') },
-      el('td', {}, el('span', { class: 'chev', text: '▸' }), ' ', el('code', { text: c.code })),
-      el('td', { text: examLabel(c.exam) }),
-      el('td', {}, el('div', { text: who(c.name, c.username, '') }), copyable(c.telegram_id)),
+      el('td', {}, el('span', { class: 'chev', text: '▸' }), ' ', el('code', { class: 'pc-code', text: c.code })),
+      el('td', {}, pill(examLabel(c.exam), 'info')),
+      el('td', {}, el('div', { text: who(c.name, c.username, '') }), el('div', { class: 'inf-sub' }, copyable(c.telegram_id))),
       el('td', {}, el('div', { text: describeDiscount(c) }), el('div', { class: 'inf-sub', text: describeCommission(c) })),
       el('td', {}, el('div', { text: c.payout_cycle }), el('div', { class: 'inf-sub', text: Number(c.min_payout) ? `min ₹${c.min_payout}` : 'no minimum' })),
       el('td', { text: num(c.stats.uses) }),
       el('td', { text: rupees(c.stats.revenuePaise) }),
-      el('td', {}, el('strong', { text: rupees(c.stats.availablePaise + c.stats.requestedPaise) }),
+      el('td', {}, el('div', { class: 'inf-money', text: rupees(c.stats.availablePaise + c.stats.requestedPaise) }),
         el('div', { class: 'inf-sub', text: `paid ${rupees(c.stats.paidPaise)}` })),
       el('td', {}, pill(c.status, c.status === 'active' ? 'ok' : 'muted')),
       el('td', {}, el('div', { class: 'inf-actions' }, edit, toggle)));
     row.addEventListener('click', () => {
       if (isOpen) openCodes.delete(c.code); else openCodes.add(c.code);
-      renderCodes();
+      renderActiveTab();
     });
     rows.push(row);
 
     if (openForm === `edit:${c.code}`) {
       rows.push(el('tr', { class: 'inf-form-row' }, el('td', { colspan: '10' }, termsForm({
         initial: c, examId: c.exam, codeEditable: false, submitLabel: 'Save new terms',
-        onCancel: () => { openForm = null; renderCodes(); },
+        onCancel: () => { openForm = null; renderActiveTab(); },
         onSubmit: (terms, button) => post('/api/affiliates/code', { code: c.code, terms }, button, 'Saving…')
       }))));
     }
     if (isOpen) {
-      const sales = data.sales.filter((s) => String(s.code).toUpperCase() === String(c.code).toUpperCase());
+      const sales = (data.sales || []).filter((s) => String(s.code).toUpperCase() === String(c.code).toUpperCase());
       rows.push(el('tr', { class: 'inf-form-row' }, el('td', { colspan: '10' },
-        el('div', { class: 'inf-sub' }, 'UPI: ', copyable(c.upi_id), '   Link: ', copyable(c.share_link)),
-        sales.length ? table(SALE_HEADERS, saleRows(sales)) : el('p', { class: 'inf-sub', text: 'No sales with this code yet.' }))));
+        el('div', { class: 'inf-detail-meta' },
+          el('span', {}, 'UPI: ', copyable(c.upi_id)),
+          el('span', {}, 'Link: ', copyable(c.share_link)),
+          el('span', { text: c.expires_on ? `Valid until ${c.expires_on}` : 'No end date' }),
+          el('span', { text: c.max_uses ? `Up to ${c.max_uses} uses` : 'Unlimited uses' })),
+        sales.length ? el('div', { class: 'table-wrap' }, table(SALE_HEADERS, saleRows(sales)))
+          : el('p', { class: 'hint-text', text: 'No sales with this code yet.' }))));
     }
   }
-  replaceChildren($('codesArea'), table(['Code', 'Exam', 'Influencer', 'Terms', 'Payouts', 'Uses', 'Revenue', 'Owed', 'Status', ''], rows));
+  return panel(title, subtitle, [bar, el('div', { class: 'table-wrap' },
+    table(['Code', 'Exam', 'Influencer', 'Terms', 'Payouts', 'Uses', 'Revenue', 'Owed', 'Status', ''], rows))]);
 }
 
-function renderSales() {
-  const q = $('saleSearch').value.trim().toLowerCase();
-  const status = $('saleStatus').value;
-  const sales = data.sales.filter((s) =>
-    (!q || haystack(s.code, s.student_name, s.student_username, s.student_id, s.payment_id, s.influencer_name).includes(q)) &&
-    (status === 'all' || s.status === status));
-  replaceChildren($('salesArea'), sales.length
-    ? table(SALE_HEADERS, saleRows(sales))
-    : emptyState('🧾', data.sales.length ? 'No sale matches those filters.' : 'No sales with promo codes yet.'));
+function salesPanel() {
+  const all = data.sales || [];
+  const sales = all.filter((s) => examMatches(s.exam) &&
+    searchMatches(s.code, s.student_name, s.student_username, s.student_id, s.payment_id, s.influencer_name, s.sale_id) &&
+    (filters.saleStatus === 'all' || s.status === filters.saleStatus));
+  const bar = filterBar([['Status', statusSelect('saleStatus', [
+    ['all', 'Any status'], ['earned', 'Available'], ['requested', 'Requested'], ['paid', 'Paid']])]]);
+  return panel('🧾 Every sale', 'One row per payment made with a promo code, newest first', [
+    bar,
+    sales.length ? el('div', { class: 'table-wrap' }, table(SALE_HEADERS, saleRows(sales)))
+      : emptyState('🧾', all.length ? 'No sale matches those filters.' : 'No sales with promo codes yet.')
+  ]);
 }
 
-function renderHistory() {
-  const decided = data.requests.filter((r) => r.status !== 'pending').map((r) => ({
-    at: r.decided_at, what: r.status === 'approved' ? `✅ Approved → ${r.code}` : `❌ Rejected${r.reason ? ': ' + r.reason : ''}`,
-    who: who(r.name, r.username, r.telegram_id), exam: examLabel(r.exam), by: r.decided_by, id: r.request_id
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+function historyRows() {
+  const decided = (data.requests || []).filter((r) => r.status !== 'pending').map((r) => ({
+    exam: r.exam, at: r.decided_at, id: r.request_id, by: r.decided_by, who: who(r.name, r.username, r.telegram_id),
+    what: r.status === 'approved' ? `✅ Approved → ${r.code}` : `❌ Rejected${r.reason ? ': ' + r.reason : ''}`
   }));
-  const payouts = data.payouts.filter((p) => p.status !== 'requested').map((p) => ({
-    at: p.decided_at, what: p.status === 'paid' ? `💸 Paid ${rupees(p.amount_paise)} (ref ${p.reference})` : `↩️ Withdrawal rejected${p.reason ? ': ' + p.reason : ''}`,
-    who: who(p.name, p.username, p.influencer_id), exam: examLabel(p.exam), by: p.decided_by, id: p.payout_id
+  const payouts = (data.payouts || []).filter((p) => p.status !== 'requested').map((p) => ({
+    exam: p.exam, at: p.decided_at, id: p.payout_id, by: p.decided_by, who: who(p.name, p.username, p.influencer_id),
+    what: p.status === 'paid' ? `💸 Paid ${rupees(p.amount_paise)} (ref ${p.reference})` : `↩️ Withdrawal rejected${p.reason ? ': ' + p.reason : ''}`
   }));
-  const all = decided.concat(payouts);
-  replaceChildren($('historyArea'), all.length
-    ? table(['What', 'Influencer', 'Exam', 'By', 'When', 'Reference'], all.map((h) => el('tr', {},
-      el('td', { text: h.what }), el('td', { text: h.who }), el('td', { text: h.exam }), el('td', { text: h.by }),
-      el('td', { text: h.at }), el('td', { class: 'inf-id', text: h.id }))))
+  return decided.concat(payouts);
+}
+
+function historyPanel() {
+  const rows = historyRows().filter((h) => examMatches(h.exam) && searchMatches(h.who, h.id, h.what, h.by));
+  return panel('🗂 History', 'What was approved, rejected and paid, and by whom', rows.length
+    ? el('div', { class: 'table-wrap' }, table(['What', 'Influencer', 'Exam', 'By', 'When', 'Reference'], rows.map((h) => el('tr', {},
+      el('td', { text: h.what }), el('td', { text: h.who }), el('td', { text: examLabel(h.exam) }), el('td', { text: h.by }),
+      el('td', { text: h.at }), el('td', { class: 'inf-id', text: h.id })))))
     : emptyState('🗂', 'Nothing decided yet.'));
 }
 
 function fillExamFilter() {
-  const select = $('codeExam');
+  const select = $('examFilter');
   const current = select.value;
   replaceChildren(select, el('option', { value: 'all', text: 'Every exam' }),
     (data.exams || []).map((e) => el('option', { value: e.id, text: e.label })));
@@ -472,27 +609,27 @@ function exportCsv() {
 // Loading
 // ---------------------------------------------------------------------------
 
-async function load() {
+async function load({ quiet = false } = {}) {
   const button = $('refreshBtn');
   button.disabled = true;
+  if (!quiet) {
+    replaceChildren($('tabBody'), el('div', { class: 'loading-row' },
+      [el('div', { class: 'spinner' }), el('span', { text: 'Loading the influencer programme…' })]));
+  }
   try {
     const result = await api('/api/affiliates');
     data = result.data || result;
-    renderSetup();
-    if (data.notReady) {
-      ['statGrid', 'requestsArea', 'payoutsArea', 'codesArea', 'salesArea', 'historyArea'].forEach((id) => replaceChildren($(id)));
-      return;
-    }
+    // The first view is whatever needs a decision.
+    if (!activeTab) activeTab = pendingRequests().length || data.notReady ? 'requests' : openPayouts().length ? 'payouts' : 'codes';
+    renderNotices();
+    renderHowItWorks();
     renderStats();
-    renderRequests();
-    renderPayouts();
     fillExamFilter();
-    renderCodes();
-    renderSales();
-    renderHistory();
+    renderTabs();
+    renderActiveTab();
   } catch (err) {
     showToast('error', err.message, 9000);
-    replaceChildren($('requestsArea'), emptyState('⚠️', 'Could not load the influencer programme.', err.message));
+    replaceChildren($('tabBody'), emptyState('⚠️', 'Could not load the influencer programme.', err.message));
   } finally {
     button.disabled = false;
   }
@@ -501,12 +638,15 @@ async function load() {
 initDashboard({
   page: 'influencers',
   onReady: async () => {
-    $('refreshBtn').addEventListener('click', load);
+    $('refreshBtn').addEventListener('click', () => load());
     $('exportBtn').addEventListener('click', () => { if (data && data.sales) exportCsv(); });
-    $('codeSearch').addEventListener('input', () => data && data.codes && renderCodes());
-    ['codeExam', 'codeStatus'].forEach((id) => $(id).addEventListener('change', () => data && data.codes && renderCodes()));
-    $('saleSearch').addEventListener('input', () => data && data.sales && renderSales());
-    $('saleStatus').addEventListener('change', () => data && data.sales && renderSales());
+    $('helpBtn').addEventListener('click', () => {
+      const box = $('howItWorks');
+      box.hidden = !box.hidden;
+      $('helpBtn').setAttribute('aria-expanded', String(!box.hidden));
+    });
+    $('examFilter').addEventListener('change', () => data && !data.notReady && renderActiveTab());
+    $('searchInput').addEventListener('input', () => data && !data.notReady && renderActiveTab());
     await load();
   }
 });

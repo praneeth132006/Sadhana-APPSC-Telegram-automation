@@ -43,6 +43,7 @@ const affiliateStore = require('./src/affiliate-store');
 const affiliateNotify = require('./src/affiliate-notify');
 const affiliateBotFactory = require('./src/affiliatebot');
 const sheetTabs = require('./src/sheet-tabs');
+const botCommands = require('./src/bot-commands');
 const autopilotFactory = require('./src/autopilot');
 
 // ---------------------------------------------------------------------------
@@ -1167,6 +1168,51 @@ function paymentBotFor(payBotEnv) {
   return paymentBots.get(payBotEnv);
 }
 
+/**
+ * syncBotMenus — puts back any bot menu Telegram holds that differs from the
+ * one in src/bot-commands.js.
+ *
+ * Menus live on Telegram's servers, so a deploy never changes them: the
+ * /referral entry stayed in every payment bot's menu after referrals were
+ * removed, until someone remembered to run `npm run bot-profile`. The daily
+ * sweep checks instead, and only writes when something is actually wrong.
+ * Never throws — a menu is not worth failing the sweep over.
+ */
+async function syncBotMenus() {
+  const results = [];
+  const callFor = (token) => (method, params) => fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {})
+  }).then((r) => r.json());
+
+  const bots = paymentBotEnvs().map((env) => ({ env, wanted: botCommands.STUDENT_COMMANDS, payment: true }));
+  if (affiliateNotify.isConfigured()) {
+    bots.push({ env: affiliateNotify.BOT_ENV, wanted: botCommands.AFFILIATE_COMMANDS, payment: false });
+  }
+  for (const { env, wanted, payment } of bots) {
+    try {
+      const call = callFor(String(process.env[env] || '').trim());
+      const shown = await botCommands.menuStudentsSee(call);
+      const expected = wanted.map((c) => c.command);
+      if (shown.join(' ') === expected.join(' ')) {
+        results.push({ bot: env, changed: false });
+        continue;
+      }
+      if (payment) {
+        await botCommands.registerMenus(call, support.supportChatFor(env));
+      } else {
+        await call('setMyCommands', { commands: wanted, scope: { type: 'all_private_chats' } });
+        await call('deleteMyCommands', { scope: { type: 'default' } });
+      }
+      console.log(`[cron] ${env} menu was ${shown.map((c) => '/' + c).join(' ') || '(empty)'} — rewritten`);
+      results.push({ bot: env, changed: true, was: shown });
+    } catch (err) {
+      console.error(`[cron] could not check ${env}'s menu: ${err.message}`);
+      results.push({ bot: env, error: err.message });
+    }
+  }
+  return results;
+}
+
 let affiliateBotApp = null;
 /** The affiliate bot, built once per instance. */
 function affiliateBot() {
@@ -2154,6 +2200,7 @@ async function handlePublicRoute(pathname, method, req, res) {
         `reminded ${summary.totals.reminded}, removed ${summary.totals.removed}`
       );
       summary.supportSummaries = await postDailySupportSummaries();
+      summary.menus = await syncBotMenus();
       sendJSON(res, 200, { success: true, data: summary });
     } catch (err) {
       console.error('[cron] sweep failed:', err.message);
@@ -3736,3 +3783,4 @@ module.exports = server;
 module.exports.createCheckoutForStudent = createCheckoutForStudent;
 module.exports.clientAddress = clientAddress;
 module.exports.handlePaymentEvent = handlePaymentEvent;
+module.exports.syncBotMenus = syncBotMenus;

@@ -11,25 +11,32 @@
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="shared.css">
   <style>
-    .inf-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
-    .inf-filters .field-input, .inf-filters .field-select { max-width: 240px; }
-    .inf-id { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-    .inf-sub { color: var(--text-muted, #999); font-size: 12px; }
-    .inf-details { max-width: 420px; white-space: pre-wrap; font-size: 13px; }
-    .inf-copy { margin-left: 6px; padding: 1px 6px; font-size: 11px; cursor: pointer; border-radius: 4px;
-      border: 1px solid var(--border-subtle, #333); background: transparent; color: var(--text-muted, #999); }
-    .inf-copy:hover { color: var(--text, #fff); }
-    .inf-form-row td { background: var(--surface-sunken, rgba(0,0,0,0.25)); padding: 16px 20px; }
+    .inf-id { font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 0.78rem; }
+    .inf-sub { color: var(--text-muted); font-size: 0.78rem; margin-top: 2px; }
+    .inf-details { max-width: 440px; white-space: pre-wrap; font-size: 0.86rem; line-height: 1.45; color: var(--text-secondary); }
+    .inf-copy { margin-left: 6px; padding: 1px 7px; font-size: 0.7rem; cursor: pointer; border-radius: 999px;
+      border: 1px solid var(--border-card); background: transparent; color: var(--text-muted); }
+    .inf-copy:hover { color: var(--text-primary); background: var(--bg-hover); }
+    .inf-form-row > td { background: var(--bg-elevated); padding: 0 16px 16px; }
+    .inf-form-row .pc-form { margin-top: 12px; }
     .inf-row { cursor: pointer; }
-    .inf-row:hover td { background: var(--surface-hover, rgba(255,255,255,0.03)); }
+    .inf-row:hover > td { background: var(--bg-hover); }
     .inf-row .chev { display: inline-block; width: 1em; transition: transform 150ms ease; color: var(--text-muted); }
     .inf-row.open .chev { transform: rotate(90deg); }
-    .inf-actions { display: flex; gap: 6px; flex-wrap: wrap; }
-    .inf-actions .btn { flex: 0 0 auto; }
-    .inf-setup { display: grid; gap: 8px; }
-    .inf-setup code { font-family: 'JetBrains Mono', monospace; }
-    .inf-scope { font-size: 13px; color: var(--text-muted, #999); }
-    @media (max-width: 720px) { .inf-filters .field-input, .inf-filters .field-select { max-width: 100%; flex: 1 1 100%; } }
+    .inf-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .inf-actions .btn { flex: 0 0 auto; width: auto; }
+    .inf-pair { display: flex; gap: 8px; }
+    .inf-pair .field-select { flex: 0 0 48%; }
+    .inf-money { font-weight: 700; color: var(--text-primary); white-space: nowrap; }
+    .inf-detail-meta { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 12px 0; font-size: 0.84rem; color: var(--text-secondary); }
+    .inf-howto { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 18px 28px; }
+    .inf-howto ol { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 0.88rem; color: var(--text-secondary); }
+    .inf-howto h3 { font-size: 0.9rem; margin: 0 0 8px; }
+    .inf-toolbar-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .inf-toolbar-filters .field-input { min-width: 240px; }
+    @media (max-width: 720px) {
+      .inf-toolbar-filters, .inf-toolbar-filters .field-input, .inf-toolbar-filters .field-select { width: 100%; min-width: 0; }
+    }
   </style>
 </head>
 <body>
@@ -39,84 +46,34 @@
         <div>
           <h1 class="page-title">Influencers</h1>
           <p class="page-subtitle">
-            Applications from the influencer bot, the promo code each approval creates and its terms, every sale made
-            with a code, and withdrawals to pay. One programme across every exam — the group picker above does not
-            change this page.
+            Applications from the influencer bot, the promo code each approval creates, every sale made with a code,
+            and withdrawals to pay — for every exam at once, stored in the Affiliate Marketing sheet.
           </p>
         </div>
         <div class="page-actions">
           <span id="botBadge" class="hint-text"></span>
-          <a id="sheetLink" class="btn btn-ghost" target="_blank" rel="noopener" style="display:none">📄 Open sheet</a>
+          <button id="helpBtn" class="btn btn-ghost" aria-expanded="false" aria-controls="howItWorks">How this works</button>
+          <a id="sheetLink" class="btn btn-ghost" target="_blank" rel="noopener" hidden>📄 Open sheet</a>
           <button id="exportBtn" class="btn btn-ghost" title="Download every sale as a spreadsheet">⬇ Export CSV</button>
           <button id="refreshBtn" class="btn btn-primary">Refresh</button>
         </div>
       </div>
 
-      <div id="setupArea"></div>
-      <div id="statGrid" class="stat-grid"></div>
+      <section id="howItWorks" class="panel sp-howto" hidden></section>
+      <div id="notices"></div>
 
-      <section class="panel">
-        <div class="panel-head"><div>
-          <h2 class="panel-title">Applications waiting</h2>
-          <p class="panel-subtitle">Approve with the terms you choose — the code is created and sent to the influencer — or reject</p>
-        </div></div>
-        <div class="panel-body tight"><div id="requestsArea" class="table-wrap"></div></div>
-      </section>
+      <div id="statGrid" class="stat-grid" aria-label="Influencer programme at a glance"></div>
 
-      <section class="panel">
-        <div class="panel-head"><div>
-          <h2 class="panel-title">Withdrawals to pay</h2>
-          <p class="panel-subtitle">Send the money over UPI first, then mark it paid with the reference — the influencer is told</p>
-        </div></div>
-        <div class="panel-body tight"><div id="payoutsArea" class="table-wrap"></div></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><div>
-          <h2 class="panel-title">Promo codes</h2>
-          <p class="panel-subtitle">Click a code to see its sales. Pause a code to stop it being used; its history stays.</p>
-        </div></div>
-        <div class="panel-body">
-          <div class="inf-filters">
-            <input id="codeSearch" class="field-input" type="search" placeholder="Code, name, @username or ID" aria-label="Filter codes">
-            <select id="codeExam" class="field-select" aria-label="Exam"><option value="all">Every exam</option></select>
-            <select id="codeStatus" class="field-select" aria-label="Status">
-              <option value="all">Any status</option>
-              <option value="active">Active</option>
-              <option value="paused">Paused</option>
-              <option value="owed">Money owed</option>
-            </select>
-          </div>
-          <div id="codesArea" class="table-wrap"></div>
+      <div class="sp-toolbar">
+        <div id="tabs" class="sp-tabs" role="tablist" aria-label="Section"></div>
+        <div class="inf-toolbar-filters">
+          <select id="examFilter" class="field-select" aria-label="Filter by exam"><option value="all">Every exam</option></select>
+          <input id="searchInput" type="search" class="field-input"
+                 placeholder="Search name, @username, Telegram id, code or payment id" aria-label="Search">
         </div>
-      </section>
+      </div>
 
-      <section class="panel">
-        <div class="panel-head"><div>
-          <h2 class="panel-title">Every sale</h2>
-          <p class="panel-subtitle">One row per payment made with a promo code, newest first</p>
-        </div></div>
-        <div class="panel-body">
-          <div class="inf-filters">
-            <input id="saleSearch" class="field-input" type="search" placeholder="Code, student, ID or payment ID" aria-label="Filter sales">
-            <select id="saleStatus" class="field-select" aria-label="Status">
-              <option value="all">Any status</option>
-              <option value="earned">Available</option>
-              <option value="requested">Requested</option>
-              <option value="paid">Paid</option>
-            </select>
-          </div>
-          <div id="salesArea" class="table-wrap"></div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><div>
-          <h2 class="panel-title">Decided applications and past withdrawals</h2>
-          <p class="panel-subtitle">What was approved, rejected and paid, and by whom</p>
-        </div></div>
-        <div class="panel-body tight"><div id="historyArea" class="table-wrap"></div></div>
-      </section>
+      <div id="tabBody"></div>
     </main>
   </div>
 
