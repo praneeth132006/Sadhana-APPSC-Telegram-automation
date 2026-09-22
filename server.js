@@ -38,7 +38,10 @@ const plans = require('./src/plans');
 const botapp = require('./src/botapp');
 const support = require('./src/support');
 const pricing = require('./src/pricing');
-const referrals = require('./src/referrals');
+const affiliates = require('./src/affiliates');
+const affiliateStore = require('./src/affiliate-store');
+const affiliateNotify = require('./src/affiliate-notify');
+const affiliateBotFactory = require('./src/affiliatebot');
 const sheetTabs = require('./src/sheet-tabs');
 const autopilotFactory = require('./src/autopilot');
 
@@ -660,89 +663,301 @@ async function recordCouponUse(notes, paymentId, paidPaise) {
 }
 
 /**
- * referralSheetFor — the sheet that holds a family's codes and earnings.
- *
- * A payment bot family shares one code list. Reading it from whichever group
- * the dashboard happens to be showing would give a curator a different answer
- * per group, and settling a payout from one of them would leave the other
- * still showing it as owed.
+ * couponExists — true when any payment bot's sheet already has this coupon
+ * code, so an influencer's code can never shadow one (or be shadowed by it).
  */
-function referralSheetFor(groupId) {
-  const group = groupRegistry.requireGroup(groupId);
-  const primary = groupRegistry.listGroups()
-    .find((g) => g.ready && g.paymentBotEnv === group.paymentBotEnv) || group;
-  return sheets.forGroup(primary.id);
+async function couponExists(code) {
+  const primaries = new Map();
+  for (const group of groupRegistry.listGroups()) {
+    if (group.ready && !primaries.has(group.paymentBotEnv)) primaries.set(group.paymentBotEnv, group);
+  }
+  const found = await Promise.all([...primaries.values()].map((group) =>
+    sheets.forGroup(group.id).getCoupon(code, '').then(Boolean).catch((err) => {
+      console.error(`[affiliates] could not check coupons in ${group.id}: ${err.message}`);
+      return false;
+    })));
+  return found.some(Boolean);
+}
+
+/** The pass an exam sells now, with the price its bot quotes. */
+async function examPass(exam) {
+  const group = exam.groups[0];
+  let settings = {};
+  try {
+    settings = await Promise.race([
+      sheets.forGroup(group.id).getBotSettings(),
+      new Promise((resolve) => setTimeout(() => resolve({}), 8000))
+    ]) || {};
+  } catch (err) {
+    settings = {};
+  }
+  return pricing.currentPass(group.id, settings);
 }
 
 /**
- * recordReferralEarning — credits the inviter once a referred payment succeeds.
+ * handleAffiliateRoute — the Influencers dashboard's API.
  *
- * Never fails the webhook: the student has paid and must get access whether or
- * not the commission can be written. The sheet ignores a payment id it has
+ *   GET  /api/affiliates          everything: requests, codes, sales, payouts
+ *   POST /api/affiliates/setup    create the sheet's tabs
+ *   POST /api/affiliates/approve  { requestId, terms } — creates the code
+ *   POST /api/affiliates/reject   { requestId, reason }
+ *   POST /api/affiliates/code     { code, status } pause/resume, or { code, terms }
+ *   POST /api/affiliates/payout   { payoutId, decision: paid|rejected, reference, reason }
+ *
+ * Nothing here moves money. Marking a withdrawal paid records that a person
+ * sent it, with the UPI reference to prove it.
+ */
+async function handleAffiliateRoute(pathname, method, req, res, user) {
+  const actor = user.name ? `${user.name} (${user.email})` : user.email;
+
+  const status = {
+    sheet: affiliateStore.isConfigured(),
+    bot: affiliateNotify.isConfigured(),
+    adminChat: Boolean(affiliateNotify.adminChat()),
+    serviceAccount: require('./src/sheets-direct').serviceAccountEmail(),
+    sheetUrl: affiliateStore.spreadsheetId()
+      ? `https://docs.google.com/spreadsheets/d/${affiliateStore.spreadsheetId()}/edit` : ''
+  };
+  let botUsername = null;
+  if (status.bot) {
+    try {
+      botUsername = (await affiliateNotify.bot().getMe()).username || null;
+    } catch (err) {
+      botUsername = null;
+    }
+  }
+
+  if (!status.sheet) {
+    if (method === 'GET' && pathname === '/api/affiliates') {
+      sendJSON(res, 200, { success: true, data: { status, botUsername, notReady: true } });
+    } else {
+      sendJSON(res, 503, {
+        success: false,
+        error: 'The influencer sheet is not set up: set AFFILIATE_SHEET_ID and share the sheet with ' +
+          `${status.serviceAccount || 'the service account'} as an Editor.`
+      });
+    }
+    return true;
+  }
+
+  if (pathname === '/api/affiliates' && method === 'GET') {
+    const { influencers, requests, codes, sales, payouts } = await affiliateStore.overview();
+    const exams = affiliates.listExams();
+    const passes = await Promise.all(exams.map((exam) => examPass(exam).catch(() => null)));
+    const upiOf = new Map(influencers.map((i) => [i.telegram_id, i.upi_id]));
+
+    const codeRows = codes.map((code) => {
+      const mine = sales.filter((sale) => String(sale.code).toUpperCase() === String(code.code).toUpperCase());
+      return Object.assign({}, code, { stats: affiliates.summarise(mine), upi_id: upiOf.get(code.telegram_id) || '' });
+    });
+    const totals = affiliates.summarise(sales);
+
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        status,
+        botUsername,
+        exams: exams.map((exam, i) => ({
+          id: exam.id, label: exam.label, botEnv: exam.botEnv,
+          pricePaise: passes[i] ? passes[i].amountPaise : null
+        })),
+        influencers,
+        // Newest first: the question is almost always "what just came in".
+        requests: requests.slice().reverse().map((r) => Object.assign({}, r, {
+          suggested_code: r.status === 'pending' ? affiliates.suggestCode(r, r.exam) : ''
+        })),
+        codes: codeRows,
+        sales: sales.slice().reverse(),
+        payouts: payouts.slice().reverse(),
+        totals: Object.assign(totals, {
+          influencers: influencers.length,
+          pendingRequests: requests.filter((r) => r.status === 'pending').length,
+          activeCodes: codes.filter((c) => c.status === 'active').length,
+          openPayouts: payouts.filter((p) => p.status === 'requested').length
+        })
+      }
+    });
+    return true;
+  }
+
+  if (method !== 'POST') {
+    sendJSON(res, 404, { success: false, error: 'Not found' });
+    return true;
+  }
+  const body = await readJsonBody(req);
+
+  if (pathname === '/api/affiliates/setup') {
+    const tabs = await affiliateStore.ensureTabs();
+    sendJSON(res, 200, { success: true, message: `The influencer sheet has its tabs: ${tabs.join(', ')}.` });
+    return true;
+  }
+
+  if (pathname === '/api/affiliates/approve') {
+    const requestId = str(body.requestId, 40);
+    const request = (await affiliateStore.listRequests()).find((r) => r.request_id === requestId);
+    if (!request) {
+      sendJSON(res, 404, { success: false, error: `No request ${requestId}.` });
+      return true;
+    }
+    const exam = affiliates.getExam(request.exam);
+    if (!exam) {
+      sendJSON(res, 400, { success: false, error: `The exam "${request.exam}" is not on sale any more.` });
+      return true;
+    }
+    const pass = await examPass(exam).catch(() => null);
+    const terms = affiliates.validateTerms(body.terms, { pricePaise: pass ? pass.amountPaise : null });
+    if (!terms.ok) {
+      sendJSON(res, 400, { success: false, error: terms.error });
+      return true;
+    }
+    let examBotUsername = '';
+    try {
+      examBotUsername = await paymentBotUsername(exam.botEnv) || '';
+    } catch (err) {
+      // The code still works when typed; only the link needs the name.
+    }
+    const result = await affiliateStore.approveRequest(requestId, terms.value, actor,
+      { codeTaken: couponExists, botUsername: examBotUsername });
+    if (!result.ok) {
+      sendJSON(res, 409, { success: false, error: result.error });
+      return true;
+    }
+    const notified = await affiliateNotify.tellInfluencer(result.code.telegram_id, affiliateNotify.approvedMessage(result.code));
+    console.log(`[affiliates] ${actor} approved ${requestId} as ${result.code.code}`);
+    sendJSON(res, 200, {
+      success: true,
+      code: result.code,
+      notified,
+      message: `Approved. Code ${result.code.code} is live in the ${exam.label} bot` +
+        (notified ? ' and the influencer has been sent it.' : ' — but the influencer could not be messaged; send them the code yourself.')
+    });
+    return true;
+  }
+
+  if (pathname === '/api/affiliates/reject') {
+    const reason = str(body.reason, 500);
+    const result = await affiliateStore.rejectRequest(str(body.requestId, 40), reason, actor);
+    if (!result.ok) {
+      sendJSON(res, 409, { success: false, error: result.error });
+      return true;
+    }
+    const notified = await affiliateNotify.tellInfluencer(result.request.telegram_id, affiliateNotify.rejectedMessage(result.request));
+    sendJSON(res, 200, { success: true, notified, message: 'Rejected' + (notified ? ' and the influencer was told.' : '.') });
+    return true;
+  }
+
+  if (pathname === '/api/affiliates/code') {
+    const code = affiliates.normaliseCode(str(body.code, 24));
+    if (body.terms) {
+      const existing = await affiliateStore.getCode(code);
+      const exam = existing && affiliates.getExam(existing.exam);
+      const pass = exam ? await examPass(exam).catch(() => null) : null;
+      const terms = affiliates.validateTerms(body.terms, { pricePaise: pass ? pass.amountPaise : null });
+      if (!terms.ok) {
+        sendJSON(res, 400, { success: false, error: terms.error });
+        return true;
+      }
+      const result = await affiliateStore.updateCodeTerms(code, terms.value, actor);
+      if (!result.ok) {
+        sendJSON(res, 404, { success: false, error: result.error });
+        return true;
+      }
+      await affiliateNotify.tellInfluencer(result.code.telegram_id,
+        `ℹ️ <b>The terms of your code ${support.esc(code)} have changed.</b>\n\n` +
+        affiliateNotify.termsLines(result.code).join('\n') +
+        '\n\n<i>Sales already made keep what they earned.</i>');
+      sendJSON(res, 200, { success: true, code: result.code, message: `${code}'s terms updated.` });
+      return true;
+    }
+    const wanted = str(body.status, 12) === 'paused' ? 'paused' : 'active';
+    const result = await affiliateStore.setCodeStatus(code, wanted, actor);
+    if (!result.ok) {
+      sendJSON(res, 404, { success: false, error: result.error });
+      return true;
+    }
+    sendJSON(res, 200, { success: true, code: result.code, message: `${code} is ${wanted}.` });
+    return true;
+  }
+
+  if (pathname === '/api/affiliates/payout') {
+    const decision = str(body.decision, 12) === 'paid' ? 'paid' : 'rejected';
+    const result = await affiliateStore.decidePayout(str(body.payoutId, 40), decision, {
+      reference: str(body.reference, 100), reason: str(body.reason, 500), actor
+    });
+    if (!result.ok) {
+      sendJSON(res, 409, { success: false, error: result.error });
+      return true;
+    }
+    const notified = await affiliateNotify.tellInfluencer(result.payout.influencer_id, decision === 'paid'
+      ? affiliateNotify.payoutPaidMessage(result.payout)
+      : affiliateNotify.payoutRejectedMessage(result.payout));
+    sendJSON(res, 200, {
+      success: true,
+      payout: result.payout,
+      message: (decision === 'paid' ? 'Marked paid' : 'Rejected') + (notified ? ' and the influencer was told.' : '.')
+    });
+    return true;
+  }
+
+  sendJSON(res, 404, { success: false, error: 'Not found' });
+  return true;
+}
+
+/**
+ * recordAffiliateSale — credits an influencer once a payment made with their
+ * promo code succeeds, and tells them.
+ *
+ * Never fails the webhook: the student has paid and must get access whether
+ * or not the commission can be written. The store ignores a payment id it has
  * already recorded, so a redelivered webhook credits nothing twice — which
  * matters more here than anywhere else in this file, because the other end of
  * it is money leaving the business.
  *
  * What is owed was worked out when the link was created and rides in its
- * notes, so an admin changing the price while the link was open cannot change
- * what the inviter is paid for a sale that already happened.
+ * notes, so an admin changing the code's terms while the link was open cannot
+ * change what the influencer earns for a sale that already happened.
  */
-async function recordReferralEarning(notes, paymentId, paidPaise) {
+async function recordAffiliateSale(notes, paymentId, paidPaise) {
   try {
     const group = groupRegistry.requireGroup(notes.group_id);
-    const primary = groupRegistry.listGroups()
-      .find((g) => g.ready && g.paymentBotEnv === group.paymentBotEnv) || group;
-    const sheet = sheets.forGroup(primary.id);
-
-    const code = referrals.normaliseCode(notes.referral_code);
-    const referral = await sheet.getReferral(code);
-    if (!referral) {
-      console.error(`[payments] referral ${code} on ${paymentId} is not in the sheet — nothing credited`);
-      return;
-    }
-
     const paid = Number(paidPaise) || 0;
-    // The notes are authoritative for what was promised; the fallback recomputes
-    // from what was actually paid, so an old link still credits something sane.
-    const commissionPaise = notes.commission_amount !== undefined && notes.commission_amount !== ''
-      ? Math.round(Number(notes.commission_amount) * 100)
-      : referrals.percentOf(paid, referrals.DEFAULT_COMMISSION_PERCENT);
-
-    const result = await sheet.recordReferralEarning({
-      code,
-      referrer_telegram_id: referral.telegram_id,
-      referrer_username: referral.username,
-      referrer_name: referral.name,
-      plan: notes.plan_id || '',
-      referred_telegram_id: notes.telegram_id,
-      referred_username: notes.telegram_username || '',
-      referred_name: notes.telegram_name || '',
+    let commissionPaise = Math.round((Number(notes.commission_amount) || 0) * 100);
+    if (!(notes.commission_amount !== undefined && notes.commission_amount !== '')) {
+      const code = await affiliateStore.getCode(notes.promo_code);
+      commissionPaise = code ? affiliates.commissionFor(code, paid) : 0;
+    }
+    const result = await affiliateStore.recordSale({
+      code: notes.promo_code,
+      influencer_id: notes.affiliate_id || '',
       group: group.shortName,
+      student_id: notes.telegram_id,
+      student_username: notes.telegram_username || '',
       payment_id: paymentId,
-      original_paise: Math.round((Number(notes.original_amount) || 0) * 100),
+      list_price_paise: Math.round((Number(notes.original_amount) || 0) * 100),
       discount_paise: Math.round((Number(notes.discount_amount) || 0) * 100),
       paid_paise: paid,
-      commission_paise: commissionPaise
+      commission_paise: Math.min(commissionPaise, paid)
     });
-
     if (!result.recorded) return;
-    console.log(`[payments] referral ${code}: credited ${commissionPaise / 100} to ${referral.telegram_id} ` +
-      `for ${notes.telegram_id}'s payment ${paymentId}`);
+    console.log(`[payments] promo ${result.sale.code}: credited ₹${result.sale.commission_paise / 100} to ` +
+      `${result.sale.influencer_id} for ${notes.telegram_id}'s payment ${paymentId}`);
 
-    // Telling the inviter is the whole reward loop. Best effort: a failed DM
-    // must not undo a credit that is already in the sheet.
+    // Telling the influencer is the whole reward loop. Best effort: a failed
+    // message must not undo a credit that is already in the sheet.
+    let stats = null;
     try {
-      await paybot.sendDirectMessage(group.paymentBotEnv, referral.telegram_id,
-        `🎁 Someone joined <b>${group.shortName}</b> using your referral code ` +
-        `<code>${code}</code>.\n\nYou earned <b>₹${(commissionPaise / 100).toFixed(2)}</b>. ` +
-        'Send /referral to see your total.');
+      const sales = (await affiliateStore.listSales())
+        .filter((s) => String(s.code).toUpperCase() === String(result.sale.code).toUpperCase());
+      stats = affiliates.summarise(sales);
     } catch (err) {
-      console.error(`[payments] could not tell ${referral.telegram_id} about their commission: ${err.message}`);
+      // The message still goes, without the running total.
     }
+    await affiliateNotify.tellInfluencer(result.sale.influencer_id, affiliateNotify.saleMessage(result.sale, stats));
   } catch (err) {
-    console.error(`[payments] could not record referral ${notes.referral_code} for ${paymentId}: ${err.message}`);
+    console.error(`[payments] could not record promo ${notes.promo_code} for ${paymentId}: ${err.message}`);
   }
 }
+
 
 async function handlePaymentEvent(event) {
   const type = String(event.event || '');
@@ -778,8 +993,8 @@ async function handlePaymentEvent(event) {
     if (notes.coupon_code) {
       await recordCouponUse(notes, payment.id || link.id, paidPaise);
     }
-    if (notes.referral_code) {
-      await recordReferralEarning(notes, payment.id || link.id, paidPaise);
+    if (notes.promo_code) {
+      await recordAffiliateSale(notes, payment.id || link.id, paidPaise);
     }
 
     // A repeat delivery of the same payment must not send a second message.
@@ -950,6 +1165,13 @@ function paymentBotFor(payBotEnv) {
     paymentBots.set(payBotEnv, botapp.createPaymentBot({ payBotEnv, polling: false }));
   }
   return paymentBots.get(payBotEnv);
+}
+
+let affiliateBotApp = null;
+/** The affiliate bot, built once per instance. */
+function affiliateBot() {
+  if (!affiliateBotApp) affiliateBotApp = affiliateBotFactory.createAffiliateBot({ polling: false });
+  return affiliateBotApp;
 }
 
 /** Every payment-bot env var a ready group names, deduplicated. */
@@ -1866,6 +2088,52 @@ async function handlePublicRoute(pathname, method, req, res) {
     return true;
   }
 
+  // ---- The influencer (affiliate) bot's webhook ----------------------------
+  // The same credential as the payment bots — the secret Telegram echoes — and
+  // the same rule: do the work before answering, inside the same budget.
+  if (pathname === '/api/telegram/affiliate' && method === 'POST') {
+    const secret = telegramWebhookSecret();
+    if (!secret) {
+      sendJSON(res, 503, { success: false, error: 'No TELEGRAM_WEBHOOK_SECRET or CRON_SECRET set.' });
+      return true;
+    }
+    const offered = Buffer.from(String(req.headers['x-telegram-bot-api-secret-token'] || ''));
+    const expected = Buffer.from(secret);
+    if (offered.length !== expected.length || !crypto.timingSafeEqual(offered, expected)) {
+      console.warn('[affiliate-bot] rejected a webhook with a bad secret token');
+      sendJSON(res, 401, { success: false, error: 'Unauthorised' });
+      return true;
+    }
+    if (!affiliateNotify.isConfigured()) {
+      sendJSON(res, 404, { success: false, error: 'No affiliate bot is configured.' });
+      return true;
+    }
+    let update;
+    try {
+      update = JSON.parse(await readRawBody(req));
+    } catch (err) {
+      sendJSON(res, 400, { success: false, error: 'Malformed update' });
+      return true;
+    }
+    try {
+      const app = affiliateBot();
+      app.bot.processUpdate(update);
+      let budgetTimer;
+      try {
+        await Promise.race([
+          app.settle(),
+          new Promise((resolve) => { budgetTimer = setTimeout(resolve, BOT_UPDATE_BUDGET_MS); })
+        ]);
+      } finally {
+        clearTimeout(budgetTimer);
+      }
+    } catch (err) {
+      console.error('[affiliate-bot] failed to handle an update:', err.message);
+    }
+    sendJSON(res, 200, { success: true });
+    return true;
+  }
+
   // Liveness of the Apps Script deployment, for the header status pill.
   // ---- Scheduled expiry sweep ---------------------------------------------
   // Runs the same check membership-cron.js runs, but on a schedule Vercel owns
@@ -2668,6 +2936,13 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     return true;
   }
 
+  // ---- Influencers (affiliates) ---------------------------------------------
+  // One programme across every exam, kept in its own sheet — so, like
+  // /api/groups, these routes are about the system and not about one group.
+  if (pathname.startsWith('/api/affiliates')) {
+    return handleAffiliateRoute(pathname, method, req, res, user);
+  }
+
   const NO_GROUP_NEEDED = ['/api/health'];
 
   let db = null;
@@ -3192,173 +3467,6 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
     return true;
   }
 
-  // ---- Referrals -----------------------------------------------------------
-  // Who invited whom, what it cost, what is owed, and what has been paid.
-  // Codes and earnings live on the family's primary sheet, so a student who
-  // invites a friend to the English group and another to the Telugu one has
-  // one code and one balance rather than two halves that never reach a payout.
-  if (pathname === '/api/referrals' && method === 'GET') {
-    const sheet = referralSheetFor(groupId);
-    const settings = referrals.settingsFrom(await sheet.getBotSettings().catch(() => ({})));
-
-    const [codes, earnings] = await Promise.all([
-      sheet.listReferrals(),
-      sheet.listReferralEarnings()
-    ]);
-
-    // Every code, with its own standing worked out the same way the bot works
-    // it out — one function, so the two can never disagree about what a
-    // student is owed.
-    const byCode = codes.map((code) => {
-      const mine = earnings.filter((e) => e.code === String(code.code).toUpperCase());
-      const stats = referrals.summarise(mine, settings);
-      const joinedIds = new Set(mine.filter((e) => e.status !== 'cancelled').map((e) => String(e.referred_telegram_id)));
-      const openedBy = String(code.opened_by_ids || '').split(',').map((x) => x.trim()).filter(Boolean);
-      return {
-        code: code.code,
-        telegramId: code.telegram_id,
-        username: code.username,
-        name: code.name,
-        status: code.status || 'active',
-        createdAt: code.created_at,
-        shareLink: code.share_link || '',
-        joined: stats.joined,
-        pendingPaise: stats.pendingPaise,
-        paidPaise: stats.paidPaise,
-        totalPaise: stats.totalPaise,
-        payable: stats.payable,
-        lastJoinedAt: mine.length ? mine[mine.length - 1].timestamp : '',
-        // Who looked, and which of them went on to pay — the answer to "is
-        // this person's link working, or just not being shared?"
-        linkOpens: openedBy.length,
-        openedBy: openedBy.map((id) => ({ telegramId: id, joined: joinedIds.has(id) })),
-        // Every person this code brought in, oldest first, with everything the
-        // sheet knows about them.
-        joins: mine.map((e) => ({
-          referralId: e.referral_id,
-          at: e.timestamp,
-          telegramId: e.referred_telegram_id,
-          username: e.referred_username,
-          name: e.referred_name,
-          group: e.group,
-          plan: e.plan,
-          paymentId: e.payment_id,
-          originalPaise: e.original_paise,
-          discountPaise: e.discount_paise,
-          paidPaise: e.paid_paise,
-          commissionPaise: e.commission_paise,
-          status: e.status,
-          paidAt: e.paid_at
-        }))
-      };
-    });
-    byCode.sort((a, b) => b.pendingPaise - a.pendingPaise || b.joined - a.joined);
-
-    const totals = earnings.reduce((acc, e) => {
-      if (e.status === 'cancelled') return acc;
-      acc.joined++;
-      acc.revenuePaise += e.paid_paise;
-      acc.discountPaise += e.discount_paise;
-      if (e.status === 'paid') acc.paidPaise += e.commission_paise;
-      else acc.pendingPaise += e.commission_paise;
-      return acc;
-    }, { joined: 0, revenuePaise: 0, discountPaise: 0, pendingPaise: 0, paidPaise: 0 });
-    totals.linkOpens = byCode.reduce((sum, c) => sum + c.linkOpens, 0);
-    totals.activeReferrers = byCode.filter((c) => c.joined > 0).length;
-
-    sendJSON(res, 200, {
-      success: true,
-      data: {
-        settings: {
-          enabled: settings.enabled,
-          discountPercent: settings.discountPercent,
-          commissionPercent: settings.commissionPercent,
-          payoutThresholdPaise: settings.payoutThresholdPaise
-        },
-        codes: byCode,
-        // Newest first: the question an admin has is almost always "who joined
-        // just now", not "who joined in March".
-        earnings: earnings.slice().reverse(),
-        totals,
-        due: referrals.payoutDue(earnings, { thresholdPaise: settings.payoutThresholdPaise })
-      }
-    });
-    return true;
-  }
-
-  // Marks one inviter's pending earnings paid, after the money has actually
-  // been sent. Nothing here moves money: this records that a person did.
-  if (pathname === '/api/referrals/settle' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const code = referrals.normaliseCode(str(body.code, 24));
-    if (!referrals.isCode(code)) {
-      sendJSON(res, 400, { success: false, error: 'That is not a referral code.' });
-      return true;
-    }
-
-    // The payment ids the admin was looking at when they decided. Without
-    // them, an earning recorded between looking and paying would be marked
-    // paid along with the rest, and nobody would ever know.
-    const paymentIds = Array.isArray(body.paymentIds)
-      ? body.paymentIds.map((id) => str(id, 60)).filter(Boolean)
-      : [];
-
-    const result = await referralSheetFor(groupId)
-      .settleReferralEarnings(code, paymentIds, `Paid out by ${actor}`);
-
-    console.log(`[referrals] ${actor} settled ${result.settled} earning(s) for ${code} ` +
-      `(₹${result.paise / 100})`);
-    sendJSON(res, 200, {
-      success: true,
-      settled: result.settled,
-      paise: result.paise,
-      message: result.settled
-        ? `${result.settled} earning(s) marked paid for ${code} (₹${(result.paise / 100).toFixed(2)}).`
-        : `Nothing was pending for ${code}.`
-    });
-    return true;
-  }
-
-  // Rewrites every code's summary columns in the Referrals tab from the log.
-  // For rows made before those columns existed, and as the repair for any
-  // summary a failed write left behind. It only ever touches the summaries —
-  // never a code, an owner or a payment.
-  if (pathname === '/api/referrals/rebuild' && method === 'POST') {
-    let botUsername = '';
-    try {
-      botUsername = await paymentBotUsername(groupRegistry.requireGroup(groupId).paymentBotEnv) || '';
-    } catch (err) {
-      // Without it the summaries are still rebuilt; only blank share links stay blank.
-    }
-    const result = await referralSheetFor(groupId).rebuildReferralSummaries({ botUsername });
-    console.log(`[referrals] ${actor} rebuilt ${result.rebuilt} referral summary row(s)`);
-    sendJSON(res, 200, {
-      success: true,
-      rebuilt: result.rebuilt,
-      message: `${result.rebuilt} referrer row(s) in the sheet brought up to date.`
-    });
-    return true;
-  }
-
-  // Switches a code off without destroying its history, for a code being abused.
-  if (pathname === '/api/referrals/status' && method === 'POST') {
-    const body = await readJsonBody(req);
-    const code = referrals.normaliseCode(str(body.code, 24));
-    if (!referrals.isCode(code)) {
-      sendJSON(res, 400, { success: false, error: 'That is not a referral code.' });
-      return true;
-    }
-    const status = str(body.status, 12) === 'disabled' ? 'disabled' : 'active';
-    const changed = await referralSheetFor(groupId).setReferralStatus(code, status);
-    if (!changed) {
-      sendJSON(res, 404, { success: false, error: `${code} is not in the sheet.` });
-      return true;
-    }
-    console.log(`[referrals] ${actor} set ${code} to ${status}`);
-    sendJSON(res, 200, { success: true, code, status });
-    return true;
-  }
-
   // ---- Autopilot -----------------------------------------------------------
   // "Every 5 minutes, post the next 20 questions until there are none left."
   // Before this the only unattended posting was a cron expression in the
@@ -3489,7 +3597,8 @@ const server = http.createServer(async (req, res) => {
   // silently skips that run, so the sweep, the autopilot batch or the
   // deleted-poll check simply does not happen and nothing says why.
   const signedDelivery = rawPath === '/api/payments/webhook' ||
-    rawPath.startsWith('/api/telegram/bot/') || rawPath.startsWith('/api/cron/');
+    rawPath.startsWith('/api/telegram/bot/') || rawPath === '/api/telegram/affiliate' ||
+    rawPath.startsWith('/api/cron/');
   if (!signedDelivery && !checkRateLimit(clientAddress(req))) {
     res.setHeader('Retry-After', '60');
     sendJSON(res, 429, { success: false, error: 'Too many requests — slow down.' });

@@ -189,37 +189,13 @@ test('the throttle allows a burst up to the limit, then refuses until the window
 });
 
 // ---------------------------------------------------------------------------
-// Referral settings
+// Member referrals are gone
 // ---------------------------------------------------------------------------
 
-test('referral percentages must be whole numbers within 0 and 100', () => {
-  const ok = (patch) => support.validateSettingsPatch(patch).ok;
-  const why = (patch) => support.validateSettingsPatch(patch).error;
-
-  assert.equal(ok({ referral_discount_percent: '15' }), true);
-  assert.equal(ok({ referral_commission_percent: '100' }), true);
-  assert.equal(ok({ referral_discount_percent: '0' }), true);
-  assert.equal(ok({ referral_discount_percent: '' }), true, 'blank means "use the default"');
-
-  assert.match(why({ referral_commission_percent: '101' }), /0 to 100/);
-  assert.match(why({ referral_commission_percent: '-5' }), /0 to 100/);
-  assert.match(why({ referral_commission_percent: '12.5' }), /0 to 100/);
-  assert.match(why({ referral_commission_percent: 'lots' }), /0 to 100/);
-});
-
-test('referrals can be switched off, and the payout threshold is rupees', () => {
-  assert.equal(support.validateSettingsPatch({ referral_enabled: 'no' }).ok, true);
-  assert.match(support.validateSettingsPatch({ referral_enabled: 'maybe' }).error, /yes or no/);
-
-  assert.equal(support.validateSettingsPatch({ referral_payout_threshold: '500' }).ok, true);
-  assert.match(support.validateSettingsPatch({ referral_payout_threshold: '12.5' }).error, /whole number of rupees/);
-});
-
-test('referrals are on by default, with the percentages left to the code', () => {
+test('the old referral settings are no longer offered or accepted', () => {
+  // Influencer promo codes replaced member referrals; their terms are set per
+  // code on the Influencers page, not in a group's Bot Settings.
   const settings = support.normaliseSettings({});
-  assert.equal(settings.referral_enabled, 'yes');
-  // Blank rather than a number: src/referrals.js owns the defaults, so there
-  // is one place they can be read from rather than two that can disagree.
-  assert.equal(settings.referral_discount_percent, '');
-  assert.equal(settings.referral_commission_percent, '');
+  assert.ok(!Object.keys(settings).some((key) => key.startsWith('referral_')));
+  assert.equal(support.validateSettingsPatch({ referral_enabled: 'no' }).ok, false);
 });

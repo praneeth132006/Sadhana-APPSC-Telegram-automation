@@ -11,8 +11,8 @@
 //   bot-profile.js   → seven commands, to default
 //
 // Telegram shows the MOST SPECIFIC scope that has commands. In a private
-// chat that is all_private_chats, so the seven-command list — with /start,
-// /about and /referral — was never shown to a single student, and every
+// chat that is all_private_chats, so the seven-command list — with /start
+// and /about — was never shown to a single student, and every
 // routine run of set-webhooks put the old four back. Both scripts now read
 // from here, so there is only one list to be right about.
 // ============================================================================
@@ -30,11 +30,31 @@ const STUDENT_COMMANDS = [
   { command: 'about', description: 'About this group and the questions' },
   { command: 'plans', description: 'See the pass and join' },
   { command: 'status', description: 'Check your current pass' },
-  { command: 'referral', description: 'Invite a friend and earn 20%' },
   { command: 'help', description: 'How it all works' },
   { command: 'support', description: 'Get help with a problem' },
   { command: 'terms', description: 'Terms of the pass and payments' }
 ];
+
+/**
+ * What an influencer sees in a private chat with the affiliate bot. Every one
+ * is answered by src/affiliatebot.js — test/affiliate-bot.test.js taps each.
+ */
+const AFFILIATE_COMMANDS = [
+  { command: 'start', description: 'What the influencer programme is' },
+  { command: 'apply', description: 'Apply to promote an exam' },
+  { command: 'codes', description: 'Your promo codes, sales and earnings' },
+  { command: 'withdraw', description: 'Withdraw what you have earned' },
+  { command: 'upi', description: 'Set the UPI ID we pay you on' },
+  { command: 'help', description: 'How the programme works' },
+  { command: 'support', description: 'Ask the admin a question' },
+  { command: 'terms', description: 'Programme terms' }
+];
+
+/** The affiliate bot's profile: shown before an influencer presses Start. */
+const AFFILIATE_ABOUT = 'Promote our APPSC, UPSC and EPFO exam-prep channels and earn on every student ' +
+  'who joins with your promo code. Apply here, get your code once approved, and withdraw your ' +
+  'earnings over UPI.';
+const AFFILIATE_SHORT = 'Influencer programme: promote our exam-prep channels and earn per student.';
 
 /** What admins see when they type "/" in a bot's support chat. */
 const ADMIN_COMMANDS = [
@@ -145,6 +165,9 @@ async function menuStudentsSee(call) {
 
 module.exports = {
   STUDENT_COMMANDS,
+  AFFILIATE_COMMANDS,
+  AFFILIATE_ABOUT,
+  AFFILIATE_SHORT,
   ADMIN_COMMANDS,
   ABOUT,
   SHORT_DESCRIPTION,

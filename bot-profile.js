@@ -153,8 +153,44 @@ async function main() {
     }
   }
 
+  await affiliateProfile();
+
   if (!statusOnly && !dryRun && !process.exitCode) {
     console.log('Done. Telegram caches these — reopen the chat, or clear the app cache, to see them.\n');
+  }
+}
+
+/** The influencer bot's description, when it exists. Its menu is set by set-webhooks. */
+async function affiliateProfile() {
+  const token = String(process.env.TELEGRAM_AFFILIATE_BOT || '').trim();
+  if (!token) return;
+  const bot = new TelegramBot(token, { polling: false });
+  let me;
+  try {
+    me = await bot.getMe();
+  } catch (err) {
+    console.log(`  TELEGRAM_AFFILIATE_BOT\n    ❌ token rejected: ${err.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`  TELEGRAM_AFFILIATE_BOT  →  @${me.username}`);
+  if (statusOnly || dryRun) {
+    const [description, short] = await Promise.all([
+      bot.getMyDescription().catch(() => ({})), bot.getMyShortDescription().catch(() => ({}))
+    ]);
+    console.log(`    description:   ${dryRun ? botCommands.AFFILIATE_ABOUT : description.description || '(none)'}`);
+    console.log(`    short:         ${dryRun ? botCommands.AFFILIATE_SHORT : short.short_description || '(none)'}\n`);
+    return;
+  }
+  try {
+    await bot.setMyDescription({ description: botCommands.AFFILIATE_ABOUT });
+    await bot.setMyShortDescription({ short_description: botCommands.AFFILIATE_SHORT });
+    const wrote = await bot.getMyDescription().then((r) => (r && r.description) || '');
+    console.log(wrote === botCommands.AFFILIATE_ABOUT ? '    ✅ description\n' : '    ❌ description did not take\n');
+    if (wrote !== botCommands.AFFILIATE_ABOUT) process.exitCode = 1;
+  } catch (err) {
+    console.log(`    ❌ ${err.message}\n`);
+    process.exitCode = 1;
   }
 }
 

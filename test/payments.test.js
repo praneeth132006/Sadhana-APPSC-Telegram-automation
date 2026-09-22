@@ -1209,29 +1209,40 @@ test('grantAccess uses the valid-until date promised at checkout, but never a da
 });
 
 // ===========================================================================
-// A referred student pays, and the inviter is credited
+// A student pays with an influencer's promo code, and the influencer is credited
 // ===========================================================================
-// The full money path: the discounted link, the signed webhook, the commission
-// written to the sheet, the inviter told, and Razorpay retrying the delivery.
-// Every one of those is a place where somebody could be paid twice, paid the
-// wrong amount, or not paid at all.
+// The full money path from the webhook: the student gets in at the price they
+// were shown, the influencer's commission is recorded on what was PAID, the
+// influencer is told, and Razorpay retrying the delivery credits nothing twice.
 
-test('a referred student pays and the inviter is credited exactly once', async () => {
-  const GROUP = 'appsc_q_te';
-
+function loadServerForPromo() {
   for (const key of Object.keys(require.cache)) {
-    if (/server\.js|membership\.js|sheets\.js|paybot\.js|referrals\.js/.test(key)) delete require.cache[key];
+    if (/server\.js|membership\.js|sheets\.js|paybot\.js|affiliate-store\.js|affiliate-notify\.js/.test(key)) {
+      delete require.cache[key];
+    }
   }
-  const sheetsModule = require('../src/sheets');
-  const paybotModule = require('../src/paybot');
-  const serverModule = require('../server');
+  return {
+    sheetsModule: require('../src/sheets'),
+    paybotModule: require('../src/paybot'),
+    store: require('../src/affiliate-store'),
+    notify: require('../src/affiliate-notify'),
+    serverModule: require('../server')
+  };
+}
+
+test('a student pays with a promo code and the influencer is credited exactly once', async () => {
+  const GROUP = 'appsc_q_te';
+  const { sheetsModule, paybotModule, store, notify, serverModule } = loadServerForPromo();
 
   const sheetRows = {};
   const dms = [];
-  const earnings = [];
-  const originalForGroup = sheetsModule.forGroup;
-  const originalInvite = paybotModule.createJoinRequestInvite;
-  const originalDm = paybotModule.sendDirectMessage;
+  const told = [];
+  const sales = [];
+  const redemptions = [];
+  const originals = {
+    forGroup: sheetsModule.forGroup, invite: paybotModule.createJoinRequestInvite, dm: paybotModule.sendDirectMessage,
+    recordSale: store.recordSale, listSales: store.listSales, tell: notify.tellInfluencer
+  };
 
   sheetsModule.forGroup = (groupId) => ({
     groupId,
@@ -1241,121 +1252,111 @@ test('a referred student pays and the inviter is credited exactly once', async (
       sheetRows[`${groupId}:${row.telegram_id}`] = saved;
       return saved;
     },
-    getReferral: async (code) => (code === 'REFAJMXPQ'
-      ? { code: 'REFAJMXPQ', telegram_id: '111', username: 'asha', status: 'active' }
-      : null),
-    recordReferralEarning: async (e) => {
-      if (earnings.some((x) => x.payment_id === e.payment_id)) return { recorded: false, reason: 'already recorded' };
-      earnings.push(e);
-      return { recorded: true, commission_paise: e.commission_paise };
-    }
+    recordRedemption: async (r) => { redemptions.push(r); return r; }
   });
   paybotModule.createJoinRequestInvite = async () => 'https://t.me/+invite-for-one';
   paybotModule.sendDirectMessage = async (botEnv, userId, text) => { dms.push({ userId, text }); };
+  // The store as it behaves: one sale per payment id, owned by the code's influencer.
+  store.recordSale = async (sale) => {
+    if (sales.some((s) => s.payment_id === sale.payment_id)) return { recorded: false, sale: null };
+    // The code's owner is credited, whatever the notes say.
+    const saved = Object.assign({ exam: 'sadhana', status: 'earned' }, sale, { code: 'RAVISADHANA42', influencer_id: '501' });
+    sales.push(saved);
+    return { recorded: true, sale: saved };
+  };
+  store.listSales = async () => sales;
+  notify.tellInfluencer = async (id, text) => { told.push({ id: String(id), text }); return true; };
 
   try {
-    // What the bot put in the link's notes when the friend tapped Pay: ₹199
-    // list, ₹19.90 off, ₹179.10 paid, ₹35.82 owed to the inviter.
+    // What the bot put in the link's notes when the student tapped Pay: ₹199
+    // list, ₹19.90 off, ₹179.10 paid, ₹35.82 owed to the influencer.
     const notes = {
-      telegram_id: '90902', telegram_username: 'ravi', plan_id: 'sprint_30', group_id: GROUP,
-      referral_code: 'REFAJMXPQ', referrer_telegram_id: '111',
+      telegram_id: '90902', telegram_username: 'kiran', plan_id: 'exam_pass', group_id: GROUP,
+      promo_code: 'RAVISADHANA42', affiliate_id: '501',
       original_amount: '199', discount_amount: '19.9', commission_amount: '35.82'
     };
-    const body = JSON.stringify({
+    const event = {
       event: 'payment_link.paid',
-      payload: {
-        payment_link: { entity: { id: 'plink_ref', notes } },
-        payment: { entity: { id: 'pay_ref', amount: 17910 } }
-      }
-    });
+      payload: { payment_link: { entity: { id: 'plink_promo', notes } }, payment: { entity: { id: 'pay_promo', amount: 17910 } } }
+    };
 
-    const handled = await serverModule.handlePaymentEvent(JSON.parse(body));
+    const handled = await serverModule.handlePaymentEvent(JSON.parse(JSON.stringify(event)));
     assert.equal(handled.handled, true, handled.reason || 'the webhook did nothing');
 
-    // ---- The friend got in, at the price they were shown ------------------
+    // The student got in, at the price they were shown.
     const row = sheetRows[`${GROUP}:90902`];
-    assert.ok(row, 'the referred student was never given access');
+    assert.ok(row, 'the student was never given access');
     assert.equal(row.status, 'active');
-    assert.equal(row.amount, 179.1, 'they were recorded as paying the discounted price');
+    assert.equal(row.amount, 179.1);
+    assert.equal(dms.filter((d) => d.userId === '90902').length, 1, 'the student was never sent their invite');
 
-    // ---- The inviter was credited, on what was PAID ----------------------
-    assert.equal(earnings.length, 1, 'the inviter was not credited');
-    assert.equal(earnings[0].code, 'REFAJMXPQ');
-    assert.equal(earnings[0].referrer_telegram_id, '111');
-    assert.equal(earnings[0].referred_telegram_id, '90902');
-    assert.equal(earnings[0].payment_id, 'pay_ref');
-    assert.equal(earnings[0].paid_paise, 17910);
-    assert.equal(earnings[0].commission_paise, 3582, '20% of ₹179.10, not of ₹199');
+    // The influencer was credited on what was PAID, and told.
+    assert.equal(sales.length, 1);
+    assert.equal(sales[0].payment_id, 'pay_promo');
+    assert.equal(sales[0].paid_paise, 17910);
+    assert.equal(sales[0].list_price_paise, 19900);
+    assert.equal(sales[0].discount_paise, 1990);
+    assert.equal(sales[0].commission_paise, 3582, '20% of ₹179.10, not of ₹199');
+    assert.equal(sales[0].student_id, '90902');
+    assert.equal(told.length, 1);
+    assert.equal(told[0].id, '501');
+    assert.match(told[0].text, /RAVISADHANA42/);
+    assert.match(told[0].text, /₹35\.82/);
 
-    // ---- Both of them were told ------------------------------------------
-    const toFriend = dms.filter((d) => d.userId === '90902');
-    const toInviter = dms.filter((d) => String(d.userId) === '111');
-    assert.equal(toFriend.length, 1, 'the student was never sent their invite');
-    assert.equal(toInviter.length, 1, 'the inviter was never told they earned something');
-    assert.match(toInviter[0].text, /REFAJMXPQ/);
-    assert.match(toInviter[0].text, /₹35\.82/);
+    // A promo code is not a coupon: nothing lands in Coupon Redemptions.
+    assert.equal(redemptions.length, 0);
 
-    // ---- Razorpay retries the same delivery ------------------------------
-    // The one that matters: a retry must not pay the inviter a second time.
-    await serverModule.handlePaymentEvent(JSON.parse(body));
-    assert.equal(earnings.length, 1, 'a retried webhook credited the inviter twice');
-    assert.equal(dms.filter((d) => String(d.userId) === '111').length, 1,
-      'a retried webhook told the inviter twice');
+    // Razorpay retries the same delivery: nothing is credited or said twice.
+    await serverModule.handlePaymentEvent(JSON.parse(JSON.stringify(event)));
+    assert.equal(sales.length, 1, 'a retried webhook credited the influencer twice');
+    assert.equal(told.length, 1, 'a retried webhook told the influencer twice');
   } finally {
-    sheetsModule.forGroup = originalForGroup;
-    paybotModule.createJoinRequestInvite = originalInvite;
-    paybotModule.sendDirectMessage = originalDm;
+    sheetsModule.forGroup = originals.forGroup;
+    paybotModule.createJoinRequestInvite = originals.invite;
+    paybotModule.sendDirectMessage = originals.dm;
+    store.recordSale = originals.recordSale;
+    store.listSales = originals.listSales;
+    notify.tellInfluencer = originals.tell;
   }
 });
 
-test('a payment naming a code that is not in the sheet credits nobody', async () => {
-  for (const key of Object.keys(require.cache)) {
-    if (/server\.js|membership\.js|sheets\.js|paybot\.js/.test(key)) delete require.cache[key];
-  }
-  const sheetsModule = require('../src/sheets');
-  const paybotModule = require('../src/paybot');
-  const serverModule = require('../server');
-
-  const earnings = [];
-  const originalForGroup = sheetsModule.forGroup;
-  const originalInvite = paybotModule.createJoinRequestInvite;
-  const originalDm = paybotModule.sendDirectMessage;
-  const originalError = console.error;
+test('the student still gets in when the influencer cannot be credited', async () => {
+  const { sheetsModule, paybotModule, store, notify, serverModule } = loadServerForPromo();
+  const originals = {
+    forGroup: sheetsModule.forGroup, invite: paybotModule.createJoinRequestInvite, dm: paybotModule.sendDirectMessage,
+    recordSale: store.recordSale, tell: notify.tellInfluencer, error: console.error
+  };
+  const rows = {};
   const logged = [];
-
-  sheetsModule.forGroup = (groupId) => ({
-    groupId,
+  sheetsModule.forGroup = () => ({
     getSubscriber: async () => null,
-    upsertSubscriber: async (row) => row,
-    getReferral: async () => null,
-    recordReferralEarning: async (e) => { earnings.push(e); return { recorded: true }; }
+    upsertSubscriber: async (row) => { rows[row.telegram_id] = row; return row; }
   });
   paybotModule.createJoinRequestInvite = async () => 'https://t.me/+x';
   paybotModule.sendDirectMessage = async () => {};
+  store.recordSale = async () => { throw new Error('Google Sheets API did not answer within 20s'); };
+  notify.tellInfluencer = async () => { throw new Error('should not be reached'); };
   console.error = (...args) => logged.push(args.join(' '));
-
   try {
     const handled = await serverModule.handlePaymentEvent({
       event: 'payment_link.paid',
       payload: {
         payment_link: { entity: { id: 'plink_x', notes: {
-          telegram_id: '90903', plan_id: 'sprint_30', group_id: 'appsc_q_te',
-          referral_code: 'REFWMXD9N', commission_amount: '35.82'
+          telegram_id: '90903', plan_id: 'exam_pass', group_id: 'appsc_q_te', promo_code: 'RAVI10', commission_amount: '35.82'
         } } },
         payment: { entity: { id: 'pay_x', amount: 17910 } }
       }
     });
-
-    // The student still gets in: their payment is real either way.
     assert.equal(handled.handled, true);
-    assert.equal(earnings.length, 0, 'a commission was credited against no code');
-    assert.ok(logged.some((l) => /REFWMXD9N/.test(l) && /nothing credited/.test(l)),
-      'the mismatch was not reported');
+    assert.equal(rows['90903'].status, 'active', 'the paying student was locked out over a commission');
+    assert.ok(logged.some((l) => /RAVI10/.test(l) && /pay_x/.test(l)), 'the failure was not reported');
   } finally {
-    sheetsModule.forGroup = originalForGroup;
-    paybotModule.createJoinRequestInvite = originalInvite;
-    paybotModule.sendDirectMessage = originalDm;
-    console.error = originalError;
+    sheetsModule.forGroup = originals.forGroup;
+    paybotModule.createJoinRequestInvite = originals.invite;
+    paybotModule.sendDirectMessage = originals.dm;
+    store.recordSale = originals.recordSale;
+    notify.tellInfluencer = originals.tell;
+    console.error = originals.error;
   }
 });
 
