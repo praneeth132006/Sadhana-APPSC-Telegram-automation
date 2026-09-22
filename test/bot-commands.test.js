@@ -58,7 +58,7 @@ test('the student menu is written to private chats, where students actually are'
   const shown = tg.scopes.get(tg.key({ type: 'all_private_chats' }));
   assert.ok(shown, 'nothing was written to private chats — the scope Telegram shows students');
   assert.deepEqual(shown.map((c) => c.command),
-    ['start', 'about', 'plans', 'status', 'referral', 'help', 'support']);
+    ['start', 'about', 'plans', 'status', 'referral', 'help', 'support', 'terms']);
 });
 
 test('a stale private-chat menu is replaced, not left shadowing the new one', async () => {
@@ -71,7 +71,7 @@ test('a stale private-chat menu is replaced, not left shadowing the new one', as
   await botCommands.registerMenus(tg.api, null);
 
   assert.deepEqual(await botCommands.menuStudentsSee(tg.api),
-    ['start', 'about', 'plans', 'status', 'referral', 'help', 'support']);
+    ['start', 'about', 'plans', 'status', 'referral', 'help', 'support', 'terms']);
 });
 
 test('the default menu is cleared, so the paid groups do not show dead commands', async () => {
@@ -138,7 +138,7 @@ test('there is one command list, and both scripts use it', () => {
 
 test('/about and the Telegram description are the same paragraph', () => {
   const src = fs.readFileSync('src/botapp.js', 'utf8');
-  assert.match(src, /botCommands\.ABOUT/, '/about has its own copy of the paragraph again');
+  assert.match(src, /botCommands\.aboutFor\(/, '/about has its own copy of the paragraph again');
   assert.ok(!/Join our APPSC prep group via this bot/.test(src), 'the paragraph is duplicated in botapp.js');
   assert.match(botCommands.ABOUT, /Eenadu, Sakshi & Nipuna/);
   assert.ok(botCommands.SHORT_DESCRIPTION.length <= 120, 'Telegram refuses a short description over 120');

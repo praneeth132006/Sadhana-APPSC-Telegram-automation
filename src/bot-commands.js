@@ -32,7 +32,8 @@ const STUDENT_COMMANDS = [
   { command: 'status', description: 'Check your current pass' },
   { command: 'referral', description: 'Invite a friend and earn 20%' },
   { command: 'help', description: 'How it all works' },
-  { command: 'support', description: 'Get help with a problem' }
+  { command: 'support', description: 'Get help with a problem' },
+  { command: 'terms', description: 'Terms of the pass and payments' }
 ];
 
 /** What admins see when they type "/" in a bot's support chat. */
@@ -52,6 +53,33 @@ const ABOUT = 'Join our APPSC prep group via this bot. Get daily practice questi
 /** The line under the bot's name in search and on its profile. Telegram allows 120. */
 const SHORT_DESCRIPTION =
   'Daily APPSC practice questions from Eenadu, Sakshi & Nipuna — in Telugu and English.';
+
+/**
+ * Bots that sell something other than the APPSC groups say so.
+ *
+ * The UPSC bot used to carry the APPSC paragraph too — a profile promising
+ * Eenadu and Telugu medium, in front of a bot that sells UPSC Prelims in
+ * English. An ad reviewer reads the profile first and then tries the bot; the
+ * two have to describe the same thing.
+ */
+const PROFILES = {
+  TELEGRAM_PAYBOT_UPSC: {
+    about: 'Join our UPSC Prelims prep group via this bot. Get daily practice questions ' +
+      'in poll format across History, Geography, Polity, Economy, Environment, ' +
+      'Science & Tech and Current Affairs. In English.',
+    short: 'Daily UPSC Prelims practice questions in poll format — History, Polity, Economy and more.'
+  }
+};
+
+/** The /about paragraph and Telegram description for one payment bot. */
+function aboutFor(payBotEnv) {
+  return (PROFILES[payBotEnv] && PROFILES[payBotEnv].about) || ABOUT;
+}
+
+/** The short description for one payment bot. */
+function shortDescriptionFor(payBotEnv) {
+  return (PROFILES[payBotEnv] && PROFILES[payBotEnv].short) || SHORT_DESCRIPTION;
+}
 
 /**
  * registerMenus — writes the menus to the scopes students and admins are in.
@@ -114,6 +142,8 @@ module.exports = {
   ADMIN_COMMANDS,
   ABOUT,
   SHORT_DESCRIPTION,
+  aboutFor,
+  shortDescriptionFor,
   registerMenus,
   menuStudentsSee
 };
