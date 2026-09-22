@@ -127,8 +127,8 @@ test('EPFO sells one pass, at Rs 199, valid until the EPFO exam', () => {
   assert.equal(pass.amountPaise, 19900);
   assert.equal(pass.lifetime, false);
   assert.equal(pass.type, 'one_time');
-  // The tentative date, until a real one is set.
-  assert.equal(pass.validUntil, '31-03-2027');
+  // The exam is on 20-12-2026; members keep access until 24-12-2026.
+  assert.equal(pass.validUntil, '24-12-2026');
   assert.deepEqual(groups.plansFor('epfo').map((p) => p.id), ['epfo_pass']);
 });
 
@@ -161,7 +161,7 @@ test('an EPFO pass bought with no date in its notes still ends on the EPFO date'
   // EPFO member would have been cut off on the APPSC exam's day.
   const plan = groups.getPlanFor('epfo', 'epfo_pass');
   const now = new Date(Date.UTC(2026, 8, 22));
-  assert.equal(plans.computeExpiry(plan, now).getTime(), endOfDay('31-03-2027'));
+  assert.equal(plans.computeExpiry(plan, now).getTime(), endOfDay('24-12-2026'));
 
   process.env.EPFO_PASS_END_DATE = '15-06-2027';
   try {
@@ -189,14 +189,14 @@ test('paying for EPFO writes an EPFO member to the EPFO sheet', async () => {
   try {
     const result = await membership.grantAccess({
       groupId: 'epfo', telegramId: '4242', planId: 'epfo_pass', paymentId: 'pay_EPFO1',
-      amountPaise: 19900, validUntil: '31-03-2027'
+      amountPaise: 19900, validUntil: '24-12-2026'
     });
     assert.equal(written.length, 1);
     assert.equal(written[0].groupId, 'epfo');
     assert.equal(written[0].row.plan, 'epfo_pass');
     assert.equal(written[0].row.plan_label, 'Target EPFO Pass');
     assert.equal(written[0].row.amount, 199);
-    assert.equal(result.expiry.getTime(), endOfDay('31-03-2027'));
+    assert.equal(result.expiry.getTime(), endOfDay('24-12-2026'));
     // The invite is for the EPFO group, made by the EPFO bot.
     assert.deepEqual(invites, [{ botEnv: 'TELEGRAM_PAYBOT_EPFO', chatId: '-1009999999992', telegramId: '4242' }]);
   } finally {
@@ -237,7 +237,7 @@ test('the EPFO bot sells only the EPFO pass, at Rs 199, with its end date', asyn
   const text = sent.map((s) => s[1]).join('\n');
   assert.match(text, /Target EPFO Pass/);
   assert.match(text, /₹199/);
-  assert.match(text, /31-03-2027/);
+  assert.match(text, /24-12-2026/);
   assert.doesNotMatch(text, /UPSC|APPSC|Newspaper/);
   const buttons = sent.flatMap((s) => ((s[2] && s[2].reply_markup && s[2].reply_markup.inline_keyboard) || []).flat());
   assert.ok(buttons.some((b) => /^buy:epfo:epfo_pass/.test(String(b.callback_data))),

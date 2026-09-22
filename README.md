@@ -143,7 +143,8 @@ nightly jobs all read the list of groups from the config. For EPFO:
    (`node group-setup.js --chat-ids` lists the groups the payment bots can see).
 3. **Sheet.** Create a Google Sheet, open Extensions → Apps Script from it, paste
    **`apps-script/epfo.gs.js`** (not `google_apps_script.js` — the generated file
-   already carries EPFO's 13 subjects), run `setupSpreadsheet`, set the `API_TOKEN`
+   already carries EPFO's 13 subjects), run `setupSpreadsheet` (it creates every tab —
+   subjects, Config, Subscribers, Payments, Support, Bot Settings, Coupons), set the `API_TOKEN`
    script property, and deploy as a Web App. The `/exec` URL → `SHEET_URL_EPFO`, the
    token → `SHEET_TOKEN_EPFO`.
 4. **Sheets API.** Share the sheet with the service account in
@@ -306,7 +307,7 @@ row the poster is holding, are each named rather than being folded into a count:
 |---|---|---|---|
 | **Newspaper · English, Newspaper · Telugu** | ♾️ Lifetime Pass | once | never |
 | Sadhana APPSC · English, Sadhana APPSC · Telugu, UPSC | 🎯 Target 2026 Pass | once | on exam day (`EXAM_PASS_END_DATE`) |
-| EPFO | 🎯 Target EPFO Pass | once | on the EPFO exam day (`EPFO_PASS_END_DATE`, tentatively 31-03-2027) |
+| EPFO | 🎯 Target EPFO Pass | once | 24-12-2026, four days after the exam on 20-12-2026 (`EPFO_PASS_END_DATE` or the dashboard can move it) |
 
 Every pass is ₹199, paid once. There are no refunds.
 

@@ -24,7 +24,7 @@
     "ONE PASS: each group sells a single pass at Rs 199 (19900 paise). sprint_30 and autopay_monthly are \"retired\": no longer offered anywhere, but still defined so a member who bought one keeps working — their renewal webhook, reminders and /cancel all still look the plan up by id. Do not delete them while anyone holds one. Their prices here are only what the dashboard shows for them; a member's own record keeps what they actually paid. The pass name, price and valid-until date can be overridden per bot from the dashboard (Pass & Coupons page) without editing this file.",
     "passPlanId says which pass a group sells. It defaults to exam_pass; the two newspaper groups sell lifetime_pass and EPFO sells epfo_pass instead. Plans a group no longer sells stay listed so members who already bought them keep resolving.",
     "",
-    "fixedEndDateEnv names the env var holding a dated pass's last day (dd-mm-yyyy); fixedEndDate is the fallback when that var is unset. epfo_pass has its own, because the EPFO exam is not on the APPSC exam's date. The date set on the dashboard's Pass & Coupons page wins over both.",
+    "fixedEndDateEnv names the env var holding a dated pass's last day (dd-mm-yyyy); fixedEndDate is the fallback when that var is unset. epfo_pass has its own (24-12-2026: the exam is on 20-12-2026 and access runs four days past it), because the EPFO exam is not on the APPSC exam's date. The date set on the dashboard's Pass & Coupons page wins over both.",
     "",
     "subjectCodes (optional, per group) fixes the three-letter prefix of each subject's Question IDs. Without it the prefix is the subject's first three letters, which gives Indian Culture and Industrial Relations the same one."
   ],
@@ -76,11 +76,11 @@
       "emoji": "🎯",
       "type": "one_time",
       "durationDays": null,
-      "tagline": "Valid until exam day — best value",
-      "description": "One payment, access right through to the EPFO exam. No renewals to remember.",
+      "tagline": "Exam on 20-12-2026 — access until 24-12-2026",
+      "description": "One payment, access right through the EPFO exam on 20-12-2026 and until 24-12-2026. No renewals to remember.",
       "reminderDaysBefore": 7,
       "fixedEndDateEnv": "EPFO_PASS_END_DATE",
-      "fixedEndDate": "31-03-2027"
+      "fixedEndDate": "24-12-2026"
     }
   },
   "groups": [

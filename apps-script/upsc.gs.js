@@ -10,7 +10,7 @@
 // Group id : upsc
 // Subjects : 12
 //            Ancient India, Medieval India, Modern India, Physical Geography, Indian Geography, Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Art and Culture
-// Built    : 2026-09-22T06:57:19.762Z
+// Built    : 2026-09-22T07:20:39.052Z
 // ==========================================================================
 
 // ============================================================================
@@ -319,16 +319,17 @@ function subjectConfigList() {
     throw new Error('SUBJECTS_JSON must be a non-empty JSON array of subject names.');
   }
 
-  SUBJECT_CONFIG_CACHE = names.map(function (entry, i) {
+  SUBJECT_CONFIG_CACHE = names.map(function (entry) {
     var isObject = entry && typeof entry === 'object';
     var clean = String(isObject ? entry.subject : entry).trim();
     var fixed = isObject ? String(entry.code || '').trim().toUpperCase() : '';
     return {
       subject: clean,
-      // Topic ids here are placeholders. `node setup.js` creates the real
-      // forum topics and writes their ids into Config, and setupSpreadsheet
-      // preserves those, so these are only ever a starting point.
-      threadId: 6 + i,
+      // Blank until `node setup-topics.js` creates the real forum topic and
+      // writes its id into Config (which setupSpreadsheet then preserves). A
+      // made-up number here looked like a real id, so setup-topics skipped
+      // the subject and nothing ever created its topic.
+      threadId: '',
       cron: '0 */3 * * *',
       count: 5,
       code: /^[A-Z]{1,6}$/.test(fixed) ? fixed : (clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB')
@@ -339,18 +340,18 @@ function subjectConfigList() {
 
 /** Fallback subject list, used when no SUBJECTS_JSON property is set. */
 var SUBJECT_CONFIG_LIST_DEFAULT = [
-  { subject: "Ancient India", threadId: 6, cron: '0 */3 * * *', count: 5, code: 'ANC' },
-  { subject: "Medieval India", threadId: 7, cron: '0 */3 * * *', count: 5, code: 'MED' },
-  { subject: "Modern India", threadId: 8, cron: '0 */3 * * *', count: 5, code: 'MOD' },
-  { subject: "Physical Geography", threadId: 9, cron: '0 */3 * * *', count: 5, code: 'PHY' },
-  { subject: "Indian Geography", threadId: 10, cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "Economy", threadId: 11, cron: '0 */3 * * *', count: 5, code: 'ECO' },
-  { subject: "Environment", threadId: 12, cron: '0 */3 * * *', count: 5, code: 'ENV' },
-  { subject: "Polity", threadId: 13, cron: '0 */3 * * *', count: 5, code: 'POL' },
-  { subject: "International Relations", threadId: 14, cron: '0 */3 * * *', count: 5, code: 'INT' },
-  { subject: "Science and Technology", threadId: 15, cron: '0 */3 * * *', count: 5, code: 'SCI' },
-  { subject: "Current Affairs", threadId: 16, cron: '0 */3 * * *', count: 5, code: 'CUR' },
-  { subject: "Art and Culture", threadId: 17, cron: '0 */3 * * *', count: 5, code: 'ART' }
+  { subject: "Ancient India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ANC' },
+  { subject: "Medieval India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MED' },
+  { subject: "Modern India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MOD' },
+  { subject: "Physical Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'PHY' },
+  { subject: "Indian Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
+  { subject: "Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ECO' },
+  { subject: "Environment", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ENV' },
+  { subject: "Polity", threadId: '', cron: '0 */3 * * *', count: 5, code: 'POL' },
+  { subject: "International Relations", threadId: '', cron: '0 */3 * * *', count: 5, code: 'INT' },
+  { subject: "Science and Technology", threadId: '', cron: '0 */3 * * *', count: 5, code: 'SCI' },
+  { subject: "Current Affairs", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CUR' },
+  { subject: "Art and Culture", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ART' }
 ];
 
 // ============================================================================
@@ -4129,8 +4130,21 @@ function setupSpreadsheet() {
     }
   }
 
+  // Members, payments, support and coupons too. They used to be separate
+  // functions that also had to be remembered, and a sheet set up with only
+  // this one looked finished while it had no Subscribers or Payments tab at
+  // all. Each is created only if missing, so re-running this is still safe.
+  subscriberSheet();
+  paymentSheet();
+  supportSheet();
+  supportLogSheet();
+  botSettingsSheet();
+  couponSheet();
+  redemptionSheet();
+
   book().toast(
-    'Setup complete — ' + subjectConfigList().length + ' subject tabs on the 30-column schema.',
+    'Setup complete — ' + subjectConfigList().length + ' subject tabs on the 30-column schema, ' +
+    'plus Subscribers, Payments, Support, Bot Settings and Coupons.',
     'Sadhana APPSC', 10
   );
 }

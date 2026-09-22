@@ -66,7 +66,8 @@ function detail(groupId) {
   console.log('   ' + require('crypto').randomBytes(32).toString('hex'));
   console.log('   (a fresh one, printed for you — do not reuse another group\'s)');
 
-  console.log('\n3. Run setupSpreadsheet, then setupSubscriptionSheets, then setupSupportSheets.');
+  console.log('\n3. Run setupSpreadsheet. It creates every tab: subjects, Config, Subscribers,');
+  console.log('   Payments, Support, Bot Settings and Coupons.');
   console.log('   Deploy > New deployment > Web app, Execute as Me, Access Anyone.');
 
   console.log('\n4. Create the Telegram group and add BOTH bots as admins:');
