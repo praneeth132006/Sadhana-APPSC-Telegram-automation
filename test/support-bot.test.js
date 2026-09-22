@@ -261,10 +261,16 @@ test('Send refuses a message that belongs to someone else', async () => {
   assert.match(ack.args[1].text, /no longer available/);
 });
 
-test('commands are left to their own handlers, not offered to support', async () => {
-  const { deliver, messages } = makeBot();
+test('an unknown command is answered with the command list, not offered to support', async () => {
+  // Silence here is what got the bot's Telegram ad rejected: "Bots must
+  // respond to commands properly".
+  const { deliver, messages, sheet } = makeBot();
   await deliver(privateMessage('/nonsense'));
-  assert.equal(messages(STUDENT.id).length, 0);
+  const replies = messages(STUDENT.id);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].args[1], /do not know that command/);
+  assert.match(replies[0].args[1], /\/plans/);
+  assert.equal(sheet.calls.filter((c) => c.name === 'createTicket').length, 0);
 });
 
 test('nothing is answered in the paid group, even though the bot sees every message there', async () => {

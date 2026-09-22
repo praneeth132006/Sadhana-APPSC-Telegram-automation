@@ -156,8 +156,9 @@ test('/start is one welcome message with a Continue button, not a wall of text',
   assert.match(all[0].args[1], /Welcome to/);
   assert.match(all[0].args[1], /Hello Asha/);
   // The paragraph the admin gave, word for word.
-  assert.match(all[0].args[1], /daily practice questions from Eenadu, Sakshi &amp; Nipuna in poll format/);
-  assert.match(all[0].args[1], /Telugu and English mediums/);
+  // This is the UPSC bot, so it describes UPSC — not the APPSC newspaper groups.
+  assert.match(all[0].args[1], /UPSC Prelims prep group/);
+  assert.doesNotMatch(all[0].args[1], /Eenadu|Telugu/);
   assert.equal(all[0].args[2].reply_markup.inline_keyboard[0][0].text, 'Continue →');
   assert.equal(all[0].args[2].reply_markup.inline_keyboard[0][0].callback_data, 'go:plans');
 });
@@ -175,8 +176,8 @@ test('/about says the same thing and lists the commands', async () => {
   await deliver(privateMessage('/about'));
 
   const text = lastText(messages, STUDENT.id);
-  assert.match(text, /daily practice questions from Eenadu, Sakshi &amp; Nipuna in poll format/);
-  assert.match(text, /Telugu and English mediums/);
+  assert.match(text, /UPSC Prelims prep group/);
+  assert.doesNotMatch(text, /Eenadu|Telugu/);
   assert.match(text, /\/referral/);
   assert.match(text, /\/support/);
 });

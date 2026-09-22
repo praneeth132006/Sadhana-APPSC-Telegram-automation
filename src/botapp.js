@@ -131,7 +131,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    */
   // From src/bot-commands.js, so /about and the Telegram description screen can
   // no longer drift apart. Escaped here because this one is sent as HTML.
-  const ABOUT_TEXT = esc(botCommands.ABOUT);
+  const ABOUT_TEXT = esc(botCommands.aboutFor(payBotEnv));
 
   /** The family's name, for the top of a greeting. */
   function botDisplayName() {
@@ -172,6 +172,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   /** How long a support flow waits for settings before using the defaults. */
   const SUPPORT_SETTINGS_WAIT_MS = 8000;
+
+  /** How long /status and /cancel wait for one group's sheet. */
+  const SUBSCRIPTION_READ_MS = 12000;
 
   /**
    * The family's first group. A bot's settings are read from, and its tickets
@@ -724,15 +727,30 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * @returns {Promise<Array<{group: Object, subscriber: Object}>>}
    */
   async function findSubscriptions(telegramId) {
-  const found = [];
-  for (const group of familyGroups()) {
-    try {
-      const subscriber = await sheetFor(group.id).getSubscriber(telegramId);
-      if (subscriber) found.push({ group, subscriber });
-    } catch (err) {
-      console.error(`[bot] could not read ${group.id}: ${err.message}`);
+  // In parallel and bounded: a sheet takes 2–4 s to answer and can take 45 s
+  // to time out, and the webhook only waits 20 s for a reply. Read one group
+  // after another and a student in a two-group family can get no answer at all.
+  let incomplete = false;
+  const reads = await Promise.all(familyGroups().map(async (group) => {
+    const failed = Symbol('failed');
+    const subscriber = await within(
+      Promise.resolve().then(() => sheetFor(group.id).getSubscriber(telegramId)).catch((err) => {
+        console.error(`[bot] could not read ${group.id}: ${err.message}`);
+        return failed;
+      }),
+      SUBSCRIPTION_READ_MS,
+      failed
+    );
+    if (subscriber === failed) {
+      incomplete = true;
+      return null;
     }
-  }
+    return subscriber ? { group, subscriber } : null;
+  }));
+  const found = reads.filter(Boolean);
+  // "You have no pass" said to a member because their sheet was slow is worse
+  // than "try again", so callers can tell an empty answer from a failed one.
+  found.incomplete = incomplete;
   return found;
   }
 
@@ -795,14 +813,73 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * and invite button for the whole group to see (/status), or act on their
    * subscription in public (/cancel).
    */
-  function studentCommand(pattern, handler) {
+  //
+  // Every command registered here is also remembered by name, so the catch-all
+  // message handler can tell "a command we answer" from "a command we do not"
+  // and reply to the second kind instead of staying silent. Telegram's ad
+  // review sends commands to the bot and rejects it when any of them goes
+  // unanswered ("Bots must respond to commands properly").
+  const studentCommandNames = new Set(['support']);
+
+  function studentCommand(name, handler) {
+    studentCommandNames.add(name);
+    // Case-insensitive, and the command must end at a space or the end of the
+    // text — the same boundary commandName() uses — so /Plans works and
+    // /plansfoo falls through to the "unknown command" reply.
+    const pattern = new RegExp(`^\\/${name}(?:@\\w+)?(?=\\s|$)(?:\\s+(\\S+))?`, 'i');
     bot.onText(pattern, async (msg, match) => {
       if (!msg || !msg.chat || msg.chat.type !== 'private') return;
-      await handler(msg, match);
+      showTyping(msg.chat.id);
+      try {
+        await handler(msg, match);
+      } catch (err) {
+        // A handler that throws used to be logged and nothing else — the
+        // student saw a command that did nothing. Say something instead.
+        console.error(`[bot] ${payBotEnv} /${name} failed: ${err && err.message}`);
+        await apologise(msg.chat.id);
+      }
     });
   }
 
-  studentCommand(/^\/start(?:@\w+)?(?:\s+(\S+))?\s*$/, async (msg, match) => {
+  /**
+   * "typing…" at the top of the chat while a command works. The sheet takes a
+   * few seconds to answer, and a bot that shows nothing for those seconds looks
+   * like one that is not going to answer. Never awaited, never fatal.
+   */
+  function showTyping(chatId) {
+    Promise.resolve()
+      .then(() => bot.sendChatAction(chatId, 'typing'))
+      .catch(() => {});
+  }
+
+  /** The reply when something broke half-way through a command. */
+  async function apologise(chatId) {
+    try {
+      await bot.sendMessage(chatId,
+        '⚠️ Something went wrong on our side. Please try again in a moment, or tap below to reach us.',
+        { reply_markup: SUPPORT_BUTTON });
+    } catch (err) {
+      console.error(`[bot] ${payBotEnv}: could not even apologise — ${err.message}`);
+    }
+  }
+
+  /**
+   * The command a message starts with, lower-cased, or '' when the text is not
+   * a well-formed command ("/", "/ hi", "/plans,").
+   */
+  function commandName(text) {
+    const match = String(text || '').match(/^\/([A-Za-z0-9_]+)(?:@\w+)?(?=\s|$)/);
+    return match ? match[1].toLowerCase() : '';
+  }
+
+  /** The command list, as one block of text for replies that point people to it. */
+  function commandListText() {
+    return botCommands.STUDENT_COMMANDS
+      .map(({ command, description }) => `/${command} — ${esc(description.charAt(0).toLowerCase() + description.slice(1))}`)
+      .join('\n');
+  }
+
+  studentCommand('start', async (msg, match) => {
   const name = msg.from.first_name || 'there';
 
   // A share link arrives as "/start ref_REFXXXXXX". Remembering it here, before
@@ -846,38 +923,34 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   );
   });
 
-  studentCommand(/^\/about(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('about', async (msg) => {
   const aboutSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
   await bot.sendMessage(msg.chat.id,
     `<b>About ${esc(botDisplayName())}</b>\n\n` + ABOUT_TEXT + '\n\n' +
-    'Commands:\n' +
-    '/plans — see the pass and join\n' +
-    '/status — check your current pass\n' +
-    '/referral — invite a friend and earn\n' +
-    '/help — how it all works\n' +
-    '/support — get help with a problem' +
+    'Commands:\n' + commandListText() +
     (aboutSettings && support.emailFallbackLine(aboutSettings)
       ? '\n\n' + support.emailFallbackLine(aboutSettings) : ''),
     { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } }
   );
   });
 
-  studentCommand(/^\/referral(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('referral', async (msg) => {
   await sendReferralCard(msg.chat.id, msg.from);
   });
 
   // The same thing under the name people actually guess.
-  studentCommand(/^\/invite(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('invite', async (msg) => {
   await sendReferralCard(msg.chat.id, msg.from);
   });
 
-  studentCommand(/^\/plans(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('plans', async (msg) => {
   await offerGroups(msg.chat.id, msg.from);
   });
 
-  studentCommand(/^\/status(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('status', async (msg) => {
   try {
     const held = await findSubscriptions(msg.from.id);
+    if (!held.length && held.incomplete) throw new Error('a member sheet did not answer');
 
     if (!held.length) {
       await bot.sendMessage(msg.chat.id,
@@ -914,7 +987,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
   });
 
-  studentCommand(/^\/help(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('help', async (msg) => {
   const many = familyGroups().length > 1;
   const helpSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
   const steps = [
@@ -940,7 +1013,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   );
   });
 
-  studentCommand(/^\/cancel(?:@\w+)?(?:\s|$)/, async (msg) => {
+  studentCommand('cancel', async (msg) => {
   try {
     const held = await findSubscriptions(msg.from.id);
     const renewing = held.filter(({ subscriber }) => subscriber.subscription_id);
@@ -973,6 +1046,54 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     await bot.sendMessage(msg.chat.id, '⚠️ Could not cancel automatically. Tap below to reach an admin.',
       { reply_markup: SUPPORT_BUTTON });
   }
+  });
+
+  // /settings and /terms are two of the commands Telegram asks every bot to
+  // answer (with /start and /help), and the first ones an ad reviewer tries
+  // after the menu. Neither is on the list of things this bot was built for,
+  // so both used to get silence.
+  studentCommand('settings', async (msg) => {
+  await bot.sendMessage(msg.chat.id,
+    '<b>Settings</b>\n\n' +
+    'There is nothing to set up — your pass is linked to this Telegram account ' +
+    'automatically when you pay.\n\n' +
+    '/status — see your pass and your invite link\n' +
+    '/plans — see the pass and join\n' +
+    '/referral — your invite link for friends\n' +
+    '/support — anything else',
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: 'Continue →', callback_data: 'go:plans' }],
+          [{ text: '🎁 My referral', callback_data: 'ref:card' }],
+          [{ text: '🆘 Support', callback_data: 'sup:menu' }]
+        ]
+      }
+    });
+  });
+
+  studentCommand('terms', async (msg) => {
+  const settings = await settingsWithin(START_SETTINGS_WAIT_MS);
+  const passes = familyGroups()
+    .map((group) => ({ group, pass: pricing.currentPass(group.id, settings) }))
+    .filter(({ pass }) => pass);
+  const validity = passes.map(({ group, pass }) =>
+    `• <b>${esc(group.shortName)}</b> — ${esc(pass.label)}, ` +
+    (pass.lifetime ? 'valid for life' : pass.validUntil ? `valid until ${esc(pass.validUntil)}` : 'valid for the period shown before you pay')
+  ).join('\n');
+  await bot.sendMessage(msg.chat.id,
+    '<b>Terms</b>\n\n' +
+    (validity ? validity + '\n\n' : '') +
+    '1. The price and how long the pass lasts are shown before you pay. You pay once; nothing renews on its own.\n' +
+    '2. Payment is taken on Razorpay\'s secure page. This bot never sees your card or UPI details.\n' +
+    '3. After payment the bot sends a private invite link for the group you chose. It works only for your ' +
+    'Telegram account and cannot be shared.\n' +
+    '4. When a dated pass ends you are removed from the group, with a reminder beforehand.\n' +
+    '5. For a payment that did not go through, a double charge or a refund request, send /support with your ' +
+    'Razorpay payment id (it starts with pay_).' +
+    (support.emailFallbackLine(settings) ? '\n\n' + support.emailFallbackLine(settings) : ''),
+    { parse_mode: 'HTML', reply_markup: SUPPORT_BUTTON });
   });
 
   // ---------------------------------------------------------------------------
@@ -2368,8 +2489,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     await sendSupportMenu(msg.chat.id);
     return;
   }
-  // Other commands have their own handlers.
-  if (String(msg.text || '').startsWith('/')) return;
+  // Commands the bot answers have their own handlers. Every other command —
+  // a typo, one from another bot, "/menu" — gets told what does work, rather
+  // than nothing. Silence here is what got the bot's ad rejected.
+  if (String(msg.text || '').startsWith('/')) {
+    if (studentCommandNames.has(commandName(msg.text))) return;
+    await bot.sendMessage(msg.chat.id,
+      'Sorry, I do not know that command. Here is what I can do:\n\n' + commandListText(),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } });
+    return;
+  }
 
   const replied = msg.reply_to_message;
   if (replied && replied.from && String(replied.from.id) === botId) {
@@ -2389,6 +2518,15 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       await followUpTicket(msg, ticketId, msg.from);
       return;
     }
+  }
+
+  // A sticker, a location, a contact: nothing support can act on, but still a
+  // person trying the bot, so they get pointed somewhere useful.
+  if (!support.messageText(msg) && !support.hasMedia(msg) && isUnreadable(msg)) {
+    await bot.sendMessage(msg.chat.id,
+      'I can only read text and photos. Here is what I can do:\n\n' + commandListText(),
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } });
+    return;
   }
 
   // Service messages (a join, a pinned message) carry neither.
@@ -2419,6 +2557,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       }
     });
   });
+
+  /** A message a person sent that has no text or media support can use. */
+  function isUnreadable(msg) {
+  return ['sticker', 'location', 'venue', 'contact', 'poll', 'dice', 'game', 'story']
+    .some((kind) => msg[kind]);
+  }
 
   /** This bot's @username, fetched once. */
   let ownUsername = null;

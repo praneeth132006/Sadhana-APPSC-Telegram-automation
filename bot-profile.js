@@ -28,7 +28,6 @@ const groupRegistry = require('./src/groups');
 const botCommands = require('./src/bot-commands');
 const support = require('./src/support');
 
-const DESCRIPTION = botCommands.ABOUT;
 
 /** A plain Telegram API caller for one bot, for the calls the library lacks. */
 function telegramFor(env) {
@@ -37,7 +36,6 @@ function telegramFor(env) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {})
   }).then((r) => r.json());
 }
-const SHORT_DESCRIPTION = botCommands.SHORT_DESCRIPTION;
 const COMMANDS = botCommands.STUDENT_COMMANDS;
 
 const statusOnly = process.argv.includes('--status');
@@ -76,6 +74,8 @@ async function main() {
       continue;
     }
     console.log(`  ${env}  →  @${me.username}`);
+    const DESCRIPTION = botCommands.aboutFor(env);
+    const SHORT_DESCRIPTION = botCommands.shortDescriptionFor(env);
 
     if (statusOnly) {
       const [description, short] = await Promise.all([
