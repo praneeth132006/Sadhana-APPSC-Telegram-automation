@@ -1241,7 +1241,7 @@ test('coupon guessing is limited per student', async () => {
   const prompt = { message_id: 1, from: BOT, chat: { id: STUDENT.id }, text: '🎟 Coupon code for UPSC Prelims' };
   for (let i = 0; i < 10; i++) await deliver(privateMessage(`GUESS${i}`, { reply_to_message: prompt }));
   assert.equal(sheet.calls.filter((c) => c.name === 'getCoupon').length, 8, 'only 8 lookups in the window');
-  assert.match(messages(STUDENT.id).at(-1).args[1], /Too many coupon attempts/);
+  assert.match(messages(STUDENT.id).at(-1).args[1], /Too many code attempts/);
 });
 
 test('a flood of free-typed messages stops reaching the sheet', async () => {

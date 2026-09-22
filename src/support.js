@@ -279,25 +279,6 @@ const SETTINGS = [
     key: 'pass_description', section: 'pass', label: 'Description', type: 'textarea', maxLength: 300,
     default: '', optional: true,
     hint: 'One or two lines shown with the price. Blank uses the built-in description.'
-  },
-  {
-    key: 'referral_enabled', section: 'pass', label: 'Referrals enabled', type: 'toggle', default: 'yes',
-    hint: 'Switches "invite a friend" off without deleting anyone\'s code or their unpaid earnings.'
-  },
-  {
-    key: 'referral_discount_percent', section: 'pass', label: 'Referral discount (%)', type: 'percent',
-    maxLength: 2, default: '', optional: true,
-    hint: 'What the invited student saves on their first pass. Blank uses 10%.'
-  },
-  {
-    key: 'referral_commission_percent', section: 'pass', label: 'Referral commission (%)', type: 'percent',
-    maxLength: 3, default: '', optional: true,
-    hint: 'What the inviter earns, as a share of what the invited student actually paid. Blank uses 20%.'
-  },
-  {
-    key: 'referral_payout_threshold', section: 'pass', label: 'Payout at (₹)', type: 'price',
-    maxLength: 7, default: '', optional: true,
-    hint: 'Pending earnings at or above this can be claimed from the bot. Blank uses ₹1000.'
   }
 ];
 

@@ -330,7 +330,7 @@ so nobody is upgraded for free by the group changing.
 ## Tabs that are not subjects
 
 A group's workbook holds question tabs and tabs that are nothing of the kind — Config,
-Subscribers, Support, Coupons, Referrals. `src/sheet-tabs.js` names the second kind and the
+Subscribers, Support, Coupons (and, in older sheets, Referrals). `src/sheet-tabs.js` names the second kind and the
 server filters them out of Analytics itself, so a new tab never shows up as a paused subject
 at 0% again, and fixing it never needs the Apps Script pasted into five sheets.
 
@@ -346,7 +346,7 @@ npm run bot-profile          # write commands and descriptions
 npm run bot-profile:status   # show what Telegram currently holds
 ```
 
-The menu is `/start`, `/about`, `/plans`, `/status`, `/referral`, `/help`, `/support`.
+The menu is `/start`, `/about`, `/plans`, `/status`, `/help`, `/support`, `/terms`.
 `/start` is one welcome message with a **Continue →** button — the pass is shown when
 they tap it, not unasked.
 
@@ -368,97 +368,59 @@ student is actually shown, read back from Telegram.
 
 ---
 
-## Referrals — invite a friend
+## Influencer programme
 
-A member sends `/referral` and gets a code and a share link. Whoever follows that link
-pays **10% less** on their first pass, and the member earns **20% of what that person
-actually paid**, in rupees.
+Influencers promote an exam's channel and earn on every student who pays with their promo
+code. It replaced the member-to-member referral system, which was hard to track and pay.
 
-**Commission is on what was paid, never on the list price.** The discount comes off
-first, so a ₹199 pass sold through a referral is ₹179.10 to the buyer, ₹35.82 to the
-inviter, and ₹143.28 kept. Paying 20% of ₹199 would quietly pay out more than the sale
-brought in.
-
-**How a member uses it**
+**Who does what**
 
 | | |
 |---|---|
-| `/referral` | Their code, their share link, and their running total |
-| Share link | `https://t.me/<bot>?start=ref_REFXXXXXX` — the discount is applied on the first screen the friend sees |
-| Typing the code | Also works, in any case, with or without the `ref_` prefix |
+| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and says where they will promote it · `/upi` sets where they are paid · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
+| **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · marks a withdrawal paid (with the UPI reference) or rejects it · pauses, resumes or re-terms a code |
+| **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
-**The rules**
+**One code, one exam.** Influencers apply per exam — APPSC Newspaper, Sadhana APPSC, UPSC,
+EPFO: one per payment bot — and a code is honoured only by that exam's bot, for either
+language. The UPSC influencer's code typed into the EPFO bot is refused with *"That code is
+for UPSC and cannot be used here."* An influencer can apply for more than one exam; each is
+approved separately and gets its own code.
 
-- **One code per member**, however many times they ask. A second code would split
-  their earnings in two, and neither half would ever reach a payout.
-- **Any number of people can join on one code.** The limit is one referral per
-  *buyer*, never a cap on the code itself.
-- **A claim button appears at ₹1000** and not a rupee before. Claiming raises a
-  support ticket; an admin sends the money and presses **Mark paid**.
+**The admin sets everything** when approving: the student discount (% or ₹), the influencer's
+commission (% of what the student actually paid, or ₹ per sale — never more than the sale
+brought in), weekly or monthly withdrawals, the minimum withdrawal, and optionally a custom
+code, an expiry date, a maximum number of uses, and one use per student. The form shows what
+one sale looks like — the student pays ₹179.10, the influencer earns ₹35.82, you keep ₹143.28.
+A code can never shadow an existing coupon, an influencer cannot use their own code, and a
+discount that would take the pass below ₹1 is refused.
 
-**And why**
+**Money.** The commission is worked out when the student taps Pay and rides in the Razorpay
+notes, so changing a code's terms never changes what a sale already earned. It is credited
+once per payment id — a redelivered webhook credits nothing — and only against a code that
+exists. Withdrawals are manual: the influencer requests one, you send it over UPI, then mark
+it paid with the reference, which the influencer is sent. A rejected withdrawal's sales go
+back to their balance. Nothing on the page moves money.
 
-- **A code works once per person, on their first pass.** Otherwise a member renewing
-  monthly would earn their friend a commission every month for one introduction.
-- **You cannot invite yourself.** That is a discount you wrote yourself, plus
-  commission on your own purchase.
-- **A code is re-checked when the Pay button is tapped**, never trusted from the
-  button. A tap on yesterday's message must not buy at yesterday's terms.
-- **Commission is only ever created from a payment that succeeded**, recorded against
-  its Razorpay payment id. Razorpay retries a webhook on any non-2xx, and without that
-  id one sale would pay an inviter once per delivery.
-- **A code can be switched off** without touching what it has already earned.
+**Alerts.** New applications, withdrawal requests and influencers' questions are posted to
+the Support Team chat (or `AFFILIATE_ADMIN_CHAT_ID`) with a button to the Influencers page.
+The influencer bot must be a member of that chat.
 
-**Getting paid**
+**The sheet** (`AFFILIATE_SHEET_ID`) is separate from every exam's sheet and needs no Apps
+Script: share a blank Google Sheet with the service account as an Editor, and its tabs are
+created on first use —
 
-Earnings sit as `pending`. A member can ask to be paid once they pass **₹1000**, and
-the monthly run pays everyone with anything pending. Asking raises a support ticket —
-nothing here moves money. An admin sends it, then presses **Mark paid** on the
-Referrals page, which records that they did.
-
-**Where it all lives**
-
-Two tabs on the family's primary sheet, created on first use and upgraded in place when
-columns are added (new ones only ever go on the end, so no existing row moves):
-
-**Referrals** — one row per member with a code. Besides who they are, every row carries a
-live summary rebuilt from the log whenever anything changes for that code:
-
-| Column | What it holds |
+| Tab | One row per |
 |---|---|
-| Code, Telegram ID, Username, Name | who owns the code |
-| Share Link | the link they send |
-| Link Opens, Opened By (IDs) | every different person who opened it — including those who never paid |
-| Joined, Joined IDs, Joined Usernames | everyone who paid using it |
-| Total Earned, Pending, Paid Out | what it has earned, owes, and has paid |
-| Last Joined At, Updated At | when |
+| **Influencers** | person: Telegram id, name, UPI ID |
+| **Requests** | application: exam, what they wrote, pending / approved / rejected, who decided |
+| **Codes** | approved code: exam, every term, status, and live Uses / Revenue / Commission Earned / Commission Paid |
+| **Sales** | payment made with a code: student, payment id, list price, discount, paid, commission, available / requested / paid |
+| **Payouts** | withdrawal: UPI ID, amount, the sales it covers, paid (with reference) or rejected |
+| **Log** | every decision and who made it |
 
-**Referral Log** — one row per referred payment: a short referral id (`RL-0001`), who invited
-(id, username, name), who joined (id, username, name), the group and pass, the Razorpay
-payment id, the original price, discount, amount paid, commission, and payout status.
-
-The summary is always worked out again from the log, never incremented, so a retried webhook
-or a hand-edited row cannot leave it drifting. **🔁 Rebuild sheet** on the Referrals page
-rewrites every summary on demand and fills in any blank share links.
-
-The **Referrals** page shows the same, with detail: every referrer is a row that opens into
-everyone who joined through them — name, username, Telegram ID, group, pass, date, amounts,
-payment ID — and everyone who opened their link, marked joined or not. Filter by status,
-group or anything searchable; **⬇ Export CSV** downloads every referral with both sides' ids.
-
-In the bot, referrals are their own section — **🎁 My referral** on the welcome screen and
-`/referral` — rather than a button under Pay. The card shows the code to tap-copy, how many
-opened the link, who joined (first names only; another member's id is never shown), what
-is owed, and how far there is to go before they can claim.
-
-The percentages and the payout threshold are editable on **Pass & Coupons** without a
-deploy, and referrals can be switched off there entirely.
-
-> Referrals need the Google Sheets API — a service account and `SHEET_ID_<PREFIX>`.
-> They were built after that route replaced the Apps Script, and putting them in both
-> would mean pasting a script into five sheets by hand to turn the feature on.
-
----
+Money is written in rupees for people and read back in paise for arithmetic. Columns are
+found by name, so reordering or adding columns in the sheet does not break anything.
 
 ## When nobody answers
 
@@ -475,7 +437,6 @@ than a special case:
 | When a ticket is raised | The same line, under the confirmation |
 | On a follow-up **no admin has ever replied to** | *Still waiting? Email us at … and we will pick it up there.* |
 | Tickets switched off, or a ticket that failed to submit | Alongside the fallback contact |
-| A referral payout request | The same line — it is money, and one door is not enough |
 
 The escalation counts **admin replies**, not who the ticket is waiting on: appending
 the student's own message sets "waiting on admin", so that field is true of every
@@ -924,7 +885,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-729 tests. The ones worth knowing about:
+741 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -933,9 +894,8 @@ npm test
   failures ask for a new token and which do not, and surviving a Google outage.
 - `test/dashboard-auth.test.mjs` — the browser's `api()` loaded for real with Firebase
   stubbed, so the token refresh and the lapsed-session path actually run.
-- `test/referrals-page.test.mjs` — the real Referrals page rendered against a fake DOM, and
-  read back: rows, Telegram ids, the drill-down. Written after that page shipped showing
-  headers and nothing else.
+- `test/influencers-page.test.mjs` — the real Influencers page rendered against a fake DOM:
+  what is on it, and exactly what Approve and Mark paid send.
 - `test/apps-script.test.js` — the Apps Script logic in a sandboxed Google runtime:
   header resolution, the migration, duplicate detection, filtering and the runway math.
 - `test/host-authorisation.test.js` — the Firebase authorised-domain matching rule,
@@ -949,11 +909,14 @@ npm test
 - `test/autopilot.test.js` — the unattended scheduler on a fake clock: overlapping
   runs, an empty queue, a Telegram outage being mistaken for an empty queue, and a
   restart neither forgetting its jobs nor stampeding through every missed run.
-- `test/referrals.test.js` — the money arithmetic: commission on what was paid rather
-  than the list price, self-referral, a code used twice, rounding, and what a member
-  is owed.
-- `test/referral-bot.test.js` — the student side, ending in what actually reaches
-  Razorpay's notes, since that is what the commission is later calculated from.
+- `test/affiliates.test.js` — the influencer rules: approval terms, a code refused by every
+  bot but its own, self-use, expiry, use limits, commission capped at what was paid, and
+  withdrawal cycles.
+- `test/affiliate-store.test.js` — the influencer sheet end to end: a sale credited once
+  however often Razorpay redelivers, a rupee in at most one withdrawal, rejected withdrawals
+  handing their sales back.
+- `test/affiliate-bot.test.js` / `test/promo-bot.test.js` — the influencer bot, and promo
+  codes in the payment bots, ending in what reaches Razorpay's notes.
 
 ---
 
@@ -972,7 +935,7 @@ npm test
 │   ├── index.html/app.js     # Upload
 │   ├── analytics.html/.js    # Analytics
 │   ├── questions.html/.js    # Question bank
-│   ├── referrals.html/.js    # Referral tracking and payouts
+│   ├── influencers.html/.js  # Influencer applications, codes, sales and withdrawals
 │   ├── automation.html/.js   # Automation
 │   └── health.html/.js       # System health
 ├── src/
@@ -980,13 +943,16 @@ npm test
 │   ├── sheets.js             # Apps Script client
 │   ├── sheets-direct.js      # Google Sheets API client (the posting path)
 │   ├── autopilot.js          # unattended "every N minutes, post M" scheduler
-│   ├── referrals.js          # referral codes, discounts, commission and payouts
+│   ├── affiliates.js         # influencer programme rules: terms, promo codes, withdrawals
+│   ├── affiliate-store.js    # the influencer sheet (Sheets API only)
+│   ├── affiliatebot.js       # the influencer bot
+│   ├── affiliate-notify.js   # what the influencer bot tells influencers and admins
 │   ├── bot-commands.js       # the one command menu and description every bot uses
 │   ├── sheet-tabs.js         # which workbook tabs are subjects and which are not
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 729 tests
+└── test/                     # 741 tests
 ```
 
 ## Notes

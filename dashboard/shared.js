@@ -68,7 +68,7 @@ export let serverConfig = {};
 // Navigation definition
 // ---------------------------------------------------------------------------
 
-/** The five dashboards, in the order they appear in the nav bar. */
+/** The dashboards, in the order they appear in the nav bar. */
 const PAGES = [
   { id: 'upload',     href: 'index.html',      icon: '📤', label: 'Upload',     hint: 'Paste JSON and push questions to the sheet' },
   { id: 'analytics',  href: 'analytics.html',  icon: '📊', label: 'Analytics',  hint: 'Counts, coverage, runway and curator activity' },
@@ -76,7 +76,7 @@ const PAGES = [
   { id: 'automation', href: 'automation.html', icon: '🤖', label: 'Automation', hint: 'Post to Telegram now and manage schedules' },
   { id: 'members',    href: 'members.html',    icon: '💳', label: 'Members',    hint: 'Paying members, revenue and expiry sweep' },
   { id: 'pricing',    href: 'pricing.html',    icon: '🎟', label: 'Pass & Coupons', hint: 'The pass students buy, its price, and coupon codes' },
-  { id: 'referrals',  href: 'referrals.html',  icon: '🎁', label: 'Referrals',  hint: 'Who invited whom, what is owed, and payouts' },
+  { id: 'influencers', href: 'influencers.html', icon: '🤝', label: 'Influencers', hint: 'Influencer applications, promo codes, sales and withdrawals — every exam' },
   { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets: reply, send invite links, check payments' },
   { id: 'health',     href: 'health.html',     icon: '🩺', label: 'Health',     hint: 'System status and security posture' }
 ];
@@ -136,7 +136,7 @@ export function el(tag, attrs = {}, ...children) {
   // arguments — el('tr', {}, a, b). Both are accepted and flattened.
   //
   // Only the first form used to work, and the second failed silently: every
-  // child after the first was dropped without an error. The Referrals page was
+  // child after the first was dropped without an error. The old Referrals page was
   // written in the second form, so its tables rendered a single header cell
   // and no rows at all, and the Telegram ids under each name never appeared —
   // which looked like a page with nothing to show rather than a broken one.

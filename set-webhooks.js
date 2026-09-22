@@ -71,6 +71,74 @@ async function registerCommandMenus(token, payBotEnv) {
   }
 }
 
+/**
+ * affiliateBot — the influencer bot, registered like the payment bots but at
+ * its own route. Optional: without TELEGRAM_AFFILIATE_BOT it is skipped.
+ * Returns false when registration failed.
+ */
+async function affiliateBot(mode, base, secret) {
+  const token = String(process.env.TELEGRAM_AFFILIATE_BOT || '').trim();
+  if (!token) {
+    console.log('── TELEGRAM_AFFILIATE_BOT  (not set — no influencer bot)\n');
+    return true;
+  }
+  const me = await call(token, 'getMe');
+  console.log(`── TELEGRAM_AFFILIATE_BOT  ${me.ok ? '@' + me.result.username : '(unreachable)'}`);
+  console.log('   influencer programme');
+
+  if (mode === 'status') {
+    const r = (await call(token, 'getWebhookInfo')).result || {};
+    console.log(`   webhook       : ${r.url || '(none)'}`);
+    console.log(`   pending       : ${r.pending_update_count || 0}`);
+    if (r.last_error_message) {
+      console.log(`   ❌ last error : ${r.last_error_message} (${new Date((r.last_error_date || 0) * 1000).toISOString()})`);
+    }
+    console.log('');
+    return true;
+  }
+  if (mode === 'delete') {
+    const out = await call(token, 'deleteWebhook', { drop_pending_updates: false });
+    console.log(out.ok ? '   ✅ webhook removed\n' : `   ❌ ${out.description}\n`);
+    return Boolean(out.ok);
+  }
+
+  const url = `${base}/api/telegram/affiliate`;
+  // The same proof as the payment bots: the deployment must answer a signed
+  // probe on this route before Telegram is told to stop delivering elsewhere.
+  let status = 0;
+  try {
+    status = (await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
+      body: JSON.stringify({ update_id: 0 })
+    })).status;
+  } catch (err) {
+    status = 0;
+  }
+  if (status !== 200) {
+    console.log(`   ❌ ${url} answered ${status || 'nothing'}, not 200. Deploy this version first.\n`);
+    return false;
+  }
+
+  const out = await call(token, 'setWebhook', {
+    url, secret_token: secret, allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: false, max_connections: 20
+  });
+  const check = await call(token, 'getWebhookInfo');
+  if (!out.ok || (check.result || {}).url !== url) {
+    console.log(`   ❌ ${out.description || 'the webhook did not stick'}\n`);
+    return false;
+  }
+  console.log(`   ✅ ${url}`);
+  const menu = await call(token, 'setMyCommands', {
+    commands: botCommands.AFFILIATE_COMMANDS, scope: { type: 'all_private_chats' }
+  });
+  console.log(menu.ok ? '   ✅ influencer menu (private chats)' : `   ⚠️ influencer menu: ${menu.description}`);
+  const cleared = await call(token, 'deleteMyCommands', { scope: { type: 'default' } });
+  console.log(cleared.ok ? '   ✅ default menu cleared\n' : `   ⚠️ default menu: ${cleared.description}\n`);
+  return true;
+}
+
 async function main() {
   const mode = process.argv.includes('--delete') ? 'delete'
     : process.argv.includes('--status') ? 'status' : 'set';
@@ -241,6 +309,8 @@ async function main() {
       if ((check.result || {}).url !== url) failures.push(payBotEnv);
     }
   }
+
+  if (!(await affiliateBot(mode, base, secret))) failures.push('TELEGRAM_AFFILIATE_BOT');
 
   if (failures.length) {
     console.error(

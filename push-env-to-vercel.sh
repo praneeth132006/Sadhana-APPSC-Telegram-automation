@@ -34,12 +34,15 @@ const need = new Set([
   // single-group API. Without this they report the whole system as
   // unconfigured — a red 'Sheets offline' pill on a deployment where every
   // group is in fact fine.
-  'LEGACY_GROUP_ID'
+  'LEGACY_GROUP_ID',
+  // The influencer programme: its bot, its sheet, and where its alerts go.
+  'TELEGRAM_AFFILIATE_BOT','AFFILIATE_SHEET_ID','AFFILIATE_ADMIN_CHAT_ID','AFFILIATE_ADMIN_THREAD_ID'
 ]);
 g.listGroups().forEach((x) => {
   need.add('SHEET_URL_' + x.envPrefix);
   need.add('SHEET_TOKEN_' + x.envPrefix);
   need.add('TELEGRAM_GROUP_' + x.envPrefix);
+  need.add('SHEET_ID_' + x.envPrefix);
   need.add(x.paymentBotEnv);
   if (x.razorpayPlanId) need.add('RAZORPAY_PLAN_' + x.envPrefix);
 });
