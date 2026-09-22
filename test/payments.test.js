@@ -73,13 +73,17 @@ test('a 30-day pass expires 30 days out', () => {
 /** The two groups that sell a lifetime pass; every other group sells the exam pass. */
 const LIFETIME_GROUPS = ['appsc_news_en', 'appsc_news_te'];
 
-test('the newspaper groups sell a lifetime pass and every other group the exam pass', () => {
+test('the newspaper groups sell a lifetime pass, EPFO its own pass, and every other group the exam pass', () => {
   assert.equal(plans.getPlan('test_5min'), null);
 
   for (const group of groups.listGroups()) {
     const sold = groups.plansFor(group.id).map((p) => p.id);
     const onSale = pricing.passPlanIdFor(group.id);
-    if (LIFETIME_GROUPS.includes(group.id)) {
+    if (group.id === 'epfo') {
+      // EPFO is new: it never sold anything else, so it lists only its pass.
+      assert.equal(onSale, 'epfo_pass');
+      assert.deepEqual(sold, ['epfo_pass']);
+    } else if (LIFETIME_GROUPS.includes(group.id)) {
       assert.equal(onSale, 'lifetime_pass', `${group.id} should be selling the lifetime pass`);
       // exam_pass is still listed, not on sale: people who bought it before
       // the change must keep resolving to a real plan.
@@ -95,7 +99,8 @@ test('retired passes are off sale but still found for the members who hold one',
   // A monthly auto-pay renewal arrives as a webhook naming autopay_monthly.
   // grantAccess looks the plan up by id; if it vanished with the plan coming
   // off sale, every renewal would fail and Razorpay would retry forever.
-  for (const group of groups.listGroups()) {
+  // EPFO started after both were retired, so nobody can hold one there.
+  for (const group of groups.listGroups().filter((g) => g.id !== 'epfo')) {
     for (const planId of ['sprint_30', 'autopay_monthly']) {
       const plan = groups.getPlanFor(group.id, planId);
       assert.ok(plan, `${group.id}/${planId} can no longer be looked up`);
@@ -106,10 +111,13 @@ test('retired passes are off sale but still found for the members who hold one',
   }
 });
 
-test('every group\'s pass is Rs 199', () => {
+test('every group\'s pass is Rs 199, and no retired plan is left at a test price', () => {
   for (const group of groups.listGroups()) {
     const pass = pricing.currentPass(group.id, {});
     assert.equal(pass.amountPaise, 19900, `${group.id} is not at Rs 199`);
+    for (const plan of groups.plansFor(group.id, { includeRetired: true })) {
+      assert.ok(plan.amountPaise >= 19900, `${group.id}/${plan.id} is still at a test price of ${plan.amountPaise} paise`);
+    }
   }
 });
 test('a timestamp survives a round trip whatever timezone the server is in', () => {
@@ -636,7 +644,7 @@ test('the checkout describes the group being bought, not one hardcoded name', as
   try {
     for (const group of groups.listGroups()) {
       await razorpay.createPaymentLink({
-        plan: groups.getPlanFor(group.id, 'sprint_30'), telegramId: '4242'
+        plan: groups.getPlanFor(group.id, pricing.passPlanIdFor(group.id)), telegramId: '4242'
       });
       assert.ok(
         seen[group.id].includes(group.displayName),
@@ -823,7 +831,10 @@ test('a student pays and ends up with access, start to finish', async () => {
 
     // The signature check is the whole security model, so it runs for real.
     assert.equal(razorpay.verifyWebhookSignature(body, signature), true);
-    assert.equal(razorpay.verifyWebhookSignature(body, signature.replace(/.$/, '0')), false,
+    // Flip the last character to a DIFFERENT one: replacing it with a fixed
+    // '0' tampered with nothing whenever the real signature already ended in 0.
+    const tampered = signature.slice(0, -1) + (signature.endsWith('0') ? '1' : '0');
+    assert.equal(razorpay.verifyWebhookSignature(body, tampered), false,
       'a tampered signature was accepted');
 
     const before = Date.now();

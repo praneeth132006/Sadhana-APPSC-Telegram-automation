@@ -5,12 +5,12 @@
 //
 // Built from google_apps_script.js by `node build-apps-scripts.js`.
 // Edit that file and re-run the builder; editing this copy means the fix
-// lives in one of 5 sheets and is lost the next time it is rebuilt.
+// lives in one of 6 sheets and is lost the next time it is rebuilt.
 //
 // Group id : appsc_news_te
 // Subjects : 16
 //            History, AP History, Geography, AP Geography, Economy, AP Economy, Polity, Society, Current Affairs, Science and Technology, Biology, Chemistry, Physics, Environment, General Studies, Disaster Management
-// Built    : 2026-09-21T09:24:16.140Z
+// Built    : 2026-09-22T06:57:19.759Z
 // ==========================================================================
 
 // ============================================================================
@@ -279,6 +279,10 @@ var PAYMENT_HEADERS = [
  * So each sheet declares its own list in a SUBJECTS_JSON script property —
  * File > Project Settings > Script Properties — as a JSON array of names:
  *   ["Ancient India", "Medieval India", ...]
+ * or, to fix a subject's Question ID prefix, of objects:
+ *   [{"subject": "Indian Culture", "code": "CUL"}, ...]
+ * The prefix is otherwise the first three letters, which gives Indian Culture
+ * and Industrial Relations the same one.
  * Thread ids and cron schedules are generated from position, then overwritten
  * by whatever is already in Config, so real Telegram topic ids survive a
  * re-run.
@@ -315,8 +319,10 @@ function subjectConfigList() {
     throw new Error('SUBJECTS_JSON must be a non-empty JSON array of subject names.');
   }
 
-  SUBJECT_CONFIG_CACHE = names.map(function (name, i) {
-    var clean = String(name).trim();
+  SUBJECT_CONFIG_CACHE = names.map(function (entry, i) {
+    var isObject = entry && typeof entry === 'object';
+    var clean = String(isObject ? entry.subject : entry).trim();
+    var fixed = isObject ? String(entry.code || '').trim().toUpperCase() : '';
     return {
       subject: clean,
       // Topic ids here are placeholders. `node setup.js` creates the real
@@ -325,7 +331,7 @@ function subjectConfigList() {
       threadId: 6 + i,
       cron: '0 */3 * * *',
       count: 5,
-      code: clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB'
+      code: /^[A-Z]{1,6}$/.test(fixed) ? fixed : (clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB')
     };
   });
   return SUBJECT_CONFIG_CACHE;

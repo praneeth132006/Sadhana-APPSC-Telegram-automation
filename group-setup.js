@@ -52,15 +52,21 @@ function detail(groupId) {
   console.log('\n1. Create a Google Sheet for this group, then Extensions > Apps Script.');
   console.log('   Paste the CURRENT google_apps_script.js. The same file goes into every');
   console.log('   sheet — what differs is the script property in step 2.');
+  console.log(`   (Or paste apps-script/${g.id}.gs.js, which has the list below built in`);
+  console.log('   and needs no SUBJECTS_JSON. Either way gives the same result.)');
 
   console.log('\n2. Apps Script > Project Settings > Script Properties, add:');
   console.log('\n   SUBJECTS_JSON =');
-  console.log('   ' + JSON.stringify(g.subjects));
+  // With fixed Question ID prefixes the entries carry them, so a sheet set up
+  // this way numbers questions exactly as the generated script would.
+  console.log('   ' + JSON.stringify(g.subjectCodes
+    ? g.subjects.map((subject) => ({ subject, code: groups.subjectCode(g, subject) }))
+    : g.subjects));
   console.log('\n   API_TOKEN =');
   console.log('   ' + require('crypto').randomBytes(32).toString('hex'));
   console.log('   (a fresh one, printed for you — do not reuse another group\'s)');
 
-  console.log('\n3. Run setupSpreadsheet, then setupSubscriptionSheets.');
+  console.log('\n3. Run setupSpreadsheet, then setupSubscriptionSheets, then setupSupportSheets.');
   console.log('   Deploy > New deployment > Web app, Execute as Me, Access Anyone.');
 
   console.log('\n4. Create the Telegram group and add BOTH bots as admins:');

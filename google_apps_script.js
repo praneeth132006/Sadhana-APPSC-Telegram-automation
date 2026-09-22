@@ -264,6 +264,10 @@ var PAYMENT_HEADERS = [
  * So each sheet declares its own list in a SUBJECTS_JSON script property —
  * File > Project Settings > Script Properties — as a JSON array of names:
  *   ["Ancient India", "Medieval India", ...]
+ * or, to fix a subject's Question ID prefix, of objects:
+ *   [{"subject": "Indian Culture", "code": "CUL"}, ...]
+ * The prefix is otherwise the first three letters, which gives Indian Culture
+ * and Industrial Relations the same one.
  * Thread ids and cron schedules are generated from position, then overwritten
  * by whatever is already in Config, so real Telegram topic ids survive a
  * re-run.
@@ -300,8 +304,10 @@ function subjectConfigList() {
     throw new Error('SUBJECTS_JSON must be a non-empty JSON array of subject names.');
   }
 
-  SUBJECT_CONFIG_CACHE = names.map(function (name, i) {
-    var clean = String(name).trim();
+  SUBJECT_CONFIG_CACHE = names.map(function (entry, i) {
+    var isObject = entry && typeof entry === 'object';
+    var clean = String(isObject ? entry.subject : entry).trim();
+    var fixed = isObject ? String(entry.code || '').trim().toUpperCase() : '';
     return {
       subject: clean,
       // Topic ids here are placeholders. `node setup.js` creates the real
@@ -310,7 +316,7 @@ function subjectConfigList() {
       threadId: 6 + i,
       cron: '0 */3 * * *',
       count: 5,
-      code: clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB'
+      code: /^[A-Z]{1,6}$/.test(fixed) ? fixed : (clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB')
     };
   });
   return SUBJECT_CONFIG_CACHE;

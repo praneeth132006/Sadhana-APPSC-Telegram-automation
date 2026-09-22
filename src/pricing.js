@@ -67,7 +67,8 @@ function currentPass(groupId, settings = {}) {
   let validUntil = '';
   if (!lifetime) {
     const configured = String(settings.pass_valid_until || '').trim();
-    const fromEnv = String(process.env[base.fixedEndDateEnv || 'EXAM_PASS_END_DATE'] || '').trim();
+    const fromEnv = String(process.env[base.fixedEndDateEnv || 'EXAM_PASS_END_DATE'] || '').trim() ||
+      String(base.fixedEndDate || '').trim();
     validUntil = endOfDayIst(configured) ? configured : (endOfDayIst(fromEnv) ? fromEnv : '');
   }
 

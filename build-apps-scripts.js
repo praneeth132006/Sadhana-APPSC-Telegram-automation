@@ -27,7 +27,7 @@ const OUT_DIR = path.resolve(__dirname, 'apps-script');
 /** Builds the subject config rows for one group, as Apps Script source. */
 function subjectBlock(group) {
   const rows = group.subjects.map((name, i) => {
-    const code = String(name).replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB';
+    const code = groups.subjectCode(group, name);
     // Thread ids start at 6 to match the original sheet. They are placeholders
     // until `node setup.js` creates the real Telegram topics and writes the
     // ids into Config, which setupSpreadsheet then preserves.

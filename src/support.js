@@ -273,7 +273,7 @@ const SETTINGS = [
   {
     key: 'pass_valid_until', section: 'pass', label: 'Valid until', type: 'date', maxLength: 10, default: '',
     optional: true,
-    hint: 'dd-mm-yyyy. Access ends at the end of this day. Blank uses EXAM_PASS_END_DATE.'
+    hint: 'dd-mm-yyyy. Access ends at the end of this day. Blank uses the pass\'s default exam date.'
   },
   {
     key: 'pass_description', section: 'pass', label: 'Description', type: 'textarea', maxLength: 300,

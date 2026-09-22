@@ -93,8 +93,8 @@ function formatAmount(amountPaise) {
  *
  * @returns {Date|null} End of the exam day, or null when unset or unparseable
  */
-function parseExamDate() {
-  const raw = String(process.env.EXAM_PASS_END_DATE || '').trim();
+function parseExamDate(envName = 'EXAM_PASS_END_DATE', fallback = '') {
+  const raw = String(process.env[envName] || '').trim() || String(fallback || '').trim();
   const match = raw.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   if (!match) return null;
 
@@ -129,7 +129,9 @@ function computeExpiry(plan, from = new Date(), currentExpiry = null) {
   if (isLifetimePlan(plan)) return new Date(LIFETIME_EXPIRY.getTime());
 
   if (plan.fixedEndDateEnv) {
-    const examDate = parseExamDate();
+    // Each dated pass reads its own date: the EPFO pass must not end on the
+    // APPSC exam's day just because both are "until the exam".
+    const examDate = parseExamDate(plan.fixedEndDateEnv, plan.fixedEndDate);
     if (examDate) return examDate;
     // Falling back to a year keeps a mis-set env var from granting nothing at
     // all — the student paid, so they get access either way.

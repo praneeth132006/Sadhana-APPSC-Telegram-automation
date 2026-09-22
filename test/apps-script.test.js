@@ -207,6 +207,27 @@ function freshScript(sheets = []) {
 // Pure helpers
 // ===========================================================================
 
+test('SUBJECTS_JSON can fix a subject\'s Question ID prefix, and plain names still work', () => {
+  // EPFO has Indian Culture and Industrial Relations: first-three-letters gives
+  // both IND, so their prefixes are set explicitly.
+  try {
+    scriptProperties.SUBJECTS_JSON = JSON.stringify([
+      { subject: 'Indian Culture', code: 'CUL' }, { subject: 'Industrial Relations', code: 'irl' }, 'Economy'
+    ]);
+    const script = freshScript();
+    assert.equal(script.subjectCode('Indian Culture'), 'CUL');
+    assert.equal(script.subjectCode('Industrial Relations'), 'IRL');
+    assert.equal(script.subjectCode('Economy'), 'ECO');
+    assert.deepEqual(Array.from(script.subjectConfigList(), (c) => c.subject),
+      ['Indian Culture', 'Industrial Relations', 'Economy']);
+
+    scriptProperties.SUBJECTS_JSON = JSON.stringify(['Indian Geography', 'Polity']);
+    assert.equal(freshScript().subjectCode('Indian Geography'), 'IND', 'plain names changed prefix');
+  } finally {
+    delete scriptProperties.SUBJECTS_JSON;
+  }
+});
+
 test('cronRunsPerDay understands the cron forms used in the Config tab', () => {
   const s = freshScript();
   assert.equal(s.cronRunsPerDay('0 9,18 * * *'), 2, 'two fixed hours');
