@@ -18,7 +18,7 @@ const assert = require('node:assert/strict');
 
 process.env.RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'rzp_test_key';
 process.env.RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'rzp_test_secret';
-for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_TE', 'UPSC']) {
+for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_TE', 'UPSC', 'EPFO']) {
   process.env[`SHEET_URL_${prefix}`] = `https://script.google.com/macros/s/test-${prefix}/exec`;
   process.env[`SHEET_TOKEN_${prefix}`] = 'token-for-tests';
   process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + String(Math.abs(prefix.length * 1234567)).padStart(10, '9');
@@ -26,6 +26,7 @@ for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_T
 process.env.TELEGRAM_PAYBOT_NEWS = '111:TEST';
 process.env.TELEGRAM_PAYBOT_SADHANA = '222:TEST';
 process.env.TELEGRAM_PAYBOT_UPSC = '333:TEST';
+process.env.TELEGRAM_PAYBOT_EPFO = '444:TEST';
 
 require('node-telegram-bot-api').prototype._request = async function (method) {
   throw new Error(`Telegram API call "${method}" attempted in a test — stub it`);
@@ -50,7 +51,7 @@ delete process.env.SUPPORT_CHAT_ID;
 delete process.env.SUPPORT_THREAD_ID;
 
 const REVIEWER = { id: 5550001, is_bot: false, first_name: 'Reviewer', language_code: 'en' };
-const BOTS = ['TELEGRAM_PAYBOT_NEWS', 'TELEGRAM_PAYBOT_SADHANA', 'TELEGRAM_PAYBOT_UPSC'];
+const BOTS = ['TELEGRAM_PAYBOT_NEWS', 'TELEGRAM_PAYBOT_SADHANA', 'TELEGRAM_PAYBOT_UPSC', 'TELEGRAM_PAYBOT_EPFO'];
 
 /** A sheet for someone who has never been here: no pass, no code, no tickets. */
 function freshSheet(overrides = {}) {
@@ -233,6 +234,8 @@ test('/terms and /settings reply in plain words with a way to get help', async (
   const terms = replies(await say('/terms'))[0];
   assert.match(terms.args[1], /Terms/);
   assert.match(terms.args[1], /Razorpay/);
+  assert.match(terms.args[1], /no refunds/i, 'there are no refunds, and the terms must say so');
+  assert.doesNotMatch(terms.args[1], /refund request/i);
   assert.match(terms.args[1], /valid for life/, 'the newspaper pass is lifetime');
   const settings = replies(await say('/settings'))[0];
   assert.match(settings.args[1], /Settings/);

@@ -207,6 +207,27 @@ function freshScript(sheets = []) {
 // Pure helpers
 // ===========================================================================
 
+test('SUBJECTS_JSON can fix a subject\'s Question ID prefix, and plain names still work', () => {
+  // EPFO has Indian Culture and Industrial Relations: first-three-letters gives
+  // both IND, so their prefixes are set explicitly.
+  try {
+    scriptProperties.SUBJECTS_JSON = JSON.stringify([
+      { subject: 'Indian Culture', code: 'CUL' }, { subject: 'Industrial Relations', code: 'irl' }, 'Economy'
+    ]);
+    const script = freshScript();
+    assert.equal(script.subjectCode('Indian Culture'), 'CUL');
+    assert.equal(script.subjectCode('Industrial Relations'), 'IRL');
+    assert.equal(script.subjectCode('Economy'), 'ECO');
+    assert.deepEqual(Array.from(script.subjectConfigList(), (c) => c.subject),
+      ['Indian Culture', 'Industrial Relations', 'Economy']);
+
+    scriptProperties.SUBJECTS_JSON = JSON.stringify(['Indian Geography', 'Polity']);
+    assert.equal(freshScript().subjectCode('Indian Geography'), 'IND', 'plain names changed prefix');
+  } finally {
+    delete scriptProperties.SUBJECTS_JSON;
+  }
+});
+
 test('cronRunsPerDay understands the cron forms used in the Config tab', () => {
   const s = freshScript();
   assert.equal(s.cronRunsPerDay('0 9,18 * * *'), 2, 'two fixed hours');
@@ -729,6 +750,60 @@ test('the row-number fallback refuses to act on the wrong row', () => {
 
   // A bare row number with no text to verify against is also refused.
   assert.equal(script.locateRow(sheet, map, '', 2, ''), -1, 'an unverified row number was accepted');
+});
+
+test('setupSpreadsheet alone builds a complete sheet, not just the subject tabs', () => {
+  // The EPFO sheet was set up with setupSpreadsheet and had no Subscribers,
+  // Payments, Support or Coupons tab: those needed two more functions that
+  // nothing said to run.
+  const ss = new FakeSpreadsheet([]);
+  const script = loadScript(ss);
+  script.setupSpreadsheet();
+
+  const names = ss.getSheets().map((sheet) => sheet.getName());
+  for (const tab of ['Config', 'Subscribers', 'Payments', 'Support', 'Support Log', 'Bot Settings',
+    'Coupons', 'Coupon Redemptions']) {
+    assert.ok(names.includes(tab), `${tab} was not created`);
+    assert.ok(ss.getSheetByName(tab).getLastRow() >= 1, `${tab} has no header row`);
+  }
+  assert.equal(ss.getSheetByName('Subscribers').values[0][0], 'Telegram ID');
+});
+
+test('re-running setupSpreadsheet leaves members, payments and tickets alone', () => {
+  const ss = new FakeSpreadsheet([]);
+  const script = loadScript(ss);
+  script.setupSpreadsheet();
+  const members = ss.getSheetByName('Subscribers');
+  members.appendRow(['4242', 'asha']);
+  const tabsBefore = ss.getSheets().length;
+
+  script.setupSpreadsheet();
+  assert.equal(ss.getSheets().length, tabsBefore, 'a second run added duplicate tabs');
+  assert.deepEqual(ss.getSheetByName('Subscribers').values[1].slice(0, 2), ['4242', 'asha']);
+});
+
+test('a new sheet starts with no thread ids, so setup-topics creates every topic', () => {
+  // Placeholder ids (6, 7, 8…) looked real: setup-topics skipped each subject
+  // as "already existed" and no topic was ever made for the EPFO group.
+  try {
+    scriptProperties.SUBJECTS_JSON = JSON.stringify([{ subject: 'Indian Culture', code: 'CUL' }, 'Polity']);
+    const ss = new FakeSpreadsheet([]);
+    loadScript(ss).setupSpreadsheet();
+    const rows = ss.getSheetByName('Config').values.slice(1);
+    assert.deepEqual(rows.map((r) => r[0]), ['Indian Culture', 'Polity']);
+    rows.forEach((r) => assert.equal(r[2], '', `${r[0]} was given a made-up thread id ${r[2]}`));
+  } finally {
+    delete scriptProperties.SUBJECTS_JSON;
+  }
+});
+
+test('the generated per-sheet scripts carry no made-up thread ids', () => {
+  for (const file of fs.readdirSync(path.join(__dirname, '..', 'apps-script'))) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'apps-script', file), 'utf8');
+    const start = src.indexOf('var SUBJECT_CONFIG_LIST_DEFAULT = [');
+    const block = src.slice(start, src.indexOf('];', start));
+    assert.doesNotMatch(block, /threadId: \d/, `${file} still has placeholder thread ids`);
+  }
 });
 
 test('setupSpreadsheet keeps existing Telegram thread ids', () => {

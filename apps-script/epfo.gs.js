@@ -1,5 +1,5 @@
 // ==========================================================================
-// Sadhana APPSC (Telugu)
+// EPFO (English)
 // ==========================================================================
 // GENERATED FILE — DO NOT EDIT HERE.
 //
@@ -7,10 +7,10 @@
 // Edit that file and re-run the builder; editing this copy means the fix
 // lives in one of 6 sheets and is lost the next time it is rebuilt.
 //
-// Group id : appsc_q_te
-// Subjects : 16
-//            Ancient India, Medieval India, Modern India, AP History, Physical Geography, Indian Geography, AP Geography, Indian Economy, AP Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Indian Society, Disaster Management
-// Built    : 2026-09-22T07:20:39.052Z
+// Group id : epfo
+// Subjects : 13
+//            Indian Culture, Freedom Movement, Economy, Polity, General Science, Computer Applications, Industrial Relations, Labour Codes and Acts, Social Security, Accountancy, Auditing, Insurance, Current Affairs
+// Built    : 2026-09-22T07:20:39.053Z
 // ==========================================================================
 
 // ============================================================================
@@ -340,22 +340,19 @@ function subjectConfigList() {
 
 /** Fallback subject list, used when no SUBJECTS_JSON property is set. */
 var SUBJECT_CONFIG_LIST_DEFAULT = [
-  { subject: "Ancient India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ANC' },
-  { subject: "Medieval India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MED' },
-  { subject: "Modern India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MOD' },
-  { subject: "AP History", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APH' },
-  { subject: "Physical Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'PHY' },
-  { subject: "Indian Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "AP Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APG' },
-  { subject: "Indian Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "AP Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APE' },
-  { subject: "Environment", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ENV' },
+  { subject: "Indian Culture", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CUL' },
+  { subject: "Freedom Movement", threadId: '', cron: '0 */3 * * *', count: 5, code: 'FRM' },
+  { subject: "Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ECO' },
   { subject: "Polity", threadId: '', cron: '0 */3 * * *', count: 5, code: 'POL' },
-  { subject: "International Relations", threadId: '', cron: '0 */3 * * *', count: 5, code: 'INT' },
-  { subject: "Science and Technology", threadId: '', cron: '0 */3 * * *', count: 5, code: 'SCI' },
-  { subject: "Current Affairs", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CUR' },
-  { subject: "Indian Society", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "Disaster Management", threadId: '', cron: '0 */3 * * *', count: 5, code: 'DIS' }
+  { subject: "General Science", threadId: '', cron: '0 */3 * * *', count: 5, code: 'GSC' },
+  { subject: "Computer Applications", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CAP' },
+  { subject: "Industrial Relations", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IRL' },
+  { subject: "Labour Codes and Acts", threadId: '', cron: '0 */3 * * *', count: 5, code: 'LAB' },
+  { subject: "Social Security", threadId: '', cron: '0 */3 * * *', count: 5, code: 'SSC' },
+  { subject: "Accountancy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ACC' },
+  { subject: "Auditing", threadId: '', cron: '0 */3 * * *', count: 5, code: 'AUD' },
+  { subject: "Insurance", threadId: '', cron: '0 */3 * * *', count: 5, code: 'INS' },
+  { subject: "Current Affairs", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CUR' }
 ];
 
 // ============================================================================

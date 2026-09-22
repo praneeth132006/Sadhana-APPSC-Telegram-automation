@@ -26,6 +26,7 @@
 // ============================================================================
 
 const crypto = require('crypto');
+const groups = require('./groups');
 
 const SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const API = 'https://sheets.googleapis.com/v4/spreadsheets';
@@ -1577,14 +1578,14 @@ function legacyHashQuestion(text) {
 }
 
 /** The three-letter code in a Question ID. Mirrors subjectCode's fallback. */
-function subjectCode(subject, rows, map) {
+function subjectCode(ctx, subject, rows, map) {
   // The Apps Script can take codes from a SUBJECTS_JSON property this side
   // cannot read, so the tab's own ids win: new ones then match the old.
   for (let i = rows.length - 1; i >= 0; i--) {
     const m = cell(rows[i], map, 'Question ID').match(/^([A-Z]{1,6})-\d{8}-\d+$/);
     if (m) return m[1];
   }
-  return String(subject || 'GEN').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 3) || 'GEN';
+  return groups.subjectCode(groups.getGroup(ctx.groupId), subject);
 }
 
 /** yyyyMMdd in IST. */
@@ -1664,7 +1665,7 @@ async function addQuestions(ctx, subject, questions, addedBy, skipDuplicates = t
   let nextSNo = (lastSNo || rows.length) + 1;
   const now = istNow();
   const uploader = String(addedBy || 'Dashboard User').trim();
-  const code = subjectCode(subject, rows, map);
+  const code = subjectCode(ctx, subject, rows, map);
   const stamp = istStamp();
   const width = Math.max(QUESTION_HEADERS.length, ...Object.values(map).map((i) => i + 1));
 

@@ -1086,12 +1086,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     '<b>Terms</b>\n\n' +
     (validity ? validity + '\n\n' : '') +
     '1. The price and how long the pass lasts are shown before you pay. You pay once; nothing renews on its own.\n' +
-    '2. Payment is taken on Razorpay\'s secure page. This bot never sees your card or UPI details.\n' +
-    '3. After payment the bot sends a private invite link for the group you chose. It works only for your ' +
+    '2. <b>All payments are final. There are no refunds</b>, including for a pass you stop using.\n' +
+    '3. Payment is taken on Razorpay\'s secure page. This bot never sees your card or UPI details.\n' +
+    '4. After payment the bot sends a private invite link for the group you chose. It works only for your ' +
     'Telegram account and cannot be shared.\n' +
-    '4. When a dated pass ends you are removed from the group, with a reminder beforehand.\n' +
-    '5. For a payment that did not go through, a double charge or a refund request, send /support with your ' +
-    'Razorpay payment id (it starts with pay_).' +
+    '5. When a dated pass ends you are removed from the group, with a reminder beforehand.\n' +
+    '6. If you paid and did not get your invite link, send /support with your Razorpay payment id ' +
+    '(it starts with pay_) and we will get you in.' +
     (support.emailFallbackLine(settings) ? '\n\n' + support.emailFallbackLine(settings) : ''),
     { parse_mode: 'HTML', reply_markup: SUPPORT_BUTTON });
   });

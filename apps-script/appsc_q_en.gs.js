@@ -5,12 +5,12 @@
 //
 // Built from google_apps_script.js by `node build-apps-scripts.js`.
 // Edit that file and re-run the builder; editing this copy means the fix
-// lives in one of 5 sheets and is lost the next time it is rebuilt.
+// lives in one of 6 sheets and is lost the next time it is rebuilt.
 //
 // Group id : appsc_q_en
 // Subjects : 16
 //            Ancient India, Medieval India, Modern India, AP History, Physical Geography, Indian Geography, AP Geography, Indian Economy, AP Economy, Environment, Polity, International Relations, Science and Technology, Current Affairs, Indian Society, Disaster Management
-// Built    : 2026-09-21T09:24:16.141Z
+// Built    : 2026-09-22T07:20:39.052Z
 // ==========================================================================
 
 // ============================================================================
@@ -279,6 +279,10 @@ var PAYMENT_HEADERS = [
  * So each sheet declares its own list in a SUBJECTS_JSON script property —
  * File > Project Settings > Script Properties — as a JSON array of names:
  *   ["Ancient India", "Medieval India", ...]
+ * or, to fix a subject's Question ID prefix, of objects:
+ *   [{"subject": "Indian Culture", "code": "CUL"}, ...]
+ * The prefix is otherwise the first three letters, which gives Indian Culture
+ * and Industrial Relations the same one.
  * Thread ids and cron schedules are generated from position, then overwritten
  * by whatever is already in Config, so real Telegram topic ids survive a
  * re-run.
@@ -315,17 +319,20 @@ function subjectConfigList() {
     throw new Error('SUBJECTS_JSON must be a non-empty JSON array of subject names.');
   }
 
-  SUBJECT_CONFIG_CACHE = names.map(function (name, i) {
-    var clean = String(name).trim();
+  SUBJECT_CONFIG_CACHE = names.map(function (entry) {
+    var isObject = entry && typeof entry === 'object';
+    var clean = String(isObject ? entry.subject : entry).trim();
+    var fixed = isObject ? String(entry.code || '').trim().toUpperCase() : '';
     return {
       subject: clean,
-      // Topic ids here are placeholders. `node setup.js` creates the real
-      // forum topics and writes their ids into Config, and setupSpreadsheet
-      // preserves those, so these are only ever a starting point.
-      threadId: 6 + i,
+      // Blank until `node setup-topics.js` creates the real forum topic and
+      // writes its id into Config (which setupSpreadsheet then preserves). A
+      // made-up number here looked like a real id, so setup-topics skipped
+      // the subject and nothing ever created its topic.
+      threadId: '',
       cron: '0 */3 * * *',
       count: 5,
-      code: clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB'
+      code: /^[A-Z]{1,6}$/.test(fixed) ? fixed : (clean.replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB')
     };
   });
   return SUBJECT_CONFIG_CACHE;
@@ -333,22 +340,22 @@ function subjectConfigList() {
 
 /** Fallback subject list, used when no SUBJECTS_JSON property is set. */
 var SUBJECT_CONFIG_LIST_DEFAULT = [
-  { subject: "Ancient India", threadId: 6, cron: '0 */3 * * *', count: 5, code: 'ANC' },
-  { subject: "Medieval India", threadId: 7, cron: '0 */3 * * *', count: 5, code: 'MED' },
-  { subject: "Modern India", threadId: 8, cron: '0 */3 * * *', count: 5, code: 'MOD' },
-  { subject: "AP History", threadId: 9, cron: '0 */3 * * *', count: 5, code: 'APH' },
-  { subject: "Physical Geography", threadId: 10, cron: '0 */3 * * *', count: 5, code: 'PHY' },
-  { subject: "Indian Geography", threadId: 11, cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "AP Geography", threadId: 12, cron: '0 */3 * * *', count: 5, code: 'APG' },
-  { subject: "Indian Economy", threadId: 13, cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "AP Economy", threadId: 14, cron: '0 */3 * * *', count: 5, code: 'APE' },
-  { subject: "Environment", threadId: 15, cron: '0 */3 * * *', count: 5, code: 'ENV' },
-  { subject: "Polity", threadId: 16, cron: '0 */3 * * *', count: 5, code: 'POL' },
-  { subject: "International Relations", threadId: 17, cron: '0 */3 * * *', count: 5, code: 'INT' },
-  { subject: "Science and Technology", threadId: 18, cron: '0 */3 * * *', count: 5, code: 'SCI' },
-  { subject: "Current Affairs", threadId: 19, cron: '0 */3 * * *', count: 5, code: 'CUR' },
-  { subject: "Indian Society", threadId: 20, cron: '0 */3 * * *', count: 5, code: 'IND' },
-  { subject: "Disaster Management", threadId: 21, cron: '0 */3 * * *', count: 5, code: 'DIS' }
+  { subject: "Ancient India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ANC' },
+  { subject: "Medieval India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MED' },
+  { subject: "Modern India", threadId: '', cron: '0 */3 * * *', count: 5, code: 'MOD' },
+  { subject: "AP History", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APH' },
+  { subject: "Physical Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'PHY' },
+  { subject: "Indian Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
+  { subject: "AP Geography", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APG' },
+  { subject: "Indian Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
+  { subject: "AP Economy", threadId: '', cron: '0 */3 * * *', count: 5, code: 'APE' },
+  { subject: "Environment", threadId: '', cron: '0 */3 * * *', count: 5, code: 'ENV' },
+  { subject: "Polity", threadId: '', cron: '0 */3 * * *', count: 5, code: 'POL' },
+  { subject: "International Relations", threadId: '', cron: '0 */3 * * *', count: 5, code: 'INT' },
+  { subject: "Science and Technology", threadId: '', cron: '0 */3 * * *', count: 5, code: 'SCI' },
+  { subject: "Current Affairs", threadId: '', cron: '0 */3 * * *', count: 5, code: 'CUR' },
+  { subject: "Indian Society", threadId: '', cron: '0 */3 * * *', count: 5, code: 'IND' },
+  { subject: "Disaster Management", threadId: '', cron: '0 */3 * * *', count: 5, code: 'DIS' }
 ];
 
 // ============================================================================
@@ -4127,8 +4134,21 @@ function setupSpreadsheet() {
     }
   }
 
+  // Members, payments, support and coupons too. They used to be separate
+  // functions that also had to be remembered, and a sheet set up with only
+  // this one looked finished while it had no Subscribers or Payments tab at
+  // all. Each is created only if missing, so re-running this is still safe.
+  subscriberSheet();
+  paymentSheet();
+  supportSheet();
+  supportLogSheet();
+  botSettingsSheet();
+  couponSheet();
+  redemptionSheet();
+
   book().toast(
-    'Setup complete — ' + subjectConfigList().length + ' subject tabs on the 30-column schema.',
+    'Setup complete — ' + subjectConfigList().length + ' subject tabs on the 30-column schema, ' +
+    'plus Subscribers, Payments, Support, Bot Settings and Coupons.',
     'Sadhana APPSC', 10
   );
 }

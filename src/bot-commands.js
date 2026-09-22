@@ -68,6 +68,12 @@ const PROFILES = {
       'in poll format across History, Geography, Polity, Economy, Environment, ' +
       'Science & Tech and Current Affairs. In English.',
     short: 'Daily UPSC Prelims practice questions in poll format — History, Polity, Economy and more.'
+  },
+  TELEGRAM_PAYBOT_EPFO: {
+    about: 'Join our EPFO (APFC, EO/AO) exam prep group via this bot. Get daily practice questions in poll ' +
+      'format on Industrial Relations, Labour Codes, Social Security, Accountancy, Auditing, ' +
+      'Insurance, Polity, Economy, General Science, Computer Applications and Current Affairs. In English.',
+    short: 'Daily EPFO APFC & EO/AO practice questions in poll format — Labour Codes, Social Security and more.'
   }
 };
 

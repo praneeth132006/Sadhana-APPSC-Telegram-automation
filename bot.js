@@ -42,7 +42,7 @@ if (!families.length) {
   console.error(
     '❌ No payment bot to run.\n' +
     '   Every group in groups.config.json names a paymentBotEnv; set that token in .env.\n' +
-    '   Expected one of: TELEGRAM_PAYBOT_NEWS, TELEGRAM_PAYBOT_SADHANA, TELEGRAM_PAYBOT_UPSC'
+    '   Expected one of: TELEGRAM_PAYBOT_NEWS, TELEGRAM_PAYBOT_SADHANA, TELEGRAM_PAYBOT_UPSC, TELEGRAM_PAYBOT_EPFO'
   );
   process.exit(1);
 }

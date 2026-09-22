@@ -238,8 +238,28 @@ function planShapes() {
   return loadConfig().planShapes || {};
 }
 
+/**
+ * subjectCode — the three-letter prefix of a subject's Question IDs.
+ *
+ * From the group's subjectCodes when it names one, otherwise the subject's
+ * first three letters. The Apps Script builder and the direct Sheets API both
+ * ask here, so a question uploaded either way gets the same prefix — and two
+ * subjects that share their first letters (Indian Culture, Industrial
+ * Relations) can be told apart.
+ *
+ * @param {Object|null} group
+ * @param {string} subject
+ * @returns {string}
+ */
+function subjectCode(group, subject) {
+  const fixed = group && group.subjectCodes && group.subjectCodes[subject];
+  if (fixed && /^[A-Z]{1,6}$/.test(fixed)) return fixed;
+  return String(subject || 'GEN').toUpperCase().replace(/[^A-Z]/g, '').substring(0, 3) || 'GEN';
+}
+
 module.exports = {
   reset,
+  subjectCode,
   planShapes,
   listGroups,
   getGroup,

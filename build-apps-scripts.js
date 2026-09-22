@@ -26,12 +26,14 @@ const OUT_DIR = path.resolve(__dirname, 'apps-script');
 
 /** Builds the subject config rows for one group, as Apps Script source. */
 function subjectBlock(group) {
-  const rows = group.subjects.map((name, i) => {
-    const code = String(name).replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 3) || 'SUB';
-    // Thread ids start at 6 to match the original sheet. They are placeholders
-    // until `node setup.js` creates the real Telegram topics and writes the
-    // ids into Config, which setupSpreadsheet then preserves.
-    return `  { subject: ${JSON.stringify(name)}, threadId: ${6 + i}, ` +
+  const rows = group.subjects.map((name) => {
+    const code = groups.subjectCode(group, name);
+    // No thread id until `node setup-topics.js <group>` creates the real topic
+    // and writes it into Config, which setupSpreadsheet then preserves. A
+    // placeholder number looked like a real id: setup-topics skipped every
+    // subject as "already existed", and the poster would have sent questions
+    // to topics that were never made. Blank, the poster refuses instead.
+    return `  { subject: ${JSON.stringify(name)}, threadId: '', ` +
            `cron: '0 */3 * * *', count: 5, code: '${code}' }`;
   });
   return rows.join(',\n');

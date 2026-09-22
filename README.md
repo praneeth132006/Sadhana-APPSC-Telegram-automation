@@ -130,6 +130,34 @@ Creates a forum topic per subject and writes the thread ids into the Config tab.
 npm run dashboard
 ```
 
+### Adding a group (EPFO is the worked example)
+
+A group is an entry in `groups.config.json` plus five values in `.env` (and on
+Vercel). Nothing else is copied: the dashboards, the bot, the webhooks and the
+nightly jobs all read the list of groups from the config. For EPFO:
+
+1. **Payment bot.** Create it with @BotFather → `TELEGRAM_PAYBOT_EPFO`.
+2. **Telegram group.** Enable Topics. Add the questions bot as an admin (Manage
+   Topics, Post Messages, Send Polls) and the EPFO payment bot as an admin (Invite
+   Users via Link, Ban Users). Its id → `TELEGRAM_GROUP_EPFO`
+   (`node group-setup.js --chat-ids` lists the groups the payment bots can see).
+3. **Sheet.** Create a Google Sheet, open Extensions → Apps Script from it, paste
+   **`apps-script/epfo.gs.js`** (not `google_apps_script.js` — the generated file
+   already carries EPFO's 13 subjects), run `setupSpreadsheet` (it creates every tab —
+   subjects, Config, Subscribers, Payments, Support, Bot Settings, Coupons), set the `API_TOKEN`
+   script property, and deploy as a Web App. The `/exec` URL → `SHEET_URL_EPFO`, the
+   token → `SHEET_TOKEN_EPFO`.
+4. **Sheets API.** Share the sheet with the service account in
+   `GOOGLE_SERVICE_ACCOUNT_JSON` as an Editor, and put its link in `SHEET_ID_EPFO`.
+   The same service account serves every group.
+5. **Topics, webhook, profile.** Once deployed with those values:
+
+   ```bash
+   node setup-topics.js epfo
+   npm run set-webhooks
+   npm run bot-profile
+   ```
+
 ---
 
 ## The 30-column schema
@@ -279,9 +307,12 @@ row the poster is holding, are each named rather than being folded into a count:
 |---|---|---|---|
 | **Newspaper · English, Newspaper · Telugu** | ♾️ Lifetime Pass | once | never |
 | Sadhana APPSC · English, Sadhana APPSC · Telugu, UPSC | 🎯 Target 2026 Pass | once | on exam day (`EXAM_PASS_END_DATE`) |
+| EPFO | 🎯 Target EPFO Pass | once | 24-12-2026, four days after the exam on 20-12-2026 (`EPFO_PASS_END_DATE` or the dashboard can move it) |
+
+Every pass is ₹199, paid once. There are no refunds.
 
 Which pass a group sells is `passPlanId` in `groups.config.json`, defaulting to
-`exam_pass`. Only the two newspaper groups set it. The pass definitions are shared by
+`exam_pass`. The two newspaper groups and EPFO set it. The pass definitions are shared by
 every group, so changing what one group sells never touches another.
 
 A lifetime member is written with an expiry of 31-12-2099 — a real date, so every
@@ -543,13 +574,10 @@ lasts.
 ## Paid group access (Razorpay)
 
 Students buy a pass from the Telegram bot and are let into a private group
-automatically. Three options:
-
-| Pass | Price | Type | Access ends |
-|---|---|---|---|
-| 🗓️ 30-Day Sprint | ₹299 | one-time | 30 days after payment |
-| 🔄 Monthly Auto-Pay | ₹249/mo | recurring | keeps renewing until cancelled |
-| 🎯 Target APPSC 2026 | ₹799 | one-time | fixed exam date (`EXAM_PASS_END_DATE`) |
+automatically. Each group sells one pass, at ₹199, paid once — see
+[What each group sells](#what-each-group-sells). The 30-Day Sprint and Monthly
+Auto-Pay passes are retired: no longer sold, but still defined so the few members
+who bought one keep resolving.
 
 Everything is stored in the same Google Sheet — a **Subscribers** tab with one row
 per member, and an append-only **Payments** log.

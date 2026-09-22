@@ -1811,6 +1811,16 @@ test('the group picker prices every group from its own config entry', async () =
   }
 });
 
+test('EPFO is in the dashboard picker with its subjects and its Rs 199 pass', async () => {
+  const res = await authed('/api/groups');
+  const epfo = res.json.data.find((g) => g.id === 'epfo');
+  assert.ok(epfo, 'EPFO is missing from the dashboard');
+  assert.equal(epfo.shortName, 'EPFO');
+  assert.equal(epfo.subjects.length, 13);
+  assert.ok(epfo.subjects.includes('Labour Codes and Acts'));
+  assert.deepEqual(epfo.plans.map((p) => [p.id, p.amountPaise]), [['epfo_pass', 19900]]);
+});
+
 // ===========================================================================
 // Health checks that were reporting on themselves rather than the system
 // ===========================================================================

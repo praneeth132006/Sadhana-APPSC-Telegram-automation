@@ -270,6 +270,17 @@ test('adding to a subject with no tab creates it', async () => {
   assert.equal(book['Art and Culture'][1][col('Question')], 'New?');
 });
 
+test('a new EPFO tab takes its prefix from the config, not the first three letters', async () => {
+  // Indian Culture and Industrial Relations both start IND. The Apps Script is
+  // built with CUL and IRL, and a question added through the API must match it.
+  const book = {};
+  fakeSheets(book);
+  const epfo = Object.assign({}, ctx, { groupId: 'epfo' });
+  const one = [{ question: 'New?', option_a: 'a', option_b: 'b', option_c: 'c', option_d: 'd' }];
+  assert.match((await DIRECT.addQuestions(epfo, 'Indian Culture', one, 'T', true)).ids[0], /^CUL-\d{8}-0001$/);
+  assert.match((await DIRECT.addQuestions(epfo, 'Industrial Relations', one, 'T', true)).ids[0], /^IRL-\d{8}-0001$/);
+});
+
 // ---------------------------------------------------------------------------
 // The curation queue
 // ---------------------------------------------------------------------------
