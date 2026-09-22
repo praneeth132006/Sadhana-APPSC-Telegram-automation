@@ -199,29 +199,57 @@ test('earnings are split into available, requested and paid', () => {
   });
 });
 
-test('a withdrawal needs something to withdraw, the minimum, the cycle, and a UPI ID', () => {
+test('a withdrawal needs something to withdraw, the minimum, the cycle, and complete payout details', () => {
   const now = new Date('2026-10-10T10:00:00Z');
   const code = upscCode({ min_payout: '50' });
-  const upi = 'ravi@okicici';
+  const upi = { legal_name: 'Ravi Kumar', phone: '9876543210', email: 'r@x.in', upi_id: 'ravi@okicici' };
 
-  assert.match(affiliates.withdrawal(code, [], [], { upi, now }).reason, /Nothing is waiting/);
-  assert.match(affiliates.withdrawal(code, [sale('earned')], [], { upi, now }).reason, /₹14\.18 to go/);
-  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [], { upi, now }).ok, true);
-  assert.match(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [], { upi: 'nope', now }).reason, /UPI ID/);
+  assert.match(affiliates.withdrawal(code, [], [], { influencer: upi, now }).reason, /Nothing is waiting/);
+  assert.match(affiliates.withdrawal(code, [sale('earned')], [], { influencer: upi, now }).reason, /₹14\.18 to go/);
+  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [], { influencer: upi, now }).ok, true);
+  const noEmail = affiliates.withdrawal(code, [sale('earned'), sale('earned')], [], { influencer: Object.assign({}, upi, { email: '' }), now });
+  assert.equal(noEmail.needsDetails, true);
+  assert.match(noEmail.reason, /payout details.*Email/);
+  const bank = { legal_name: 'R', phone: '9876543210', email: 'r@x.in', payout_method: 'bank', account_holder: 'R' };
+  assert.match(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [], { influencer: bank, now }).reason, /Account number, IFSC/);
 
   const lastWeek = { status: 'paid', requested_at: new Date(now.getTime() - 3 * DAY).toISOString() };
-  const tooSoon = affiliates.withdrawal(code, [sale('earned'), sale('earned')], [lastWeek], { upi, now });
+  const tooSoon = affiliates.withdrawal(code, [sale('earned'), sale('earned')], [lastWeek], { influencer: upi, now });
   assert.equal(tooSoon.ok, false);
   assert.equal(tooSoon.nextAt.getTime(), new Date(lastWeek.requested_at).getTime() + 7 * DAY);
 
   const monthly = upscCode({ payout_cycle: 'monthly' });
   const tenDaysAgo = { status: 'paid', requested_at: new Date(now.getTime() - 10 * DAY).toISOString() };
-  assert.equal(affiliates.withdrawal(monthly, [sale('earned')], [tenDaysAgo], { upi, now }).ok, false);
-  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [tenDaysAgo], { upi, now }).ok, true);
+  assert.equal(affiliates.withdrawal(monthly, [sale('earned')], [tenDaysAgo], { influencer: upi, now }).ok, false);
+  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [tenDaysAgo], { influencer: upi, now }).ok, true);
 
   // A rejected request does not start the clock; an open one blocks another.
   const rejected = { status: 'rejected', requested_at: new Date(now.getTime() - DAY).toISOString() };
-  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [rejected], { upi, now }).ok, true);
+  assert.equal(affiliates.withdrawal(code, [sale('earned'), sale('earned')], [rejected], { influencer: upi, now }).ok, true);
   const open = { status: 'requested', payout_id: 'WD-1', requested_at: now.toISOString() };
-  assert.match(affiliates.withdrawal(code, [sale('earned')], [open], { upi, now }).reason, /WD-1 is still with the admin/);
+  assert.match(affiliates.withdrawal(code, [sale('earned')], [open], { influencer: upi, now }).reason, /WD-1 is still with the admin/);
+});
+
+test('payout details are cleaned and checked the way RazorpayX needs them', () => {
+  const ok = (field, raw) => affiliates.checkPayoutField(field, raw);
+  assert.equal(ok('phone', '+91 98765-43210').value, '9876543210');
+  assert.equal(ok('phone', '09876543210').value, '9876543210');
+  assert.equal(ok('phone', '5876543210').ok, false, 'Indian mobiles start 6–9');
+  assert.equal(ok('email', ' Ravi@Gmail.COM ').value, 'ravi@gmail.com');
+  assert.equal(ok('email', 'ravi@gmail').ok, false);
+  assert.equal(ok('ifsc', 'hdfc0001234').value, 'HDFC0001234');
+  assert.equal(ok('ifsc', 'HDFC1001234').ok, false, 'the fifth IFSC character is always 0');
+  assert.equal(ok('account_number', '1234 5678 9012').value, '123456789012');
+  assert.equal(ok('account_number', '12345678').ok, false);
+  assert.equal(ok('pan', 'abcde1234f').value, 'ABCDE1234F');
+  assert.equal(ok('legal_name', 'Ravi  Kumar').value, 'Ravi Kumar');
+  assert.equal(ok('legal_name', '1234').ok, false);
+  assert.equal(affiliates.maskAccount('123456789012'), 'XXXXXXXX9012');
+});
+
+test('payout details say what is missing for the chosen method', () => {
+  assert.deepEqual(affiliates.payoutDetails({}).missingLabels, ['Name as on your bank account', 'Mobile number', 'Email', 'UPI ID']);
+  assert.equal(affiliates.payoutDetails({ legal_name: 'R', phone: '9', email: 'e', upi_id: 'x@y' }).complete, true);
+  assert.equal(affiliates.payoutDetails({ legal_name: 'R', phone: '9', email: 'e', upi_id: 'x@y', payout_method: 'bank' }).complete, false,
+    'choosing bank needs the bank account, even with a UPI ID on file');
 });

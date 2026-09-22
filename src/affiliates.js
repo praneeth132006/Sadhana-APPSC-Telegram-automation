@@ -329,6 +329,82 @@ function evaluatePromo(code, { payBotEnv, amountPaise, studentId, uses = 0, uses
 }
 
 // ---------------------------------------------------------------------------
+// Payout details — what RazorpayX needs to pay someone
+// ---------------------------------------------------------------------------
+// A RazorpayX payout is made to a Contact (name, phone, email) through a Fund
+// Account (a UPI ID, or a bank account with its IFSC). Collected once, in the
+// bot, checked here, and shown to the admin beside every withdrawal so the
+// payout can be made without asking the influencer anything.
+
+const PAYOUT_FIELDS = {
+  legal_name: {
+    label: 'Name as on your bank account',
+    check: (v) => /^[A-Za-z][A-Za-z .'-]{1,99}$/.test(v) || 'Use letters only, as it appears on your bank account.'
+  },
+  phone: {
+    label: 'Mobile number',
+    clean: (v) => String(v).replace(/[\s-]/g, '').replace(/^(\+91|91|0)(?=[6-9]\d{9}$)/, ''),
+    check: (v) => /^[6-9]\d{9}$/.test(v) || 'Send a 10-digit Indian mobile number, e.g. 9876543210.'
+  },
+  email: {
+    label: 'Email',
+    clean: (v) => String(v).trim().toLowerCase(),
+    check: (v) => /^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/i.test(v) || 'That does not look like an email address.'
+  },
+  upi_id: {
+    label: 'UPI ID',
+    check: (v) => UPI_PATTERN.test(v) || 'That does not look like a UPI ID. It looks like name@bank, e.g. ravi@okicici.'
+  },
+  account_holder: {
+    label: 'Account holder name',
+    check: (v) => /^[A-Za-z][A-Za-z .'-]{1,99}$/.test(v) || 'Use letters only, as it appears on the bank account.'
+  },
+  account_number: {
+    label: 'Account number',
+    clean: (v) => String(v).replace(/[\s-]/g, ''),
+    check: (v) => /^\d{9,18}$/.test(v) || 'An account number is 9 to 18 digits.'
+  },
+  ifsc: {
+    label: 'IFSC',
+    clean: (v) => String(v).trim().toUpperCase(),
+    check: (v) => /^[A-Z]{4}0[A-Z0-9]{6}$/.test(v) || 'An IFSC is 11 characters, like HDFC0001234.'
+  },
+  pan: {
+    label: 'PAN (optional)',
+    clean: (v) => String(v).trim().toUpperCase(),
+    check: (v) => /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(v) || 'A PAN looks like ABCDE1234F.'
+  }
+};
+
+/** Cleans and checks one payout detail. { ok, value } or { ok: false, reason }. */
+function checkPayoutField(field, raw) {
+  const def = PAYOUT_FIELDS[field];
+  if (!def) return { ok: false, reason: 'Unknown detail.' };
+  const value = (def.clean ? def.clean(raw) : String(raw || '').trim().replace(/\s+/g, ' '));
+  const verdict = def.check(value);
+  return verdict === true ? { ok: true, value } : { ok: false, reason: verdict };
+}
+
+/**
+ * payoutDetails — what an influencer has given, and what is still missing
+ * before they can be paid. The method is UPI unless they chose bank.
+ */
+function payoutDetails(influencer) {
+  const i = influencer || {};
+  const method = String(i.payout_method || '').toLowerCase() === 'bank' ? 'bank' : 'upi';
+  const needed = ['legal_name', 'phone', 'email'].concat(method === 'bank'
+    ? ['account_holder', 'account_number', 'ifsc'] : ['upi_id']);
+  const missing = needed.filter((field) => !String(i[field] || '').trim());
+  return { method, complete: missing.length === 0, missing, missingLabels: missing.map((f) => PAYOUT_FIELDS[f].label) };
+}
+
+/** "XXXXXX1234" — enough to recognise an account without showing it. */
+function maskAccount(number) {
+  const text = String(number || '');
+  return text.length > 4 ? 'X'.repeat(Math.min(text.length - 4, 8)) + text.slice(-4) : text;
+}
+
+// ---------------------------------------------------------------------------
 // Earnings and withdrawals
 // ---------------------------------------------------------------------------
 
@@ -363,12 +439,12 @@ function summarise(sales) {
  * @param {Array<Object>} sales This code's sales
  * @param {Array<Object>} payouts This code's withdrawal requests
  * @param {Object} [options]
- * @param {string} [options.upi] The influencer's UPI id
+ * @param {Object} [options.influencer] Their Influencers row, for the payout details
  * @param {Date} [options.now]
  * @param {Function} [options.parseDate] Timestamp string → Date
  * @returns {{ok: boolean, reason?: string, amountPaise: number, nextAt?: Date|null}}
  */
-function withdrawal(code, sales, payouts, { upi = '', now = new Date(), parseDate = (s) => new Date(s) } = {}) {
+function withdrawal(code, sales, payouts, { influencer = null, now = new Date(), parseDate = (s) => new Date(s) } = {}) {
   const stats = summarise(sales);
   const amountPaise = stats.availablePaise;
   const minPaise = (Number(code.min_payout) || 0) * 100;
@@ -401,8 +477,14 @@ function withdrawal(code, sales, payouts, { upi = '', now = new Date(), parseDat
     }
   }
 
-  if (!UPI_PATTERN.test(String(upi || '').trim())) {
-    return { ok: false, amountPaise, reason: 'Set your UPI ID first, so we know where to send it.' };
+  // Everything RazorpayX needs, before the admin is asked to pay.
+  // Each detail was checked when it was saved; here it only has to be there.
+  const details = payoutDetails(influencer);
+  if (!details.complete) {
+    return {
+      ok: false, amountPaise, needsDetails: true,
+      reason: `Add your payout details first (/payout): ${details.missingLabels.join(', ')}.`
+    };
   }
   return { ok: true, amountPaise };
 }
@@ -424,5 +506,9 @@ module.exports = {
   commissionFor,
   evaluatePromo,
   summarise,
-  withdrawal
+  withdrawal,
+  PAYOUT_FIELDS,
+  checkPayoutField,
+  payoutDetails,
+  maskAccount
 };

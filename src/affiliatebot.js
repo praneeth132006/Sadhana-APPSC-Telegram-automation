@@ -41,7 +41,21 @@ const esc = support.esc;
 const PROMPT = {
   application: '📝 Application — ',
   upi: '💳 UPI ID for payouts',
+  legal_name: '✏️ Your name as on your bank account',
+  phone: '📱 Your mobile number',
+  email: '✉️ Your email address',
+  pan: '🪪 Your PAN',
+  bank: '🏦 Bank account for payouts',
   question: '🆘 Question for the admin'
+};
+
+/** What each single-field prompt asks for, with an example. */
+const FIELD_PROMPTS = {
+  legal_name: ['legal_name', 'Reply with your full name exactly as it appears on your bank account.', 'Ravi Kumar'],
+  phone: ['phone', 'Reply with your 10-digit mobile number. RazorpayX needs it to pay you.', '9876543210'],
+  email: ['email', 'Reply with your email address. Payout receipts go here.', 'ravi@gmail.com'],
+  upi_id: ['upi', 'Reply with the UPI ID we should send your earnings to.', 'ravi@okicici'],
+  pan: ['pan', 'Optional — only needed for tax records on larger payouts. Reply with your PAN.', 'ABCDE1234F']
 };
 
 /**
@@ -103,7 +117,7 @@ function createAffiliateBot({ polling = false } = {}) {
     inline_keyboard: [
       [{ text: '📝 Apply to promote', callback_data: 'aff:apply' }],
       [{ text: '📊 My codes & earnings', callback_data: 'aff:codes' }],
-      [{ text: '💸 Withdraw', callback_data: 'aff:withdraw' }, { text: '💳 UPI ID', callback_data: 'aff:upi' }]
+      [{ text: '💸 Withdraw', callback_data: 'aff:withdraw' }, { text: '💳 Payout details', callback_data: 'aff:payout' }]
     ]
   };
 
@@ -217,26 +231,115 @@ function createAffiliateBot({ polling = false } = {}) {
       `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
       `Reference: <code>${esc(result.request.request_id)}</code>\n` +
       'An admin will review it and you will get a message here with your code and terms.' +
-      (influencer && influencer.upi_id ? '' : '\n\n💳 While you wait, set the UPI ID we will pay you on with /upi.'));
+      (affiliates.payoutDetails(influencer).complete ? ''
+        : '\n\n💳 While you wait, add your payout details so we can pay you — tap below.'),
+      affiliates.payoutDetails(influencer).complete ? {} : { reply_markup: PAYOUT_BUTTON });
     await notify.alertAdmins(notify.applicationAlert(result.request));
   }
 
-  async function askForUpi(chatId, user) {
+  // ---- payout details --------------------------------------------------------
+  // Everything RazorpayX needs to pay them, one detail per prompt, each shown
+  // with a tick or a cross so it is obvious what is left and how to change it.
+
+  const PAYOUT_BUTTON = { inline_keyboard: [[{ text: '💳 Payout details', callback_data: 'aff:payout' }]] };
+
+  async function sendPayoutCard(chatId, user, heading = '') {
     if (!(await requireStore(chatId))) return;
-    const influencer = await store.getInfluencer(user.id);
-    await reply(chatId,
-      `${PROMPT.upi}\n\n` +
-      'Reply to this message with the UPI ID we should send your earnings to, e.g. <code>ravi@okicici</code>.' +
-      (influencer && influencer.upi_id ? `\n\nCurrent: <code>${esc(influencer.upi_id)}</code>` : ''),
-      { reply_markup: { force_reply: true, input_field_placeholder: 'name@bank' } });
+    const i = (await store.getInfluencer(user.id)) || {};
+    const status = affiliates.payoutDetails(i);
+    const line = (label, value, required = true) =>
+      `${value ? '✅' : required ? '❌' : '➖'} ${label}: ${value ? `<b>${esc(value)}</b>` : '<i>not set</i>'}`;
+    const bank = i.account_number
+      ? `${i.account_holder || ''}, ${affiliates.maskAccount(i.account_number)}, ${i.ifsc || ''}` : '';
+    const lines = [
+      heading,
+      '<b>💳 Your payout details</b>',
+      'We pay by RazorpayX, which needs all of these.',
+      '',
+      line('Name as on bank account', i.legal_name),
+      line('Mobile', i.phone),
+      line('Email', i.email),
+      '',
+      `Pay me by: <b>${status.method === 'bank' ? '🏦 Bank transfer' : '💳 UPI'}</b>`,
+      line('UPI ID', i.upi_id, status.method === 'upi'),
+      line('Bank account', bank, status.method === 'bank'),
+      line('PAN (optional)', i.pan, false),
+      '',
+      status.complete
+        ? '✅ <b>All set</b> — you can withdraw as soon as your cycle allows.'
+        : `Still needed: <b>${esc(status.missingLabels.join(', '))}</b>. Tap below to add ${status.missing.length > 1 ? 'them' : 'it'}.`
+    ].filter((l, idx) => idx !== 0 || l);
+    const set = (text, field) => ({ text, callback_data: `aff:set:${field}` });
+    await reply(chatId, lines.join('\n'), {
+      reply_markup: {
+        inline_keyboard: [
+          [set(i.legal_name ? '✏️ Change name' : '✏️ Add name', 'legal_name'), set(i.phone ? '📱 Change mobile' : '📱 Add mobile', 'phone')],
+          [set(i.email ? '✉️ Change email' : '✉️ Add email', 'email'), set(i.pan ? '🪪 Change PAN' : '🪪 Add PAN', 'pan')],
+          [set(i.upi_id ? '💳 Change UPI ID' : '💳 Add UPI ID', 'upi_id'), set(i.account_number ? '🏦 Change bank account' : '🏦 Add bank account', 'bank')],
+          [
+            { text: (status.method === 'upi' ? '● ' : '○ ') + 'Pay me by UPI', callback_data: 'aff:method:upi' },
+            { text: (status.method === 'bank' ? '● ' : '○ ') + 'Pay me by bank', callback_data: 'aff:method:bank' }
+          ]
+        ]
+      }
+    });
   }
 
-  async function saveUpi(msg) {
-    const result = await store.setUpi(msg.from, support.messageText(msg));
-    await reply(msg.chat.id, result.ok
-      ? `✅ UPI ID saved: <code>${esc(result.influencer.upi_id)}</code>`
-      : `❌ ${esc(result.reason)}`,
-      result.ok ? {} : { reply_markup: { inline_keyboard: [[{ text: '💳 Try again', callback_data: 'aff:upi' }]] } });
+  async function askForField(chatId, user, field) {
+    if (!(await requireStore(chatId))) return;
+    const i = (await store.getInfluencer(user.id)) || {};
+    if (field === 'bank') {
+      await reply(chatId,
+        `${PROMPT.bank}\n\n` +
+        'Reply with three lines:\n1. account holder name\n2. account number\n3. IFSC\n\n' +
+        '<i>Example:\nRavi Kumar\n123456789012\nHDFC0001234</i>' +
+        (i.account_number ? `\n\nCurrent: ${esc(i.account_holder)}, ${esc(affiliates.maskAccount(i.account_number))}, ${esc(i.ifsc)}` : ''),
+        { reply_markup: { force_reply: true, input_field_placeholder: 'Name / account number / IFSC' } });
+      return;
+    }
+    const [promptKey, ask, example] = FIELD_PROMPTS[field] || [];
+    if (!promptKey) return;
+    await reply(chatId,
+      `${PROMPT[promptKey]}\n\n${ask}\n<i>Example: ${esc(example)}</i>` +
+      (i[field] ? `\n\nCurrent: <code>${esc(i[field])}</code>` : ''),
+      { reply_markup: { force_reply: true, input_field_placeholder: example } });
+  }
+
+  async function saveField(msg, field) {
+    const result = await store.setPayoutField(msg.from, field, support.messageText(msg));
+    if (!result.ok) {
+      await reply(msg.chat.id, `❌ ${esc(result.reason)}`,
+        { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:set:${field}` }]] } });
+      return;
+    }
+    await sendPayoutCard(msg.chat.id, msg.from, `✅ Saved: <b>${esc(affiliates.PAYOUT_FIELDS[field].label)}</b>\n`);
+  }
+
+  async function saveBank(msg) {
+    const parts = support.messageText(msg).split(/\r?\n|,/).map((p) => p.trim()).filter(Boolean);
+    if (parts.length < 3) {
+      await reply(msg.chat.id, '❌ Please send three lines: the account holder name, the account number, and the IFSC.',
+        { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: 'aff:set:bank' }]] } });
+      return;
+    }
+    const [holder, number, ifsc] = [parts[0], parts[1], parts[2]];
+    const result = await store.setBankAccount(msg.from, { holder, number, ifsc });
+    if (!result.ok) {
+      await reply(msg.chat.id, `❌ ${esc(result.reason)}`,
+        { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: 'aff:set:bank' }]] } });
+      return;
+    }
+    await sendPayoutCard(msg.chat.id, msg.from, '✅ Bank account saved — you will be paid by bank transfer.\n');
+  }
+
+  async function chooseMethod(chatId, user, method) {
+    if (!(await requireStore(chatId))) return;
+    const result = await store.setPayoutMethod(user, method);
+    if (!result.ok) {
+      await askForField(chatId, user, method === 'bank' ? 'bank' : 'upi_id');
+      return;
+    }
+    await sendPayoutCard(chatId, user, `✅ You will be paid by <b>${method === 'bank' ? 'bank transfer' : 'UPI'}</b>.\n`);
   }
 
   /** "Mon, 29 Sep" in IST, for "you can withdraw again on …". */
@@ -295,8 +398,10 @@ function createAffiliateBot({ polling = false } = {}) {
     for (const r of waiting) {
       blocks.push(`⏳ <b>${esc(notify.examLabel(r.exam))}</b> — application <code>${esc(r.request_id)}</code> is with the admin.`);
     }
-    if (!influencer || !influencer.upi_id) blocks.push('💳 <b>No UPI ID yet</b> — set it with /upi so we can pay you.');
+    const details = affiliates.payoutDetails(influencer);
+    if (!details.complete) blocks.push(`💳 <b>Payout details missing</b>: ${esc(details.missingLabels.join(', '))}.`);
     keyboard.push([{ text: '🔄 Refresh', callback_data: 'aff:codes' }, { text: '📝 Apply for another', callback_data: 'aff:apply' }]);
+    keyboard.push([{ text: details.complete ? '💳 Payout details' : '💳 Add payout details', callback_data: 'aff:payout' }]);
 
     await reply(chatId, '<b>Your promo codes</b>\n\n' + blocks.join('\n\n'), { reply_markup: { inline_keyboard: keyboard } });
   }
@@ -322,10 +427,14 @@ function createAffiliateBot({ polling = false } = {}) {
           (check.nextAt ? ` Next withdrawal from ${esc(day(check.nextAt))}.` : ''));
       }
     }
-    if (!influencer || !influencer.upi_id) keyboard.push([{ text: '💳 Set UPI ID', callback_data: 'aff:upi' }]);
+    const details = affiliates.payoutDetails(influencer);
+    keyboard.push([{ text: details.complete ? '💳 Change payout details' : '💳 Add payout details', callback_data: 'aff:payout' }]);
+    const payTo = details.method === 'bank'
+      ? `bank account ${esc(affiliates.maskAccount(influencer.account_number))} (${esc(influencer.ifsc)})`
+      : `<code>${esc(influencer && influencer.upi_id)}</code>`;
     await reply(chatId,
       '<b>Withdraw</b>\n\n' + lines.join('\n') +
-      (influencer && influencer.upi_id ? `\n\nWe pay to <code>${esc(influencer.upi_id)}</code> (change with /upi).` : ''),
+      (details.complete ? `\n\nWe pay to ${payTo}.` : ''),
       keyboard.length ? { reply_markup: { inline_keyboard: keyboard } } : {});
   }
 
@@ -334,13 +443,16 @@ function createAffiliateBot({ polling = false } = {}) {
     const result = await store.requestPayout(code, user.id);
     if (!result.ok) {
       await reply(chatId, `❌ ${esc(result.reason)}` +
-        (result.nextAt ? ` You can withdraw again from ${esc(day(result.nextAt))}.` : ''));
+        (result.nextAt ? ` You can withdraw again from ${esc(day(result.nextAt))}.` : ''),
+        /payout details/.test(result.reason) ? { reply_markup: PAYOUT_BUTTON } : {});
       return;
     }
     await reply(chatId,
       `✅ <b>Withdrawal requested: ${pricing.rupees(result.payout.amount_paise)}</b>\n\n` +
       `Reference: <code>${esc(result.payout.payout_id)}</code>\n` +
-      `We will send it to <code>${esc(result.payout.upi_id)}</code> and message you here with the UPI reference.`);
+      `We will send it to ${result.payout.payout_method === 'bank'
+        ? `your bank account ${esc(affiliates.maskAccount(result.payout.account_number))}`
+        : `<code>${esc(result.payout.upi_id)}</code>`} and message you here with the payment reference.`);
     await notify.alertAdmins(notify.withdrawalAlert(result.payout));
   }
 
@@ -352,8 +464,8 @@ function createAffiliateBot({ polling = false } = {}) {
       'student, and whether you withdraw weekly or monthly.\n' +
       '3. You get a promo code and a link. Your code works only in that exam\'s payment bot.\n' +
       '4. Every student who pays with your code earns you the commission — you get a message each time.\n' +
-      '5. /withdraw — when your cycle comes round and you are above the minimum. We pay by UPI (/upi) ' +
-      'and send you the reference.\n\n' +
+      '5. /payout — your name, mobile, email and UPI ID or bank account, so we can pay you through RazorpayX.\n' +
+      '6. /withdraw — when your cycle comes round and you are above the minimum. We send you the payment reference.\n\n' +
       'Commands:\n' + commandListText(),
       { reply_markup: MAIN_MENU });
   }
@@ -366,8 +478,8 @@ function createAffiliateBot({ polling = false } = {}) {
       '2. Commission is earned only on payments that succeed, and is worked out on what the student actually paid.\n' +
       '3. A code works only in the payment bot of the exam it was approved for.\n' +
       '4. You cannot use your own code.\n' +
-      '5. Withdrawals are paid by UPI to the ID you set, by hand, after the admin checks them. You get the UPI ' +
-      'reference when it is sent.\n' +
+      '5. Withdrawals are paid through RazorpayX, by UPI or bank transfer, to the details you give in /payout, ' +
+      'after the admin checks them. You get the payment reference when it is sent.\n' +
       '6. The admin may pause a code — for example if it is misused. What you have already earned stays yours.\n' +
       '7. Students\' payments are final: there are no refunds.');
   }
@@ -400,13 +512,15 @@ function createAffiliateBot({ polling = false } = {}) {
   command('status', async (msg) => { await sendCodes(msg.chat.id, msg.from); });
   command('earnings', async (msg) => { await sendCodes(msg.chat.id, msg.from); });
   command('withdraw', async (msg) => { await sendWithdrawChoice(msg.chat.id, msg.from); });
-  command('upi', async (msg) => { await askForUpi(msg.chat.id, msg.from); });
+  command('payout', async (msg) => { await sendPayoutCard(msg.chat.id, msg.from); });
+  command('upi', async (msg) => { await sendPayoutCard(msg.chat.id, msg.from); });
+  command('bank', async (msg) => { await sendPayoutCard(msg.chat.id, msg.from); });
   command('help', async (msg) => { await sendHelp(msg.chat.id); });
   command('terms', async (msg) => { await sendTerms(msg.chat.id); });
   command('support', async (msg) => { await askQuestion(msg.chat.id); });
   command('settings', async (msg) => {
     await reply(msg.chat.id,
-      '<b>Settings</b>\n\n/upi — the UPI ID we pay you on\n/codes — your codes and their terms\n\n' +
+      '<b>Settings</b>\n\n/payout — how we pay you: UPI or bank, name, mobile, email\n/codes — your codes and their terms\n\n' +
       'Your discount, commission and payout cycle are set by the admin for each code.',
       { reply_markup: MAIN_MENU });
   });
@@ -425,7 +539,9 @@ function createAffiliateBot({ polling = false } = {}) {
       if (data.startsWith('aff:exam:')) { await ack(); await askForDetails(chatId, user, data.slice(9)); return; }
       if (data === 'aff:codes') { await ack(); await sendCodes(chatId, user); return; }
       if (data === 'aff:withdraw') { await ack(); await sendWithdrawChoice(chatId, user); return; }
-      if (data === 'aff:upi') { await ack(); await askForUpi(chatId, user); return; }
+      if (data === 'aff:payout' || data === 'aff:upi') { await ack(); await sendPayoutCard(chatId, user); return; }
+      if (data.startsWith('aff:set:')) { await ack(); await askForField(chatId, user, data.slice(8)); return; }
+      if (data.startsWith('aff:method:')) { await ack(); await chooseMethod(chatId, user, data.slice(11)); return; }
       if (data.startsWith('aff:wd:')) { await ack('Requesting…'); await withdraw(chatId, user, data.slice(7)); return; }
       await ack();
     } catch (err) {
@@ -454,7 +570,9 @@ function createAffiliateBot({ polling = false } = {}) {
         await submitApplication(msg, prompt.split('\n')[0].slice(PROMPT.application.length).trim());
         return;
       }
-      if (prompt.startsWith(PROMPT.upi)) { await saveUpi(msg); return; }
+      if (prompt.startsWith(PROMPT.bank)) { await saveBank(msg); return; }
+      const field = Object.keys(FIELD_PROMPTS).find((f) => prompt.startsWith(PROMPT[FIELD_PROMPTS[f][0]]));
+      if (field) { await saveField(msg, field); return; }
       if (prompt.startsWith(PROMPT.question)) { await forwardQuestion(msg); return; }
     } catch (err) {
       console.error(`[affiliate-bot] reply handling failed: ${err.message}`);

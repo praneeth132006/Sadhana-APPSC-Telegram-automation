@@ -127,10 +127,10 @@ test('messageText uses the caption for media and caps the length', () => {
   assert.equal(support.hasMedia({ text: 'hi' }), false);
 });
 
-test('the settings cache reads once per ttl and serves defaults when the sheet fails', async () => {
+test('the settings cache reads once per ttl, and a sheet that never answered gives defaults', async () => {
   let clock = 0;
   let loads = 0;
-  let fail = false;
+  let fail = true;
   const cache = support.createSettingsCache({
     load: async () => {
       loads++;
@@ -141,28 +141,68 @@ test('the settings cache reads once per ttl and serves defaults when the sheet f
     failureTtlMs: 100,
     now: () => clock
   });
-
   const originalError = console.error;
   console.error = () => {};
   try {
-    assert.equal((await cache.get()).support_hours, 'from sheet');
-    assert.equal((await cache.get()).support_hours, 'from sheet');
-    assert.equal(loads, 1, 'second read inside the ttl should be cached');
-
-    clock = 2000;
-    fail = true;
-    const fallback = await cache.get();
-    assert.equal(fallback.support_hours, support.normaliseSettings({}).support_hours);
-    assert.equal(loads, 2);
-
-    clock = 2050;
+    assert.equal((await cache.get()).support_hours, support.normaliseSettings({}).support_hours);
+    assert.equal(cache.peek(), null, 'defaults are not passed off as what the sheet said');
+    clock = 50;
     await cache.get();
-    assert.equal(loads, 2, 'a failure should not be retried on every message');
+    assert.equal(loads, 1, 'a failure should not be retried on every message');
 
     fail = false;
-    cache.invalidate();
+    clock = 200;
     assert.equal((await cache.get()).support_hours, 'from sheet');
-    assert.equal(loads, 3);
+    assert.equal((await cache.get()).support_hours, 'from sheet');
+    assert.equal(loads, 2, 'second read inside the ttl should be cached');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('stale settings are served at once while a refresh runs behind them', async () => {
+  let clock = 0;
+  let loads = 0;
+  let release;
+  const background = [];
+  const cache = support.createSettingsCache({
+    load: async () => {
+      loads++;
+      if (loads === 1) return { support_hours: 'first' };
+      await new Promise((r) => { release = r; });
+      return { support_hours: 'second' };
+    },
+    ttlMs: 1000,
+    staleMs: 10000,
+    now: () => clock,
+    background: (work) => background.push(work)
+  });
+  await cache.get();
+  clock = 5000;   // expired, but not too old to show
+  assert.equal((await cache.get()).support_hours, 'first', 'a stale read made the student wait');
+  assert.equal(background.length, 1, 'the refresh was not handed over to be kept alive');
+  release();
+  await background[0];
+  assert.equal((await cache.get()).support_hours, 'second');
+});
+
+test('a failed refresh keeps the last settings the sheet gave, never the defaults', async () => {
+  // Defaults would quote the built-in price while an admin has set another.
+  let clock = 0;
+  let fail = false;
+  const cache = support.createSettingsCache({
+    load: async () => { if (fail) throw new Error('down'); return { pass_price: '149' }; },
+    ttlMs: 1000,
+    staleMs: 10000,
+    now: () => clock
+  });
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await cache.get();
+    fail = true;
+    clock = 20000;   // too old to serve stale: this read waits, and fails
+    assert.equal((await cache.get()).pass_price, '149');
   } finally {
     console.error = originalError;
   }

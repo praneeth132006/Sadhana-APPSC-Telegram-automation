@@ -412,6 +412,64 @@ async function readConfig(ctx) {
     .filter((item) => item.subject.length > 0);
 }
 
+// ---------------------------------------------------------------------------
+// The two reads on a bot's reply path
+// ---------------------------------------------------------------------------
+// Through the Apps Script each took 2–4 s, and both sit between a student's
+// tap and the bot's answer: the settings behind /start and the price screen,
+// and the member row behind /status. A Telegram ad reviewer counts that wait
+// as a bot that does not respond. Direct, each is a single sub-second read.
+
+/** The Bot Settings tab (Key | Value), exactly as the Apps Script reads it. */
+async function getBotSettings(ctx) {
+  const range = encodeURIComponent(`${quoteTab('Bot Settings')}!A2:B`);
+  let body;
+  try {
+    body = await call('GET', `/${ctx.spreadsheetId}/values/${range}?valueRenderOption=UNFORMATTED_VALUE`);
+  } catch (err) {
+    // No tab yet is no settings yet — the Apps Script creates it empty.
+    if (/Unable to parse range/i.test(err.message)) return {};
+    throw err;
+  }
+  const out = {};
+  for (const row of body.values || []) {
+    const key = String(row[0] === undefined || row[0] === null ? '' : row[0]).trim();
+    if (key) out[key] = String(row[1] === null || row[1] === undefined ? '' : row[1]);
+  }
+  return out;
+}
+
+/** Subscribers columns A–S, in the Apps Script's order. */
+const SUBSCRIBER_FIELDS = ['telegram_id', 'username', 'name', 'plan', 'plan_label', 'status', 'start_date',
+  'expiry_date', 'amount', 'payment_id', 'link_id', 'subscription_id', 'total_paid', 'renewals',
+  'reminder_sent', 'invite_link', 'joined_at', 'last_payment_at', 'notes'];
+
+/** One member by Telegram id — the first matching row, as findSubscriberRow does. */
+async function getSubscriber(ctx, telegramId) {
+  const range = encodeURIComponent(`${quoteTab('Subscribers')}!A2:S`);
+  let body;
+  try {
+    body = await call('GET', `/${ctx.spreadsheetId}/values/${range}?valueRenderOption=UNFORMATTED_VALUE`);
+  } catch (err) {
+    if (/Unable to parse range/i.test(err.message)) return null;
+    throw err;
+  }
+  const target = String(telegramId).trim();
+  const rows = body.values || [];
+  const index = rows.findIndex((row) => String(row[0] === undefined || row[0] === null ? '' : row[0]).trim() === target);
+  if (index === -1) return null;
+  const row = rows[index];
+  const text = (i) => String(row[i] === undefined || row[i] === null ? '' : row[i]).trim();
+  const out = {};
+  SUBSCRIBER_FIELDS.forEach((field, i) => { out[field] = text(i); });
+  out.status = out.status.toLowerCase();
+  out.amount = Number(row[8]) || 0;
+  out.total_paid = Number(row[12]) || 0;
+  out.renewals = Number(row[13]) || 0;
+  out.row_number = index + 2;
+  return out;
+}
+
 async function getUnpostedQuestions(ctx, subject, count = 1, requireApproved = true) {
   const limit = Math.min(Math.max(Number(count) || 1, 1), 100);
   const { map, rows } = await readTab(ctx, subject);
@@ -1346,6 +1404,7 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
+  getBotSettings, getSubscriber,
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
   holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions, markDeleted,
   scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions

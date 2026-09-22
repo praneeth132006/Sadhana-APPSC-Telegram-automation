@@ -188,9 +188,31 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   const botId = support.botIdFromToken(process.env[payBotEnv]);
 
+  // A refresh that runs behind an answer is handed to keepAlive, so settle()
+  // waits for it and the deployment is not frozen half-way through the read.
   const settingsCache = support.createSettingsCache({
-    load: () => sheetFor(primaryGroup().id).getBotSettings()
+    load: () => sheetFor(primaryGroup().id).getBotSettings(),
+    background: (work) => keepAlive(work)
   });
+
+  /**
+   * settingsNow — settings without waiting: what this instance already holds,
+   * or the defaults while the first read runs behind the reply.
+   *
+   * For /start, /about, /help and /terms, which only use settings for an
+   * optional line (the welcome note, the contact email). A Telegram ad
+   * reviewer presses Start and counts the seconds; the welcome must not sit
+   * behind a spreadsheet read to decide whether to add a sentence.
+   */
+  function settingsNow() {
+    const held = settingsCache.peek();
+    if (held) {
+      keepAlive(settingsCache.get());
+      return held;
+    }
+    keepAlive(settingsCache.refresh());
+    return support.normaliseSettings({});
+  }
 
   /** Settings, or the defaults if the sheet does not answer within `ms`. */
   async function settingsWithin(ms) {
@@ -547,6 +569,14 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // tracked without each one having to remember to opt in.
   const pending = new Set();
 
+  /** Work started behind a reply (a settings refresh) that settle() must still wait for. */
+  function keepAlive(promise) {
+    const work = Promise.resolve(promise).catch(() => {});
+    pending.add(work);
+    work.finally(() => pending.delete(work));
+    return work;
+  }
+
   function track(handler) {
     if (typeof handler !== 'function') return handler;
     return function trackedHandler(...args) {
@@ -662,10 +692,18 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // has to type the code, and the discount is already on the pass when they
   // see it. Whether it is valid for this bot is decided there, not here.
   const promo = affiliates.codeFromStartPayload(match && match[1]);
-  if (promo) pendingPromo.set(String(msg.from.id), { code: promo, at: Date.now() });
+  if (promo) {
+    pendingPromo.set(String(msg.from.id), { code: promo, at: Date.now() });
+    // Who opened the influencer's link, for the Influencers page. Behind the
+    // reply, never before it: the welcome must not wait on a spreadsheet.
+    if (affiliateStore.isConfigured()) {
+      keepAlive(Promise.resolve().then(() => affiliateStore.recordLinkOpen(promo, msg.from)).catch((err) =>
+        console.error(`[bot] ${payBotEnv}: could not record a link open for ${promo} — ${err.message}`)));
+    }
+  }
 
   // Bounded: a slow sheet must never hold up the greeting.
-  const settings = await settingsWithin(START_SETTINGS_WAIT_MS);
+  const settings = settingsNow();
   const note = settings.welcome_note ? `${esc(settings.welcome_note)}\n\n` : '';
 
   await bot.sendMessage(msg.chat.id,
@@ -683,7 +721,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   });
 
   studentCommand('about', async (msg) => {
-  const aboutSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
+  const aboutSettings = settingsNow();
   await bot.sendMessage(msg.chat.id,
     `<b>About ${esc(botDisplayName())}</b>\n\n` + ABOUT_TEXT + '\n\n' +
     'Commands:\n' + commandListText() +
@@ -739,7 +777,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   studentCommand('help', async (msg) => {
   const many = familyGroups().length > 1;
-  const helpSettings = await settingsWithin(START_SETTINGS_WAIT_MS);
+  const helpSettings = settingsNow();
   const steps = [
     many ? 'Send /plans and choose your group.' : 'Send /plans to see the pass.',
     'Got a coupon or an influencer\'s promo code? Tap <b>🎟 Apply coupon or promo code</b> and type it — the new price is shown before you pay.',
@@ -852,6 +890,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   bot.on('callback_query', async (query) => {
   const data = String(query.data || '');
   const user = query.from;
+  // "typing…" while the next screen is worked out: Continue reads the price,
+  // Pay asks Razorpay for a link. Private chats only — never in a group.
+  if (query.message && query.message.chat && query.message.chat.type === 'private') showTyping(user.id);
 
   // Acknowledging must not be able to kill the handler. A callback from a
   // message sent by an earlier bot process is "too old" by the time it
@@ -1069,7 +1110,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       Object.assign(extraNotes, {
         promo_code: applied.code,
         affiliate_id: applied.affiliateId || '',
-        commission_amount: String((applied.commissionPaise || 0) / 100)
+        commission_amount: String((applied.commissionPaise || 0) / 100),
+        // So the Sales tab says who joined, not only their Telegram id.
+        student_name: name
       });
     } else {
       extraNotes.coupon_code = applied.code;
@@ -2261,6 +2304,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (!support.messageText(msg) && !support.hasMedia(msg)) return;
 
   if (!allowFreeText(String(msg.from.id))) return;
+
+  // Looking for an open ticket takes a sheet read; show that something is
+  // happening rather than a silent chat.
+  showTyping(msg.chat.id);
 
   // Someone mid-conversation with support just types again. That belongs in
   // the ticket they already have, not in a new one.

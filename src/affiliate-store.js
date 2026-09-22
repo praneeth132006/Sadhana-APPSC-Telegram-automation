@@ -35,8 +35,10 @@ const { call, quoteTab, writeHeaderRow, formatPlainTab, appendRows, istNow, pars
 const TABLES = {
   influencers: {
     tab: 'Influencers',
-    headers: ['Telegram ID', 'Username', 'Name', 'UPI ID', 'Joined At', 'Updated At', 'Status', 'Notes'],
-    widths: [130, 150, 180, 200, 190, 190, 90, 260]
+    headers: ['Telegram ID', 'Username', 'Name', 'UPI ID', 'Joined At', 'Updated At', 'Status', 'Notes',
+      'Legal Name', 'Phone', 'Email', 'Payout Method', 'Account Holder', 'Account Number', 'IFSC', 'PAN',
+      'Details Complete'],
+    widths: [130, 150, 180, 200, 190, 190, 90, 260, 190, 120, 220, 110, 190, 170, 120, 120, 120]
   },
   requests: {
     tab: 'Requests',
@@ -63,8 +65,15 @@ const TABLES = {
   payouts: {
     tab: 'Payouts',
     headers: ['Payout ID', 'Requested At', 'Code', 'Exam', 'Influencer ID', 'Username', 'Name', 'UPI ID',
-      'Amount', 'Sales', 'Sale IDs', 'Status', 'Decided At', 'Decided By', 'Reference', 'Reason'],
-    widths: [170, 190, 130, 140, 130, 150, 180, 200, 100, 70, 320, 100, 190, 220, 200, 260]
+      'Amount', 'Sales', 'Sale IDs', 'Status', 'Decided At', 'Decided By', 'Reference', 'Reason',
+      'Legal Name', 'Phone', 'Email', 'Payout Method', 'Account Holder', 'Account Number', 'IFSC', 'PAN'],
+    widths: [170, 190, 130, 140, 130, 150, 180, 200, 100, 70, 320, 100, 190, 220, 200, 260,
+      190, 120, 220, 110, 190, 170, 120, 120]
+  },
+  opens: {
+    tab: 'Link Opens',
+    headers: ['Timestamp', 'Code', 'Exam', 'Student ID', 'Student Username', 'Student Name'],
+    widths: [190, 130, 140, 130, 160, 180]
   },
   log: {
     tab: 'Log',
@@ -269,13 +278,59 @@ async function upsertInfluencer(user, patch = {}) {
   });
 }
 
+/**
+ * setPayoutField — one payout detail (legal name, phone, email, UPI ID,
+ * PAN…), checked before it is stored. `Details Complete` is kept current so
+ * the sheet alone says who can be paid.
+ */
+async function setPayoutField(user, field, raw) {
+  const checked = affiliates.checkPayoutField(field, raw);
+  if (!checked.ok) return { ok: false, reason: checked.reason };
+  const current = (await getInfluencer(user.id || user.telegram_id)) || {};
+  const patch = { [field]: checked.value };
+  // Giving a UPI ID or bank account also says how they want to be paid,
+  // unless they already chose the other with its details in place.
+  if (field === 'upi_id' && !current.payout_method) patch.payout_method = 'upi';
+  const next = Object.assign({}, current, patch);
+  patch.details_complete = affiliates.payoutDetails(next).complete ? 'yes' : 'no';
+  const saved = await upsertInfluencer(user, patch);
+  await log(`Influencer ${saved.telegram_id}`, `${field}_set`, saved.telegram_id,
+    field === 'account_number' ? affiliates.maskAccount(checked.value) : checked.value);
+  return { ok: true, influencer: saved, value: checked.value };
+}
+
+/** Kept for the /upi command and older callers. */
 async function setUpi(user, upi) {
-  const clean = String(upi || '').trim();
-  if (!affiliates.UPI_PATTERN.test(clean)) {
-    return { ok: false, reason: 'That does not look like a UPI ID. It looks like name@bank, e.g. ravi@okicici.' };
+  return setPayoutField(user, 'upi_id', upi);
+}
+
+/** A bank account in one go: holder, number and IFSC, all checked first. */
+async function setBankAccount(user, { holder, number, ifsc }) {
+  const checks = [['account_holder', holder], ['account_number', number], ['ifsc', ifsc]]
+    .map(([field, raw]) => [field, affiliates.checkPayoutField(field, raw)]);
+  const bad = checks.find(([, c]) => !c.ok);
+  if (bad) return { ok: false, reason: bad[1].reason };
+  const current = (await getInfluencer(user.id || user.telegram_id)) || {};
+  const patch = Object.fromEntries(checks.map(([field, c]) => [field, c.value]));
+  patch.payout_method = 'bank';
+  patch.details_complete = affiliates.payoutDetails(Object.assign({}, current, patch)).complete ? 'yes' : 'no';
+  const saved = await upsertInfluencer(user, patch);
+  await log(`Influencer ${saved.telegram_id}`, 'bank_set', saved.telegram_id,
+    `${patch.account_holder}, ${affiliates.maskAccount(patch.account_number)}, ${patch.ifsc}`);
+  return { ok: true, influencer: saved };
+}
+
+/** UPI or bank — only to a method whose details are already given. */
+async function setPayoutMethod(user, method) {
+  const wanted = method === 'bank' ? 'bank' : 'upi';
+  const current = (await getInfluencer(user.id || user.telegram_id)) || {};
+  const next = Object.assign({}, current, { payout_method: wanted });
+  const status = affiliates.payoutDetails(next);
+  const own = wanted === 'bank' ? ['account_holder', 'account_number', 'ifsc'] : ['upi_id'];
+  if (own.some((f) => status.missing.includes(f))) {
+    return { ok: false, reason: wanted === 'bank' ? 'Add your bank account first.' : 'Add your UPI ID first.' };
   }
-  const saved = await upsertInfluencer(user, { upi_id: clean });
-  await log(`Influencer ${saved.telegram_id}`, 'upi_set', saved.telegram_id, clean);
+  const saved = await upsertInfluencer(user, { payout_method: wanted, details_complete: status.complete ? 'yes' : 'no' });
   return { ok: true, influencer: saved };
 }
 
@@ -517,6 +572,35 @@ async function recordSale(sale) {
 }
 
 // ---------------------------------------------------------------------------
+// Link opens
+// ---------------------------------------------------------------------------
+
+/**
+ * recordLinkOpen — someone opened an influencer's link. Once per student per
+ * code, never the code's own influencer, and only for a code that exists.
+ * So the admin can see who looked, not only who paid.
+ */
+async function recordLinkOpen(codeText, user) {
+  const wanted = affiliates.normaliseCode(codeText);
+  const id = String(user.id);
+  return withLock(`open:${wanted}:${id}`, async () => {
+    const code = await getCode(wanted);
+    if (!code || code.telegram_id === id) return { recorded: false };
+    const { rows, columns } = await read('opens');
+    if (rows.some((r) => String(r.code).toUpperCase() === wanted && r.student_id === id)) return { recorded: false };
+    await append('opens', [{
+      timestamp: istNow(), code: wanted, exam: code.exam, student_id: id,
+      student_username: user.username || '', student_name: personName(user)
+    }], columns);
+    return { recorded: true };
+  });
+}
+
+async function listOpens() {
+  return (await read('opens')).rows;
+}
+
+// ---------------------------------------------------------------------------
 // Withdrawals
 // ---------------------------------------------------------------------------
 
@@ -532,9 +616,7 @@ async function withdrawalStatus(code, influencer, now = new Date()) {
   const myPayouts = payouts.filter((p) => String(p.code).toUpperCase() === wanted);
   return {
     stats: affiliates.summarise(mine),
-    check: affiliates.withdrawal(code, mine, myPayouts, {
-      upi: influencer && influencer.upi_id, now, parseDate: parseIstDate
-    }),
+    check: affiliates.withdrawal(code, mine, myPayouts, { influencer, now, parseDate: parseIstDate }),
     sales: mine,
     payouts: myPayouts
   };
@@ -566,6 +648,12 @@ async function requestPayout(codeText, telegramId, now = new Date()) {
       payout_id: newId('WD', now), requested_at: istNow(now), code: wanted, exam: code.exam,
       influencer_id: code.telegram_id, username: influencer.username || code.username, name: influencer.name || code.name,
       upi_id: influencer.upi_id, amount: toRupees(amountPaise), sales: covering.length,
+      // What the admin pays to, as it was when the withdrawal was asked for:
+      // a change of UPI ID afterwards must not redirect money already requested.
+      legal_name: influencer.legal_name || '', phone: influencer.phone || '', email: influencer.email || '',
+      payout_method: affiliates.payoutDetails(influencer).method,
+      account_holder: influencer.account_holder || '', account_number: influencer.account_number || '',
+      ifsc: influencer.ifsc || '', pan: influencer.pan || '',
       sale_ids: covering.map((s) => s.sale_id).join(', '), status: 'requested',
       decided_at: '', decided_by: '', reference: '', reason: ''
     };
@@ -574,7 +662,9 @@ async function requestPayout(codeText, telegramId, now = new Date()) {
       row: s._row, object: Object.assign({}, s, { status: 'requested', payout_id: payout.payout_id })
     })));
     await log(`Influencer ${telegramId}`, 'withdrawal_requested', payout.payout_id,
-      `${wanted}: ₹${payout.amount} to ${payout.upi_id} (${payout.sales} sale(s))`);
+      `${wanted}: ₹${payout.amount} by ${payout.payout_method} to ` +
+      `${payout.payout_method === 'bank' ? `${payout.ifsc} ${affiliates.maskAccount(payout.account_number)}` : payout.upi_id}` +
+      ` (${payout.sales} sale(s))`);
     return { ok: true, payout: Object.assign({}, payout, { amount_paise: amountPaise }), code };
   });
 }
@@ -623,10 +713,10 @@ async function decidePayout(payoutId, decision, { reference = '', reason = '', a
 // ---------------------------------------------------------------------------
 
 async function overview() {
-  const [influencers, requests, codes, sales, payouts] = await Promise.all([
-    read('influencers').then((t) => t.rows), listRequests(), listCodes(), listSales(), listPayouts()
+  const [influencers, requests, codes, sales, payouts, opens] = await Promise.all([
+    read('influencers').then((t) => t.rows), listRequests(), listCodes(), listSales(), listPayouts(), listOpens()
   ]);
-  return { influencers, requests, codes, sales, payouts };
+  return { influencers, requests, codes, sales, payouts, opens };
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +867,11 @@ module.exports = {
   getInfluencer,
   upsertInfluencer,
   setUpi,
+  setPayoutField,
+  setBankAccount,
+  setPayoutMethod,
+  recordLinkOpen,
+  listOpens,
   listRequests,
   createRequest,
   approveRequest,

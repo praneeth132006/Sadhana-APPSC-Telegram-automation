@@ -53,6 +53,14 @@ async function approvedCode(terms = TERMS) {
   return approved.code;
 }
 
+/** Everything RazorpayX needs to pay Ravi, by UPI. */
+async function giveDetails(user = RAVI) {
+  for (const [field, value] of [['legal_name', 'Ravi Kumar'], ['phone', '9876543210'], ['email', 'ravi@example.com'], ['upi_id', 'ravi@okicici']]) {
+    const out = await store.setPayoutField(user, field, value);
+    assert.equal(out.ok, true, out.reason);
+  }
+}
+
 async function sell(code, paymentId, studentId = 900) {
   return store.recordSale({
     code: code.code, payment_id: paymentId, student_id: studentId, student_username: 's' + studentId,
@@ -64,7 +72,7 @@ async function sell(code, paymentId, studentId = 900) {
 test('the sheet builds its own tabs, styled, on first use', async () => {
   const { book } = fresh();
   const tabs = await store.ensureTabs();
-  assert.deepEqual(tabs, ['Influencers', 'Requests', 'Codes', 'Sales', 'Payouts', 'Log']);
+  assert.deepEqual(tabs, ['Influencers', 'Requests', 'Codes', 'Sales', 'Payouts', 'Link Opens', 'Log']);
   for (const tab of tabs) {
     assert.ok(book[tab], `${tab} was not created`);
     assert.deepEqual(book[tab][0], store.TABLES[Object.keys(store.TABLES).find((k) => store.TABLES[k].tab === tab)].headers);
@@ -228,12 +236,13 @@ test('withdrawing needs a UPI ID, the minimum, and respects the cycle', async ()
   assert.match(under.reason, /₹14\.18 to go/);
 
   await sell(code, 'pay_2', 901);
-  const noUpi = await store.requestPayout(code.code, RAVI.id);
-  assert.equal(noUpi.ok, false);
-  assert.match(noUpi.reason, /UPI ID/);
-
   assert.equal((await store.setUpi(RAVI, 'not a upi')).ok, false);
   assert.equal((await store.setUpi(RAVI, 'ravi@okicici')).ok, true);
+  const noDetails = await store.requestPayout(code.code, RAVI.id);
+  assert.equal(noDetails.ok, false);
+  assert.match(noDetails.reason, /payout details.*Name as on your bank account, Mobile number, Email/);
+
+  await giveDetails();
 
   const ok = await store.requestPayout(code.code, RAVI.id);
   assert.equal(ok.ok, true, ok.reason);
@@ -260,7 +269,7 @@ test('someone else cannot withdraw a code\'s earnings', async () => {
 test('marking paid needs the UPI reference, then closes the sales', async () => {
   fresh();
   const code = await approvedCode(Object.assign({}, TERMS, { min_payout: 0 }));
-  await store.setUpi(RAVI, 'ravi@okicici');
+  await giveDetails();
   await sell(code, 'pay_1');
   const { payout } = await store.requestPayout(code.code, RAVI.id);
 
@@ -282,7 +291,7 @@ test('marking paid needs the UPI reference, then closes the sales', async () => 
 test('a rejected withdrawal hands its sales back to be withdrawn again', async () => {
   fresh();
   const code = await approvedCode(Object.assign({}, TERMS, { min_payout: 0 }));
-  await store.setUpi(RAVI, 'ravi@okicici');
+  await giveDetails();
   await sell(code, 'pay_1');
   const { payout } = await store.requestPayout(code.code, RAVI.id);
   const rejected = await store.decidePayout(payout.payout_id, 'rejected', { reason: 'Wrong UPI ID', actor: 'Admin' });
@@ -299,7 +308,7 @@ test('a rejected withdrawal hands its sales back to be withdrawn again', async (
 test('a paid withdrawal starts the weekly clock', async () => {
   fresh();
   const code = await approvedCode(Object.assign({}, TERMS, { min_payout: 0 }));
-  await store.setUpi(RAVI, 'ravi@okicici');
+  await giveDetails();
   await sell(code, 'pay_1');
   const { payout } = await store.requestPayout(code.code, RAVI.id);
   await store.decidePayout(payout.payout_id, 'paid', { reference: 'UTR1', actor: 'Admin' });
@@ -338,4 +347,64 @@ test('columns are found by name, so a reordered sheet is still read right', asyn
   assert.equal(row[0], 'Ravi Kumar');
   assert.equal(row[1], '501');
   assert.equal((await store.getInfluencer(501)).upi_id, 'ravi@okicici');
+});
+
+test('payout details: each is checked, and the sheet says who can be paid', async () => {
+  const { book } = fresh();
+  assert.match((await store.setPayoutField(RAVI, 'phone', '12345')).reason, /10-digit/);
+  assert.match((await store.setPayoutField(RAVI, 'email', 'nope')).reason, /email/);
+  assert.equal((await store.setPayoutField(RAVI, 'phone', '+91 98765 43210')).value, '9876543210');
+  await giveDetails();
+  const row = await store.getInfluencer(501);
+  assert.equal(row.details_complete, 'yes');
+  assert.equal(row.payout_method, 'upi');
+  const header = book.Influencers[0];
+  for (const col of ['Legal Name', 'Phone', 'Email', 'Payout Method', 'Account Holder', 'Account Number', 'IFSC', 'PAN', 'Details Complete']) {
+    assert.ok(header.includes(col), `${col} is not a column`);
+  }
+});
+
+test('a bank account is taken whole, checked, and becomes the payout method', async () => {
+  fresh();
+  await giveDetails();
+  assert.match((await store.setBankAccount(RAVI, { holder: 'Ravi Kumar', number: '12', ifsc: 'HDFC0001234' })).reason, /9 to 18 digits/);
+  assert.match((await store.setBankAccount(RAVI, { holder: 'Ravi Kumar', number: '123456789012', ifsc: 'HDFC001' })).reason, /IFSC/);
+  const ok = await store.setBankAccount(RAVI, { holder: 'Ravi Kumar', number: '1234 5678 9012', ifsc: 'hdfc0001234' });
+  assert.equal(ok.ok, true, ok.reason);
+  const row = await store.getInfluencer(501);
+  assert.deepEqual([row.payout_method, row.account_number, row.ifsc, row.details_complete], ['bank', '123456789012', 'HDFC0001234', 'yes']);
+  // Switching back to UPI works because the UPI ID is there too.
+  assert.equal((await store.setPayoutMethod(RAVI, 'upi')).ok, true);
+  const newbie = { id: 777, first_name: 'New' };
+  assert.match((await store.setPayoutMethod(newbie, 'bank')).reason, /bank account first/);
+});
+
+test('a withdrawal records the payout details as they were when it was asked for', async () => {
+  const { book } = fresh();
+  const code = await approvedCode(Object.assign({}, TERMS, { min_payout: 0 }));
+  await giveDetails();
+  await store.setBankAccount(RAVI, { holder: 'Ravi Kumar', number: '123456789012', ifsc: 'HDFC0001234' });
+  await sell(code, 'pay_1');
+  const { payout } = await store.requestPayout(code.code, RAVI.id);
+  assert.equal(payout.payout_method, 'bank');
+  assert.equal(payout.account_number, '123456789012');
+  assert.equal(payout.phone, '9876543210');
+  // Changing the UPI ID afterwards does not touch the request already made.
+  await store.setPayoutField(RAVI, 'upi_id', 'other@okaxis');
+  const [header, row] = book.Payouts;
+  assert.equal(row[header.indexOf('UPI ID')], 'ravi@okicici');
+  assert.equal(row[header.indexOf('IFSC')], 'HDFC0001234');
+});
+
+test('a link open is recorded once per student, never for the influencer or an unknown code', async () => {
+  const { book } = fresh();
+  const code = await approvedCode();
+  const kiran = { id: 900, first_name: 'Kiran', username: 'kiran' };
+  assert.equal((await store.recordLinkOpen(code.code, kiran)).recorded, true);
+  assert.equal((await store.recordLinkOpen(code.code.toLowerCase(), kiran)).recorded, false, 'counted twice');
+  assert.equal((await store.recordLinkOpen(code.code, RAVI)).recorded, false, 'the influencer counted their own open');
+  assert.equal((await store.recordLinkOpen('GHOST', kiran)).recorded, false);
+  assert.equal(book['Link Opens'].length, 2, 'header + one open');
+  const [open] = await store.listOpens();
+  assert.deepEqual([open.code, open.student_id, open.student_name], [code.code, '900', 'Kiran']);
 });

@@ -179,7 +179,9 @@ test('a code can be paused, resumed, and given new terms — and the influencer 
 test('a withdrawal is marked paid only with a UPI reference, and the influencer gets the reference', async () => {
   const requestId = await pendingRequest();
   await api('/api/affiliates/approve', { method: 'POST', body: { requestId, terms: Object.assign({ code: 'RAVI10' }, TERMS) } });
-  await store.setUpi(RAVI, 'ravi@okicici');
+  for (const [f, v] of [['legal_name', 'Ravi Kumar'], ['phone', '9876543210'], ['email', 'ravi@example.com'], ['upi_id', 'ravi@okicici']]) {
+    await store.setPayoutField(RAVI, f, v);
+  }
   await store.recordSale({ code: 'RAVI10', payment_id: 'pay_1', student_id: 900, paid_paise: 17910, commission_paise: 3582 });
   const { payout } = await store.requestPayout('RAVI10', 501);
   told.length = 0;
@@ -201,7 +203,9 @@ test('a withdrawal is marked paid only with a UPI reference, and the influencer 
 test('a rejected withdrawal goes back to the influencer\'s balance', async () => {
   const requestId = await pendingRequest();
   await api('/api/affiliates/approve', { method: 'POST', body: { requestId, terms: Object.assign({ code: 'RAVI10' }, TERMS) } });
-  await store.setUpi(RAVI, 'ravi@okicici');
+  for (const [f, v] of [['legal_name', 'Ravi Kumar'], ['phone', '9876543210'], ['email', 'ravi@example.com'], ['upi_id', 'ravi@okicici']]) {
+    await store.setPayoutField(RAVI, f, v);
+  }
   await store.recordSale({ code: 'RAVI10', payment_id: 'pay_1', student_id: 900, paid_paise: 17910, commission_paise: 3582 });
   const { payout } = await store.requestPayout('RAVI10', 501);
   const res = await api('/api/affiliates/payout', { method: 'POST', body: { payoutId: payout.payout_id, decision: 'rejected', reason: 'UPI ID bounced' } });

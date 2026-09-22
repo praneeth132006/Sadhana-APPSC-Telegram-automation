@@ -17,14 +17,25 @@ const CODE = {
   name: 'Ravi Kumar', discount_type: 'percent', discount_value: '10', commission_type: 'percent', commission_value: '20',
   payout_cycle: 'weekly', min_payout: '100', expires_on: '', max_uses: '', one_per_student: 'yes', status: 'active',
   share_link: 'https://t.me/prelimspaymentbot?start=promo_RAVI10', upi_id: 'ravi@okicici',
-  stats: { uses: 2, revenuePaise: 35820, discountPaise: 3980, earnedPaise: 7164, availablePaise: 3582, requestedPaise: 3582, paidPaise: 0 }
+  stats: { uses: 2, revenuePaise: 35820, discountPaise: 3980, earnedPaise: 7164, availablePaise: 3582, requestedPaise: 3582, paidPaise: 0,
+    opens: 3, openedAndPaid: 2 },
+  notYetPaid: [{ timestamp: '22-09-2026', code: 'RAVI10', student_id: '9003', student_username: 'sai', student_name: 'Sai' }]
 };
 const PAYLOAD = {
   status: { sheet: true, bot: true, adminChat: true, serviceAccount: 'sheets-bot@x.iam.gserviceaccount.com',
     sheetUrl: 'https://docs.google.com/spreadsheets/d/AFF/edit' },
   botUsername: 'influencer_bot',
   exams: [{ id: 'upsc', label: 'UPSC', pricePaise: 19900 }, { id: 'epfo', label: 'EPFO', pricePaise: 19900 }],
-  influencers: [{ telegram_id: '501', upi_id: 'ravi@okicici' }],
+  influencers: [
+    { telegram_id: '501', username: 'ravi_teaches', name: 'Ravi Kumar', upi_id: 'ravi@okicici', legal_name: 'Ravi Kumar',
+      phone: '9876543210', email: 'ravi@example.com', payout_method: 'upi', joined_at: '20-09-2026',
+      payout: { method: 'upi', complete: true, missing: [], missingLabels: [] },
+      codes: [{ code: 'RAVI10', exam: 'upsc', status: 'active' }],
+      stats: { uses: 2, earnedPaise: 7164, availablePaise: 3582, requestedPaise: 3582, paidPaise: 0 } },
+    { telegram_id: '777', username: 'priya_edu', name: 'Priya', joined_at: '22-09-2026',
+      payout: { method: 'upi', complete: false, missing: ['phone'], missingLabels: ['Mobile number', 'Email', 'UPI ID'] },
+      codes: [], stats: {}, pendingApplications: 1 }
+  ],
   requests: [
     { request_id: 'REQ-20260922-AAAAAA', created_at: '22-09-2026', telegram_id: '777', username: 'priya_edu', name: 'Priya',
       exam: 'epfo', details: 'Instagram @priya_edu — 25k followers', status: 'pending', suggested_code: 'PRIYAEPFO42' },
@@ -41,7 +52,9 @@ const PAYLOAD = {
       paid_paise: 17910, commission_paise: 3582, status: 'earned', payout_id: '' }
   ],
   payouts: [{ payout_id: 'WD-20260922-CCCCCC', requested_at: '22-09-2026', code: 'RAVI10', exam: 'upsc', influencer_id: '501',
-    username: 'ravi_teaches', name: 'Ravi Kumar', upi_id: 'ravi@okicici', amount_paise: 3582, sales: '1', status: 'requested' }],
+    username: 'ravi_teaches', name: 'Ravi Kumar', upi_id: 'ravi@okicici', amount_paise: 3582, sales: '1', status: 'requested',
+    legal_name: 'Ravi Kumar', phone: '9876543210', email: 'ravi@example.com', payout_method: 'bank',
+    account_holder: 'Ravi Kumar', account_number: '123456789012', ifsc: 'HDFC0001234', pan: '' }],
   totals: { influencers: 2, pendingRequests: 1, activeCodes: 1, openPayouts: 1, uses: 2, revenuePaise: 35820,
     discountPaise: 3980, earnedPaise: 7164, availablePaise: 3582, requestedPaise: 3582, paidPaise: 0 }
 };
@@ -174,6 +187,7 @@ test('the page opens on what needs a decision, with counts on every tab', () => 
   const tabs = byId('tabs').textContent;
   assert.match(tabs, /Applications1/);
   assert.match(tabs, /Withdrawals1/);
+  assert.match(tabs, /Influencers2/);
   assert.match(tabs, /Promo codes1/);
   assert.match(tabs, /Sales2/);
   assert.match(body().textContent, /Applications waiting/, 'the first view should be the waiting application');
@@ -209,11 +223,12 @@ test('approving sends the request id and every term, with the suggested code', a
   assert.equal(sent.body.terms.code, 'PRIYAEPFO42');
 });
 
-test('a withdrawal shows the UPI ID and amount, and marking it paid sends the reference', async () => {
+test('a withdrawal shows everything RazorpayX needs, and marking it paid sends the reference', async () => {
   openTab('payouts');
   const text = body().textContent;
-  assert.match(text, /ravi@okicici/);
-  assert.match(text, /₹35\.82/);
+  for (const s of ['Bank transfer', 'Ravi Kumar', '123456789012', 'HDFC0001234', '9876543210', 'ravi@example.com', '₹35.82']) {
+    assert.ok(text.includes(s), `${s} is missing from the withdrawal`);
+  }
   button('Mark paid…').click();
   byId('pay-WD-20260922-CCCCCC').value = 'UTR412345678901';
   button('I have sent ₹35.82 — mark paid').click();
@@ -231,9 +246,37 @@ test('each code shows its terms and what is owed, and opens into its sales', () 
   assert.match(text, /min ₹100/);
   assert.match(text, /₹71\.64/, 'owed = available + requested');
   const row = walk(body()).find((n) => n.tagName === 'TR' && /inf-row/.test(n.className));
+  assert.match(text, /2 joined/);
+  assert.match(text, /3 opened the link/);
   row.click();
+  assert.match(body().textContent, /Students who joined with RAVI10 \(2\)/);
+  assert.match(body().textContent, /Opened the link, not paid yet \(1\)/);
+  assert.match(body().textContent, /Sai/);
+  assert.match(body().textContent, /9003/);
   assert.match(body().textContent, /pay_AAA/);
   assert.match(body().textContent, /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
+});
+
+test('the Influencers tab has everyone, how to pay them, and what is missing', () => {
+  openTab('people');
+  const text = body().textContent;
+  assert.match(text, /Ravi Kumar \(@ravi_teaches\)/);
+  assert.match(text, /ready to pay/);
+  assert.match(text, /ravi@okicici/);
+  assert.match(text, /9876543210/);
+  assert.match(text, /Priya/);
+  assert.match(text, /details missing/);
+  assert.match(text, /Mobile number, Email, UPI ID/);
+  assert.match(text, /application waiting/);
+});
+
+test('searching a student\'s name finds the code they joined with', () => {
+  openTab('codes');
+  byId('searchInput').value = 'meena';
+  (byId('searchInput').listeners.input || []).forEach((fn) => fn({}));
+  assert.match(body().textContent, /RAVI10/);
+  byId('searchInput').value = '';
+  (byId('searchInput').listeners.input || []).forEach((fn) => fn({}));
 });
 
 test('every sale is listed with both sides\' ids and the money', () => {

@@ -336,6 +336,14 @@ at 0% again, and fixing it never needs the Apps Script pasted into five sheets.
 
 ## The bot: what people see
 
+**Speed.** A bot that is slow to answer is rejected by Telegram's ad review. `/start` never
+waits on a spreadsheet: the settings it could use (the welcome note) are read behind the
+reply and are there from the next greeting on. Bot settings and member lookups read the
+sheet directly through the Sheets API (about 0.5 s) instead of the Apps Script (2–4 s),
+settings are served from memory while a refresh runs behind them, and the deployment runs
+in Frankfurt (`fra1`), next to Telegram's servers. The daily sweep also puts back any bot
+menu that has drifted from `src/bot-commands.js`.
+
 Three things live on Telegram's servers rather than in this repository — the
 description shown **before** anyone presses Start, the line under the bot's name,
 and the ☰ Menu. Nothing in a deploy touches them, so they drift. `npm run bot-profile`
@@ -377,8 +385,8 @@ code. It replaced the member-to-member referral system, which was hard to track 
 
 | | |
 |---|---|
-| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and says where they will promote it · `/upi` sets where they are paid · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
-| **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · marks a withdrawal paid (with the UPI reference) or rejects it · pauses, resumes or re-terms a code |
+| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and says where they will promote it · `/payout` gives and changes what RazorpayX needs to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
+| **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · pays a withdrawal from RazorpayX using the **Pay to** details beside it, then marks it paid with the reference · sees every influencer's payout details and whether they are complete · opens a code to see every student who joined with it and everyone who opened the link but has not paid · pauses, resumes or re-terms a code |
 | **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
 **One code, one exam.** Influencers apply per exam — APPSC Newspaper, Sadhana APPSC, UPSC,
@@ -394,6 +402,9 @@ code, an expiry date, a maximum number of uses, and one use per student. The for
 one sale looks like — the student pays ₹179.10, the influencer earns ₹35.82, you keep ₹143.28.
 A code can never shadow an existing coupon, an influencer cannot use their own code, and a
 discount that would take the pass below ₹1 is refused.
+
+**Withdrawals need complete payout details** — everything a RazorpayX payout needs — and the
+request keeps a copy of them, so changing a UPI ID afterwards never redirects money already asked for.
 
 **Money.** The commission is worked out when the student taps Pay and rides in the Razorpay
 notes, so changing a code's terms never changes what a sale already earned. It is credited
@@ -412,11 +423,12 @@ created on first use —
 
 | Tab | One row per |
 |---|---|
-| **Influencers** | person: Telegram id, name, UPI ID |
+| **Influencers** | person: Telegram id, name, and payout details — legal name, mobile, email, method, UPI ID or bank account and IFSC, PAN, and whether they are complete |
 | **Requests** | application: exam, what they wrote, pending / approved / rejected, who decided |
 | **Codes** | approved code: exam, every term, status, and live Uses / Revenue / Commission Earned / Commission Paid |
 | **Sales** | payment made with a code: student, payment id, list price, discount, paid, commission, available / requested / paid |
-| **Payouts** | withdrawal: UPI ID, amount, the sales it covers, paid (with reference) or rejected |
+| **Payouts** | withdrawal: amount, the sales it covers, the payout details as they were when it was asked for, paid (with reference) or rejected |
+| **Link Opens** | student who opened an influencer's link, once per code |
 | **Log** | every decision and who made it |
 
 Money is written in rupees for people and read back in paise for arithmetic. Columns are

@@ -797,21 +797,29 @@ function hasMedia(message) {
  *
  * @param {{load: Function, ttlMs?: number, failureTtlMs?: number, now?: Function}} options
  */
-function createSettingsCache({ load, ttlMs = 60000, failureTtlMs = 30000, now = Date.now }) {
+function createSettingsCache({
+  load, ttlMs = 60000, failureTtlMs = 30000, staleMs = 30 * 60 * 1000, now = Date.now, background = null
+}) {
   let cached = null;
+  let loaded = false;      // cached came from the sheet, not from defaults
+  let loadedAt = 0;
   let expiresAt = 0;
   let inflight = null;
 
-  async function get() {
-    if (cached && now() < expiresAt) return cached;
+  function refresh() {
     if (inflight) return inflight;
     inflight = (async () => {
       try {
         cached = normaliseSettings(await load());
-        expiresAt = now() + ttlMs;
+        loaded = true;
+        loadedAt = now();
+        expiresAt = loadedAt + ttlMs;
       } catch (err) {
-        console.error('[support] could not read bot settings, using defaults:', err.message);
-        cached = normaliseSettings({});
+        console.error('[support] could not read bot settings:', err.message);
+        // Keep what the sheet last said rather than falling back to defaults:
+        // defaults would quote the built-in price to a student while an admin
+        // has set another one.
+        if (!loaded) cached = normaliseSettings({});
         expiresAt = now() + failureTtlMs;
       } finally {
         inflight = null;
@@ -821,12 +829,33 @@ function createSettingsCache({ load, ttlMs = 60000, failureTtlMs = 30000, now = 
     return inflight;
   }
 
+  /**
+   * get — fresh settings when they are fresh; the last ones read, at once,
+   * while a refresh runs behind them, when they are merely stale. Only an
+   * instance with nothing at all, or something older than `staleMs`, waits.
+   */
+  async function get() {
+    if (cached && now() < expiresAt) return cached;
+    if (cached && loaded && now() - loadedAt < staleMs) {
+      const work = refresh();
+      if (background) background(work);
+      return cached;
+    }
+    return refresh();
+  }
+
+  /** Whatever is held right now, without waiting — null before the first read. */
+  function peek() {
+    return loaded ? cached : null;
+  }
+
   function invalidate() {
     cached = null;
+    loaded = false;
     expiresAt = 0;
   }
 
-  return { get, invalidate };
+  return { get, peek, refresh, invalidate };
 }
 
 /**

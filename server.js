@@ -742,14 +742,27 @@ async function handleAffiliateRoute(pathname, method, req, res, user) {
   }
 
   if (pathname === '/api/affiliates' && method === 'GET') {
-    const { influencers, requests, codes, sales, payouts } = await affiliateStore.overview();
+    const { influencers, requests, codes, sales, payouts, opens } = await affiliateStore.overview();
     const exams = affiliates.listExams();
     const passes = await Promise.all(exams.map((exam) => examPass(exam).catch(() => null)));
     const upiOf = new Map(influencers.map((i) => [i.telegram_id, i.upi_id]));
 
     const codeRows = codes.map((code) => {
       const mine = sales.filter((sale) => String(sale.code).toUpperCase() === String(code.code).toUpperCase());
-      return Object.assign({}, code, { stats: affiliates.summarise(mine), upi_id: upiOf.get(code.telegram_id) || '' });
+      const opened = opens.filter((o) => String(o.code).toUpperCase() === String(code.code).toUpperCase());
+      const paidIds = new Set(mine.filter((sale) => sale.status !== 'cancelled').map((sale) => sale.student_id));
+      return Object.assign({}, code, {
+        stats: Object.assign(affiliates.summarise(mine), {
+          opens: opened.length,
+          // Opened the link and paid — from either side, so a student who
+          // typed the code without opening the link still counts as joined.
+          openedAndPaid: opened.filter((o) => paidIds.has(o.student_id)).length
+        }),
+        upi_id: upiOf.get(code.telegram_id) || '',
+        // Who looked and has not paid: the people an influencer's audience
+        // is losing between the link and the checkout.
+        notYetPaid: opened.filter((o) => !paidIds.has(o.student_id)).reverse()
+      });
     });
     const totals = affiliates.summarise(sales);
 
@@ -762,7 +775,20 @@ async function handleAffiliateRoute(pathname, method, req, res, user) {
           id: exam.id, label: exam.label, botEnv: exam.botEnv,
           pricePaise: passes[i] ? passes[i].amountPaise : null
         })),
-        influencers,
+        // One row per person, with their payout details and totals across
+        // every code they hold.
+        influencers: influencers.map((person) => {
+          const theirCodes = codes.filter((c) => c.telegram_id === person.telegram_id);
+          const theirSales = sales.filter((sale) => theirCodes.some((c) =>
+            String(c.code).toUpperCase() === String(sale.code).toUpperCase()));
+          return Object.assign({}, person, {
+            payout: affiliates.payoutDetails(person),
+            codes: theirCodes.map((c) => ({ code: c.code, exam: c.exam, status: c.status })),
+            stats: affiliates.summarise(theirSales),
+            pendingApplications: requests.filter((r) => r.telegram_id === person.telegram_id && r.status === 'pending').length
+          });
+        }),
+        opens: opens.slice().reverse(),
         // Newest first: the question is almost always "what just came in".
         requests: requests.slice().reverse().map((r) => Object.assign({}, r, {
           suggested_code: r.status === 'pending' ? affiliates.suggestCode(r, r.exam) : ''
@@ -933,6 +959,7 @@ async function recordAffiliateSale(notes, paymentId, paidPaise) {
       group: group.shortName,
       student_id: notes.telegram_id,
       student_username: notes.telegram_username || '',
+      student_name: notes.student_name || '',
       payment_id: paymentId,
       list_price_paise: Math.round((Number(notes.original_amount) || 0) * 100),
       discount_paise: Math.round((Number(notes.discount_amount) || 0) * 100),

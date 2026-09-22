@@ -449,9 +449,24 @@ test('/start still greets when the settings sheet fails, and includes the welcom
   assert.equal(failing.messages(STUDENT.id)[0].args[2].reply_markup.inline_keyboard[0][0].callback_data,
     'go:plans');
 
+  // The very first /start on a fresh instance does not wait for the sheet;
+  // the note is read behind it and is there from the next greeting on.
   const noted = makeBot({ sheet: fakeSheet({ getBotSettings: { welcome_note: 'Exam special this week' } }) });
   await noted.deliver(privateMessage('/start'));
-  assert.match(noted.messages(STUDENT.id)[0].args[1], /Exam special this week/);
+  await noted.deliver(privateMessage('/start'));
+  assert.match(noted.messages(STUDENT.id)[1].args[1], /Exam special this week/);
+});
+
+test('/start answers at once even when the settings sheet never answers', async () => {
+  // What the Telegram ad reviewer measures. /start used to wait up to 2.5 s
+  // on the settings sheet before saying a word.
+  const hung = makeBot({ sheet: fakeSheet({ getBotSettings: () => new Promise(() => {}) }) });
+  hung.app.bot.processUpdate({ update_id: 1, message: {
+    message_id: 1, date: 1, from: STUDENT, chat: { id: STUDENT.id, type: 'private' }, text: '/start' } });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(hung.messages(STUDENT.id).length, 1, '/start waited on the sheet');
+  assert.match(hung.messages(STUDENT.id)[0].args[1], /Welcome to/);
 });
 
 test('/help points at support with a button', async () => {

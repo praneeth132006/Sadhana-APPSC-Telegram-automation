@@ -44,7 +44,7 @@ const AFFILIATE_COMMANDS = [
   { command: 'apply', description: 'Apply to promote an exam' },
   { command: 'codes', description: 'Your promo codes, sales and earnings' },
   { command: 'withdraw', description: 'Withdraw what you have earned' },
-  { command: 'upi', description: 'Set the UPI ID we pay you on' },
+  { command: 'payout', description: 'Your payout details: UPI or bank, name, phone' },
   { command: 'help', description: 'How the programme works' },
   { command: 'support', description: 'Ask the admin a question' },
   { command: 'terms', description: 'Programme terms' }

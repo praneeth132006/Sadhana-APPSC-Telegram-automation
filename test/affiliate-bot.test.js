@@ -105,7 +105,7 @@ test('the welcome explains the programme and offers the four actions', async () 
   const { say } = makeBot();
   const out = await say('/start');
   assert.match(out[0].args[1], /Welcome to our influencer programme/);
-  assert.deepEqual(buttons(out).map((b) => b.callback_data), ['aff:apply', 'aff:codes', 'aff:withdraw', 'aff:upi']);
+  assert.deepEqual(buttons(out).map((b) => b.callback_data), ['aff:apply', 'aff:codes', 'aff:withdraw', 'aff:payout']);
 });
 
 test('applying: choose an exam, describe the promotion, and the admin is alerted', async () => {
@@ -126,7 +126,8 @@ test('applying: choose an exam, describe the promotion, and the admin is alerted
     'Ravi Kumar — youtube.com/@ravi_teaches — 40k subscribers');
   assert.match(done[0].args[1], /Application sent for UPSC/);
   assert.match(done[0].args[1], /REQ-\d{8}-/);
-  assert.match(done[0].args[1], /set the UPI ID/, 'no UPI yet, so they are nudged');
+  assert.match(done[0].args[1], /add your payout details/, 'no payout details yet, so they are nudged');
+  assert.equal(done[0].args[2].reply_markup.inline_keyboard[0][0].callback_data, 'aff:payout');
 
   // In the sheet, as the admin will see it.
   const [header, row] = book.Requests;
@@ -161,17 +162,58 @@ test('a one-line application is sent back for more detail', async () => {
   assert.ok(!book.Requests || book.Requests.length <= 1);
 });
 
-test('the UPI ID is checked, saved, and shown back', async () => {
+test('payout details: each is asked for, checked, saved, and can be changed', async () => {
   const { tap, answer } = makeBot();
-  const prompt = await tap('aff:upi');
-  assert.ok(prompt[0].args[1].startsWith(PROMPT.upi));
+  const card = await tap('aff:payout');
+  assert.match(card[0].args[1], /Your payout details/);
+  assert.match(card[0].args[1], /Still needed: <b>Name as on your bank account, Mobile number, Email, UPI ID<\/b>/);
+  const data = buttons(card).map((b) => b.callback_data);
+  for (const d of ['aff:set:legal_name', 'aff:set:phone', 'aff:set:email', 'aff:set:upi_id', 'aff:set:bank', 'aff:set:pan', 'aff:method:upi', 'aff:method:bank']) {
+    assert.ok(data.includes(d), `no ${d} button`);
+  }
+
+  const phonePrompt = await tap('aff:set:phone');
+  assert.ok(phonePrompt[0].args[1].startsWith(PROMPT.phone));
+  assert.match(textOf(await answer(PROMPT.phone, '12345')), /10-digit Indian mobile/);
+  assert.match(textOf(await answer(PROMPT.phone, '+91 98765 43210')), /Saved: <b>Mobile number<\/b>[\s\S]*Mobile: <b>9876543210<\/b>/);
+  await answer(PROMPT.legal_name, 'Ravi Kumar');
+  await answer(PROMPT.email, 'Ravi@Gmail.com');
   assert.match(textOf(await answer(PROMPT.upi, 'not-a-upi')), /does not look like a UPI ID/);
-  assert.match(textOf(await answer(PROMPT.upi, 'ravi@okicici')), /UPI ID saved: <code>ravi@okicici<\/code>/);
-  assert.equal((await store.getInfluencer(501)).upi_id, 'ravi@okicici');
+  const done = await answer(PROMPT.upi, 'ravi@okicici');
+  assert.match(textOf(done), /All set/);
+  assert.ok(buttons(done).some((b) => b.text === '💳 Change UPI ID'), 'no obvious way to change the UPI ID');
+
+  // Changing it is the same button.
+  await tap('aff:set:upi_id');
+  assert.match(textOf(await answer(PROMPT.upi, 'ravi@okaxis')), /UPI ID: <b>ravi@okaxis<\/b>/);
+
+  // A bank account, in one reply, switches the payout method.
+  assert.match(textOf(await answer(PROMPT.bank, 'Ravi Kumar')), /three lines/);
+  const bank = await answer(PROMPT.bank, 'Ravi Kumar\n1234 5678 9012\nhdfc0001234');
+  assert.match(textOf(bank), /paid by bank transfer/);
+  assert.match(textOf(bank), /XXXXXXXX9012/);
+  assert.doesNotMatch(textOf(bank), /123456789012/, 'the full account number was shown in chat');
+  const row = await store.getInfluencer(501);
+  assert.deepEqual([row.payout_method, row.ifsc, row.phone, row.email, row.details_complete],
+    ['bank', 'HDFC0001234', '9876543210', 'ravi@gmail.com', 'yes']);
+  assert.match(textOf(await tap('aff:method:upi')), /paid by <b>UPI<\/b>/);
+  assert.equal((await store.getInfluencer(501)).payout_method, 'upi');
+});
+
+test('/upi and /bank open the same payout screen', async () => {
+  const { say } = makeBot();
+  assert.match(textOf(await say('/upi')), /Your payout details/);
+  assert.match(textOf(await say('/bank')), /Your payout details/);
 });
 
 test('codes: terms, share link, sales and earnings, and a Withdraw button when it is due', async () => {
   const { say, answer } = makeBot();
+  const giveDetails = async () => {
+    await answer(PROMPT.legal_name, 'Ravi Kumar');
+    await answer(PROMPT.phone, '9876543210');
+    await answer(PROMPT.email, 'ravi@gmail.com');
+    await answer(PROMPT.upi, 'ravi@okicici');
+  };
   const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube, 40k subscribers');
   const terms = affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
     commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
@@ -187,10 +229,11 @@ test('codes: terms, share link, sales and earnings, and a Withdraw button when i
   assert.match(noUpi[0].args[1], /Students joined: <b>1<\/b>/);
   assert.match(noUpi[0].args[1], /Available: <b>₹35\.82<\/b>/);
   assert.match(noUpi[0].args[1], /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
-  assert.match(noUpi[0].args[1], /No UPI ID yet/);
-  assert.ok(!buttons(noUpi).some((b) => /^aff:wd:/.test(b.callback_data || '')), 'withdraw offered with no UPI ID');
+  assert.match(noUpi[0].args[1], /Payout details missing/);
+  assert.ok(buttons(noUpi).some((b) => b.callback_data === 'aff:payout'));
+  assert.ok(!buttons(noUpi).some((b) => /^aff:wd:/.test(b.callback_data || '')), 'withdraw offered without payout details');
 
-  await answer(PROMPT.upi, 'ravi@okicici');
+  await giveDetails();
   const ready = await say('/codes');
   assert.ok(buttons(ready).some((b) => b.callback_data === 'aff:wd:RAVI10'));
   assert.ok(buttons(ready).some((b) => /^https:\/\/t\.me\/share\/url/.test(b.url || '')));
@@ -203,6 +246,12 @@ test('withdrawing: the request, the admin alert, and no second request for the s
     commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
   await store.approveRequest(applied.request.request_id, Object.assign({}, terms, { code: 'RAVI10' }), 'Admin');
   await store.recordSale({ code: 'RAVI10', payment_id: 'pay_1', student_id: 900, paid_paise: 17910, commission_paise: 3582 });
+  const early = await tap('aff:wd:RAVI10');
+  assert.match(early[0].args[1], /Add your payout details first/);
+  assert.equal(early[0].args[2].reply_markup.inline_keyboard[0][0].callback_data, 'aff:payout');
+  await answer(PROMPT.legal_name, 'Ravi Kumar');
+  await answer(PROMPT.phone, '9876543210');
+  await answer(PROMPT.email, 'ravi@gmail.com');
   await answer(PROMPT.upi, 'ravi@okicici');
   alerts.length = 0;
 

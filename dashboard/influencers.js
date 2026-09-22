@@ -280,7 +280,8 @@ function renderHowItWorks() {
     ])]),
     el('div', {}, [el('h3', { text: 'What you do here' }), steps([
       'Applications: approve with the student discount, their commission, the payout cycle and minimum — or reject with a reason.',
-      'Withdrawals: send the money over UPI first, then mark it paid with the UPI reference. Rejecting puts it back in their balance.',
+      'Withdrawals: pay from RazorpayX using the Pay to details shown (name, mobile, email, UPI ID or bank account), then mark it paid with the payout reference. Rejecting puts it back in their balance.',
+      'Influencers: everyone\'s contact and payout details in one place, and whether they are complete.',
       'Promo codes: pause a code to stop it being used, or change its terms. Past sales keep what they earned.'
     ])]),
     el('div', {}, [el('h3', { text: 'Rules the bots enforce' }), steps([
@@ -308,6 +309,7 @@ function renderStats() {
 const TABS = [
   { id: 'requests', label: 'Applications', count: () => pendingRequests().length, alert: true },
   { id: 'payouts', label: 'Withdrawals', count: () => openPayouts().length, alert: true },
+  { id: 'people', label: 'Influencers', count: () => (data.influencers || []).length },
   { id: 'codes', label: 'Promo codes', count: () => (data.codes || []).length },
   { id: 'sales', label: 'Sales', count: () => (data.sales || []).length },
   { id: 'history', label: 'History', count: () => historyRows().length }
@@ -337,7 +339,7 @@ function renderActiveTab() {
     return;
   }
   const view = {
-    requests: requestsPanel, payouts: payoutsPanel, codes: codesPanel, sales: salesPanel, history: historyPanel
+    requests: requestsPanel, payouts: payoutsPanel, people: peoplePanel, codes: codesPanel, sales: salesPanel, history: historyPanel
   }[activeTab] || requestsPanel;
   replaceChildren(host, view());
 }
@@ -402,11 +404,31 @@ function openPayouts() {
   return (data.payouts || []).filter((p) => p.status === 'requested');
 }
 
+/**
+ * payTo — everything RazorpayX needs for one payout, each value copyable:
+ * the contact (name, mobile, email) and the fund account (UPI ID, or bank
+ * account with IFSC). Missing values are shown as missing, not hidden.
+ */
+function payTo(p) {
+  const bank = String(p.payout_method || '').toLowerCase() === 'bank';
+  const item = (label, value) => el('div', {}, el('span', { class: 'inf-sub', text: label + ' ' }),
+    value ? copyable(value) : el('span', { class: 'pc-warn', text: 'missing' }));
+  return el('div', { class: 'inf-payto' },
+    el('div', {}, pill(bank ? '🏦 Bank transfer' : '💳 UPI', bank ? 'info' : 'ok')),
+    item('Name', p.legal_name),
+    bank ? item('A/c', p.account_number) : item('UPI', p.upi_id),
+    bank ? item('IFSC', p.ifsc) : null,
+    bank && p.account_holder && p.account_holder !== p.legal_name ? item('Holder', p.account_holder) : null,
+    item('Mobile', p.phone),
+    item('Email', p.email),
+    p.pan ? item('PAN', p.pan) : null);
+}
+
 function payoutsPanel() {
   const open = openPayouts().filter((p) => examMatches(p.exam) &&
-    searchMatches(p.name, p.username, p.influencer_id, p.code, p.upi_id, p.payout_id));
+    searchMatches(p.name, p.username, p.influencer_id, p.code, p.upi_id, p.payout_id, p.legal_name, p.phone, p.email, p.account_number));
   const title = '💸 Withdrawals to pay';
-  const subtitle = 'Send the money over UPI first, then mark it paid with the reference — the influencer is told';
+  const subtitle = 'Pay it from RazorpayX using the details shown, then mark it paid with the payout reference — the influencer is told';
   if (!open.length) {
     return panel(title, subtitle, emptyState('✅', openPayouts().length ? 'No withdrawal matches the filters.' : 'No withdrawals waiting.',
       'Influencers request them from the bot once their cycle comes round.'));
@@ -420,7 +442,7 @@ function payoutsPanel() {
     rows.push(el('tr', {},
       el('td', {}, el('div', { text: who(p.name, p.username, '') }), el('div', { class: 'inf-sub' }, copyable(p.influencer_id))),
       el('td', {}, el('code', { class: 'pc-code', text: p.code }), el('div', { class: 'inf-sub', text: examLabel(p.exam) })),
-      el('td', {}, copyable(p.upi_id)),
+      el('td', {}, payTo(p)),
       el('td', {}, el('div', { class: 'inf-money', text: rupees(p.amount_paise) }), el('div', { class: 'inf-sub', text: `${p.sales} sale(s)` })),
       el('td', {}, el('div', { text: p.requested_at }), el('div', { class: 'inf-sub inf-id', text: p.payout_id })),
       el('td', {}, el('div', { class: 'inf-actions' }, paid, reject))));
@@ -428,19 +450,49 @@ function payoutsPanel() {
     if (openForm === `paid:${p.payout_id}` || openForm === `rejectpay:${p.payout_id}`) {
       const isPaid = openForm.startsWith('paid:');
       const input = el('input', { id: `pay-${p.payout_id}`, class: 'field-input', type: 'text', maxlength: isPaid ? '100' : '500',
-        placeholder: isPaid ? 'UPI reference / UTR of the transfer' : 'Shown to the influencer, e.g. "UPI ID is wrong"' });
+        placeholder: isPaid ? 'RazorpayX payout id or UTR, e.g. pout_Nx… or 412345678901' : 'Shown to the influencer, e.g. "UPI ID is wrong"' });
       const confirm = el('button', { class: 'btn btn-primary', text: isPaid ? `I have sent ${rupees(p.amount_paise)} — mark paid` : 'Reject withdrawal' });
       confirm.addEventListener('click', () => post('/api/affiliates/payout', {
         payoutId: p.payout_id, decision: isPaid ? 'paid' : 'rejected', reference: isPaid ? input.value : '', reason: isPaid ? '' : input.value
       }, confirm, 'Saving…'));
       rows.push(el('tr', { class: 'inf-form-row' }, el('td', { colspan: '6' }, el('div', { class: 'pc-form' },
-        field(isPaid ? `UPI reference for ${rupees(p.amount_paise)} to ${p.upi_id}` : 'Reason', input,
+        field(isPaid ? `Payment reference for ${rupees(p.amount_paise)} to ${p.legal_name || p.name || p.upi_id}` : 'Reason', input,
           isPaid ? 'Required. The influencer is sent this so they can find the payment.' : 'Its sales go back to their balance.'),
         el('div', { class: 'support-actions end' },
           el('button', { class: 'btn btn-ghost', text: 'Cancel', onclick: () => { openForm = null; renderActiveTab(); } }), confirm)))));
     }
   }
-  return panel(title, subtitle, el('div', { class: 'table-wrap' }, table(['Influencer', 'Code', 'UPI ID', 'Amount', 'Requested', ''], rows)));
+  return panel(title, subtitle, el('div', { class: 'table-wrap' }, table(['Influencer', 'Code', 'Pay to', 'Amount', 'Requested', ''], rows)));
+}
+
+// ---------------------------------------------------------------------------
+// Influencers — one row per person
+// ---------------------------------------------------------------------------
+
+function peoplePanel() {
+  const all = data.influencers || [];
+  const people = all.filter((p) => searchMatches(p.name, p.username, p.telegram_id, p.legal_name, p.phone, p.email, p.upi_id,
+    (p.codes || []).map((c) => c.code).join(' ')) &&
+    ($('examFilter').value === 'all' || (p.codes || []).some((c) => examMatches(c.exam))));
+  const title = '🤝 Influencers';
+  const subtitle = 'Everyone who has used the influencer bot: how to reach and pay them, their codes, and where their money stands';
+  if (!all.length) return panel(title, subtitle, emptyState('🤝', 'Nobody has used the influencer bot yet.'));
+  if (!people.length) return panel(title, subtitle, emptyState('🔍', 'Nobody matches those filters.'));
+  const rows = people.map((p) => el('tr', {},
+    el('td', {}, el('div', { text: who(p.name, p.username, '') }), el('div', { class: 'inf-sub' }, copyable(p.telegram_id)),
+      el('div', { class: 'inf-sub', text: `since ${String(p.joined_at || '').slice(0, 10)}` })),
+    el('td', {}, payTo(p)),
+    el('td', {}, p.payout && p.payout.complete ? pill('ready to pay', 'ok')
+      : el('div', {}, pill('details missing', 'warn'), el('div', { class: 'inf-sub', text: (p.payout ? p.payout.missingLabels : []).join(', ') }))),
+    el('td', {}, (p.codes || []).length
+      ? el('div', { class: 'inf-actions' }, p.codes.map((c) => el('span', {}, el('code', { class: 'pc-code', text: c.code }),
+        el('span', { class: 'inf-sub', text: ` ${examLabel(c.exam)}${c.status === 'active' ? '' : ' · ' + c.status}` }))))
+      : el('span', { class: 'inf-sub', text: p.pendingApplications ? 'application waiting' : 'no code yet' })),
+    el('td', { text: num((p.stats || {}).uses || 0) }),
+    el('td', {}, el('div', { class: 'inf-money', text: rupees(((p.stats || {}).availablePaise || 0) + ((p.stats || {}).requestedPaise || 0)) }),
+      el('div', { class: 'inf-sub', text: `earned ${rupees((p.stats || {}).earnedPaise)} · paid ${rupees((p.stats || {}).paidPaise)}` }))));
+  return panel(title, subtitle, el('div', { class: 'table-wrap' },
+    table(['Influencer', 'Pay to', 'Payout details', 'Codes', 'Students', 'Owed'], rows)));
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +521,8 @@ const SALE_HEADERS = ['When', 'Code', 'Group', 'Student', 'Payment ID', 'List', 
 function codesPanel() {
   const all = data.codes || [];
   const codes = all.filter((c) => examMatches(c.exam) &&
-    searchMatches(c.code, c.name, c.username, c.telegram_id, c.upi_id) &&
+    searchMatches(c.code, c.name, c.username, c.telegram_id, c.upi_id,
+      (data.sales || []).filter((sale) => sale.code === c.code).map((sale) => `${sale.student_name} ${sale.student_username} ${sale.student_id}`).join(' ')) &&
     (filters.codeStatus === 'all' || (filters.codeStatus === 'owed'
       ? c.stats.availablePaise + c.stats.requestedPaise > 0 : c.status === filters.codeStatus)));
   const bar = filterBar([['Status', statusSelect('codeStatus', [
@@ -501,7 +554,8 @@ function codesPanel() {
       el('td', {}, el('div', { text: who(c.name, c.username, '') }), el('div', { class: 'inf-sub' }, copyable(c.telegram_id))),
       el('td', {}, el('div', { text: describeDiscount(c) }), el('div', { class: 'inf-sub', text: describeCommission(c) })),
       el('td', {}, el('div', { text: c.payout_cycle }), el('div', { class: 'inf-sub', text: Number(c.min_payout) ? `min ₹${c.min_payout}` : 'no minimum' })),
-      el('td', { text: num(c.stats.uses) }),
+      el('td', {}, el('div', { text: `${num(c.stats.uses)} joined` }),
+        el('div', { class: 'inf-sub', text: `${num(c.stats.opens || 0)} opened the link` })),
       el('td', { text: rupees(c.stats.revenuePaise) }),
       el('td', {}, el('div', { class: 'inf-money', text: rupees(c.stats.availablePaise + c.stats.requestedPaise) }),
         el('div', { class: 'inf-sub', text: `paid ${rupees(c.stats.paidPaise)}` })),
@@ -528,12 +582,18 @@ function codesPanel() {
           el('span', {}, 'Link: ', copyable(c.share_link)),
           el('span', { text: c.expires_on ? `Valid until ${c.expires_on}` : 'No end date' }),
           el('span', { text: c.max_uses ? `Up to ${c.max_uses} uses` : 'Unlimited uses' })),
+        el('h4', { class: 'inf-subhead', text: `👥 Students who joined with ${c.code} (${sales.length})` }),
         sales.length ? el('div', { class: 'table-wrap' }, table(SALE_HEADERS, saleRows(sales)))
-          : el('p', { class: 'hint-text', text: 'No sales with this code yet.' }))));
+          : el('p', { class: 'hint-text', text: 'Nobody has paid with this code yet.' }),
+        el('h4', { class: 'inf-subhead', text: `👀 Opened the link, not paid yet (${(c.notYetPaid || []).length})` }),
+        (c.notYetPaid || []).length
+          ? el('div', { class: 'table-wrap' }, table(['When', 'Student', 'Telegram ID'], c.notYetPaid.map((o) => el('tr', {},
+            el('td', { text: o.timestamp }), el('td', { text: who(o.student_name, o.student_username, '') }), el('td', {}, copyable(o.student_id))))))
+          : el('p', { class: 'hint-text', text: 'Everyone who opened the link has paid — or nobody has opened it yet.' }))));
     }
   }
   return panel(title, subtitle, [bar, el('div', { class: 'table-wrap' },
-    table(['Code', 'Exam', 'Influencer', 'Terms', 'Payouts', 'Uses', 'Revenue', 'Owed', 'Status', ''], rows))]);
+    table(['Code', 'Exam', 'Influencer', 'Terms', 'Payouts', 'Students', 'Revenue', 'Owed', 'Status', ''], rows))]);
 }
 
 function salesPanel() {
