@@ -3203,3 +3203,39 @@ test('Analytics never shows the referral tabs as subjects', async () => {
     clientStubs.getAnalytics = original;
   }
 });
+
+// ===========================================================================
+// Members analysis, and pages shown once per payment bot
+// ===========================================================================
+
+test('GET /api/members/analysis reads every page of members and breaks them down', async () => {
+  const rows = (n, extra) => Array.from({ length: n }, (_, i) => Object.assign({
+    telegram_id: String(1000 + i), plan: 'exam_pass', plan_label: 'Target 2026 Pass', status: 'active',
+    amount: 199, total_paid: 199, renewals: 1, joined_at: '20-09-2026, 10:00:00 AM IST', expiry_date: '30-11-2099'
+  }, extra));
+  const pages = { 1: rows(500), 2: rows(3, { status: 'expired', amount: 179.1, total_paid: 179.1 }) };
+  stub(sheets, 'listSubscribers', (opts) => ({ total: 503, page: Number(opts.page), totalPages: 2, subscribers: pages[opts.page] || [] }));
+  stub(sheets, 'getBotSettings', {});
+  try {
+    calls.length = 0;
+    const res = await authed('/api/members/analysis');
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    const a = res.json.data;
+    assert.equal(a.totals.members, 503, 'the second page of members was missed');
+    assert.deepEqual(a.status.map((s) => [s.key, s.count]), [['active', 500], ['expired', 3]]);
+    assert.deepEqual(a.price.map((s) => [s.key, s.count]), [['full', 500], ['discounted', 3]]);
+    const asked = calls.filter((c) => c.name === 'listSubscribers').map((c) => c.args[0]);
+    assert.deepEqual(asked.map((q) => [q.page, q.pageSize]), [['1', '500'], ['2', '500']]);
+    assert.equal((await call('/api/members/analysis?group=appsc_news_en')).status, 401);
+  } finally {
+    stub(sheets, 'listSubscribers', { total: 1, page: 1, totalPages: 1, subscribers: [{ telegram_id: '555' }] });
+  }
+});
+
+test('GET /api/groups says which payment bot sells each group, so shared pages show once per bot', async () => {
+  const res = await authed('/api/groups');
+  const en = res.json.data.find((g) => g.id === 'appsc_news_en');
+  const te = res.json.data.find((g) => g.id === 'appsc_news_te');
+  assert.equal(en.paymentBotEnv, 'TELEGRAM_PAYBOT_NEWS');
+  if (te) assert.equal(te.paymentBotEnv, en.paymentBotEnv);
+});

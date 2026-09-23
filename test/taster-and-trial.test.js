@@ -130,6 +130,16 @@ test('the welcome sells nothing: no price, no pay button, just Continue', async 
   assert.deepEqual(buttons(out).map((b) => b.callback_data), ['go:plans']);
 });
 
+test('the welcome points down to Continue, with no "Need help" line', async () => {
+  const { say } = makeBot();
+  const out = await say('/start');
+  const text = textOf(out);
+  assert.match(text, /Tap <b>Continue<\/b> below 👇 to see the pass\./);
+  assert.doesNotMatch(text, /Need help/);
+  assert.doesNotMatch(text, /\/support/);
+  assert.deepEqual(buttons(out).map((b) => b.text), ['Continue ⬇️']);
+});
+
 test('Continue asks the language, and picking one starts the questions — not the price', async () => {
   const { tap } = makeBot({ payBotEnv: 'TELEGRAM_PAYBOT_NEWS' });
   const ask = await tap('go:plans');

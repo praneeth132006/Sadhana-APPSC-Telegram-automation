@@ -347,15 +347,10 @@ function renderRedemptions() {
   replaceChildren($('redemptionPanel'), panel('🧾 Recent coupon uses', 'Newest first, from the Coupon Redemptions tab', body));
 }
 
-function renderNotices(context) {
-  replaceChildren($('notices'), context && !context.isPrimary
-    ? el('div', { class: 'sp-notices' }, [el('div', { class: 'banner tone-info' }, [
-      el('div', { class: 'banner-body' }, [
-        el('strong', { text: 'Shared bot. ' }),
-        el('span', { text: `This group uses the same payment bot as ${context.primaryGroupName}. The pass and coupons below apply to both.` })
-      ])
-    ])])
-    : null);
+function renderNotices() {
+  // English and Telugu share one pass and one set of coupons; the switcher
+  // at the top already names both, so there is nothing to warn about.
+  replaceChildren($('notices'));
 }
 
 async function load() {
@@ -363,7 +358,7 @@ async function load() {
   replaceChildren($('passPanel'), el('div', { class: 'loading-row' }, [el('div', { class: 'spinner' }), el('span', { text: 'Loading the pass and coupons…' })]));
   try {
     data = await api('/api/pricing');
-    renderNotices(data.context);
+    renderNotices();
     renderPass();
     renderCoupons();
     renderRedemptions();

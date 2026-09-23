@@ -762,11 +762,10 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     `Hello ${esc(name)}! ` + ABOUT_TEXT + '\n\n' +
     note +
     (promo ? `🎁 Promo code <b>${esc(promo)}</b> will be applied on the next screen.\n\n` : '') +
-    'Tap <b>Continue →</b> to see the pass.\n\n' +
-    '<i>Need help? Send /support.</i>',
+    'Tap <b>Continue</b> below 👇 to see the pass.',
     {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: `go:plans${promo ? ':' + promo : ''}` }]] }
+      reply_markup: { inline_keyboard: [[{ text: 'Continue ⬇️', callback_data: `go:plans${promo ? ':' + promo : ''}` }]] }
     }
   );
   });
@@ -778,7 +777,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     'Commands:\n' + commandListText() +
     (aboutSettings && support.emailFallbackLine(aboutSettings)
       ? '\n\n' + support.emailFallbackLine(aboutSettings) : ''),
-    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } }
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue ⬇️', callback_data: 'go:plans' }]] } }
   );
   });
 
@@ -932,7 +931,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [
-          [{ text: 'Continue →', callback_data: 'go:plans' }],
+          [{ text: 'Continue ⬇️', callback_data: 'go:plans' }],
           [{ text: '🆘 Support', callback_data: 'sup:menu' }]
         ]
       }
@@ -2480,7 +2479,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     if (studentCommandNames.has(commandName(msg.text))) return;
     await bot.sendMessage(msg.chat.id,
       'Sorry, I do not know that command. Here is what I can do:\n\n' + commandListText(),
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } });
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue ⬇️', callback_data: 'go:plans' }]] } });
     return;
   }
 
@@ -2509,7 +2508,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (!support.messageText(msg) && !support.hasMedia(msg) && isUnreadable(msg)) {
     await bot.sendMessage(msg.chat.id,
       'I can only read text and photos. Here is what I can do:\n\n' + commandListText(),
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] } });
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Continue ⬇️', callback_data: 'go:plans' }]] } });
     return;
   }
 

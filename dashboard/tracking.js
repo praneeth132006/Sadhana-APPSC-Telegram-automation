@@ -340,18 +340,11 @@ function renderPeople() {
 }
 
 function renderNotices() {
-  const context = data && data.context;
   const notes = [];
   if (data && data.configured === false) {
     notes.push(el('div', { class: 'banner tone-warn' }, [el('div', { class: 'banner-body' }, [
       el('strong', { text: 'Tracking is not set up for this bot. ' }),
       el('span', { text: 'It needs the group\'s SHEET_ID and the Google service account (GOOGLE_SERVICE_ACCOUNT_JSON).' })
-    ])]));
-  }
-  if (context && !context.isPrimary) {
-    notes.push(el('div', { class: 'banner tone-info' }, [el('div', { class: 'banner-body' }, [
-      el('strong', { text: 'Shared bot. ' }),
-      el('span', { text: `This group uses the same payment bot as ${context.primaryGroupName}, so its codes and tracking are shared.` })
     ])]));
   }
   replaceChildren($('notices'), notes.length ? el('div', { class: 'sp-notices' }, notes) : null);

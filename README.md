@@ -19,12 +19,17 @@ Live at <https://appscsadhana.vercel.app>, or locally with `npm run dashboard` a
 | 📊 | **Analytics** (`/analytics.html`) | How many questions exist per subject, how many are posted, what is pending, the workflow and difficulty mix, curator contributions, posting timeline, and how many days of content each subject has left. |
 | 📚 | **Questions** (`/questions.html`) | Browse and search the whole bank. Filter by subject, status, difficulty or posted state. Edit any question in place, approve or reject in bulk, delete. |
 | 🤖 | **Automation** (`/automation.html`) | Post to Telegram straight from the browser. Queue batches for a planned time, or take them back out. Hand the queue to **Autopilot** and let it post unattended. See every subject's cron cadence and remaining runway. |
-| 💳 | **Members** (`/members.html`) | Paying members, revenue by plan, who is about to lapse, and a dry run of the nightly expiry sweep. |
+| 💳 | **Members** (`/members.html`) | Paying members, revenue by plan, who is about to lapse, and a dry run of the nightly expiry sweep. **Member analysis** pie charts: where members stand, which pass, where the money came from, full price vs a code vs free, when access ends, new vs returning — each slice labelled with its count and share — and new members per week. |
 | 🎟 | **Pass & Coupons** (`/pricing.html`) | The pass students buy — name, price, valid-until date — and coupon codes with their usage. |
 | 📈 | **Code Tracking** (`/tracking.html`) | For every coupon or promo code: who clicked its link, applied it, made a payment link and paid — and who made a link and never paid. The ad link to copy for each code. |
 | 🆘 | **Support** (`/support.html`) | Student tickets: read the conversation, reply, send a new invite link, check a payment, grant a pass, resolve. |
 | 🩺 | **Health** (`/health.html`) | Is the server, the sheet and the bot reachable — and are the security controls that protect them actually switched on. |
 
+
+**Pass & Coupons, Code Tracking, Influencers and Support are per payment bot.** English and
+Telugu of one exam share one bot, so on those four pages the switcher shows one entry per bot
+(*APPSC Newspaper — English & Telugu*) and the data is the same whichever language was picked.
+The other pages stay per group.
 ---
 
 ## Uploading questions — for everyone except the admin
@@ -338,7 +343,7 @@ at 0% again, and fixing it never needs the Apps Script pasted into five sheets.
 ## The bot: what people see
 
 **Nothing is sold on the first screen.** Telegram rejects an ad whose bot opens with a
-payment demand, so `/start` is a welcome and a **Continue →** button. Continue asks the
+payment demand, so `/start` is a welcome and a **Continue ⬇️** button. Continue asks the
 language (when the bot sells two), then the bot posts real questions from that group's
 sheet as quiz polls, one at a time behind a **Next →** button. After the last one it says
 what the group posts every day and *then* shows the pass. How many questions
@@ -368,7 +373,7 @@ npm run bot-profile:status   # show what Telegram currently holds
 ```
 
 The menu is `/start`, `/about`, `/plans`, `/status`, `/help`, `/support`, `/terms`.
-`/start` is one welcome message with a **Continue →** button — the pass is shown when
+`/start` is one welcome message with a **Continue ⬇️** button — the pass is shown when
 they tap it, not unasked.
 
 **Where the menu is written matters.** Telegram keeps a separate list per *scope* and

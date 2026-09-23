@@ -444,7 +444,9 @@ test('/start still greets when the settings sheet fails, and includes the welcom
   } finally {
     console.error = originalError;
   }
-  assert.match(failing.messages(STUDENT.id)[0].args[1], /Hello Asha[\s\S]*\/support/);
+  // The welcome points down to Continue; the "Need help? Send /support" line is gone.
+  assert.match(failing.messages(STUDENT.id)[0].args[1], /Hello Asha[\s\S]*Tap <b>Continue<\/b> below 👇/);
+  assert.doesNotMatch(failing.messages(STUDENT.id)[0].args[1], /Need help/);
   // The greeting is one message with a Continue button, as the welcome screen
   // is meant to be — not a wall of text followed by the pass unasked.
   assert.equal(failing.messages(STUDENT.id).length, 1);

@@ -41,6 +41,7 @@ const pricing = require('./src/pricing');
 const affiliates = require('./src/affiliates');
 const affiliateStore = require('./src/affiliate-store');
 const codeTracking = require('./src/code-tracking');
+const memberAnalysis = require('./src/member-analysis');
 const affiliateNotify = require('./src/affiliate-notify');
 const affiliateBotFactory = require('./src/affiliatebot');
 const sheetTabs = require('./src/sheet-tabs');
@@ -3266,6 +3267,9 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
         language: g.language,
         displayName: g.displayName,
         shortName: g.shortName,
+        // Groups sold by one payment bot share its pass, coupons, tickets and
+        // tracking; the dashboard shows those pages once per bot, not per language.
+        paymentBotEnv: g.paymentBotEnv || '',
         ready: g.ready,
         missing: g.missing,
         subjects: g.subjects || [],
@@ -3645,6 +3649,33 @@ async function handleAuthedRoute(pathname, method, req, res, query, user) {
 
   if (pathname === '/api/members/revenue' && method === 'GET') {
     sendJSON(res, 200, { success: true, data: await db.getRevenue() });
+    return true;
+  }
+
+  // Pie charts for the Members page: every member of this group, broken down.
+  if (pathname === '/api/members/analysis' && method === 'GET') {
+    const subscribers = [];
+    for (let page = 1, pages = 1; page <= pages && page <= 50; page++) {
+      const batch = await db.listSubscribers({ page: String(page), pageSize: '500' });
+      subscribers.push(...((batch && batch.subscribers) || []));
+      pages = Number(batch && batch.totalPages) || 1;
+    }
+    // Each member's full price: the pass on sale at the admin's price, any
+    // other (retired, test) pass at its own configured price.
+    let current = null;
+    try {
+      const { primary } = familyOf(groupId);
+      current = pricing.currentPass(groupId, support.normaliseSettings(await sheets.forGroup(primary.id).getBotSettings()));
+    } catch (err) {
+      current = null;
+    }
+    const analysis = memberAnalysis.analyseMembers(subscribers, {
+      priceFor: (s) => (current && s.plan === current.id
+        ? current.amountPaise
+        : ((groupRegistry.getPlanFor(groupId, s.plan) || {}).amountPaise || 0)),
+      isLifetime: (s) => membership.isLifetimeSubscriber(s)
+    });
+    sendJSON(res, 200, { success: true, data: analysis });
     return true;
   }
 

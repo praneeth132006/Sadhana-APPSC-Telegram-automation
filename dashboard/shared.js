@@ -69,16 +69,18 @@ export let serverConfig = {};
 // ---------------------------------------------------------------------------
 
 /** The dashboards, in the order they appear in the nav bar. */
+// familyWide: the page's data belongs to a payment bot, so English and Telugu
+// of one exam are the same page and the switcher picks a bot, not a language.
 const PAGES = [
   { id: 'upload',     href: 'index.html',      icon: '📤', label: 'Upload',     hint: 'Paste JSON and push questions to the sheet' },
   { id: 'analytics',  href: 'analytics.html',  icon: '📊', label: 'Analytics',  hint: 'Counts, coverage, runway and curator activity' },
   { id: 'questions',  href: 'questions.html',  icon: '📚', label: 'Questions',  hint: 'Browse, search and edit the whole question bank' },
   { id: 'automation', href: 'automation.html', icon: '🤖', label: 'Automation', hint: 'Post to Telegram now and manage schedules' },
   { id: 'members',    href: 'members.html',    icon: '💳', label: 'Members',    hint: 'Paying members, revenue and expiry sweep' },
-  { id: 'pricing',    href: 'pricing.html',    icon: '🎟', label: 'Pass & Coupons', hint: 'The pass students buy, its price, and coupon codes' },
-  { id: 'tracking',   href: 'tracking.html',   icon: '📈', label: 'Code Tracking', hint: 'Who clicked a code\'s link, applied it, made a payment link, paid — or did not' },
-  { id: 'influencers', href: 'influencers.html', icon: '🤝', label: 'Influencers', hint: 'Influencer applications, promo codes, sales and withdrawals — every exam' },
-  { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets: reply, send invite links, check payments' },
+  { id: 'pricing',    href: 'pricing.html',    icon: '🎟', label: 'Pass & Coupons', hint: 'The pass students buy, its price, and coupon codes', familyWide: true },
+  { id: 'tracking',   href: 'tracking.html',   icon: '📈', label: 'Code Tracking', hint: 'Who clicked a code\'s link, applied it, made a payment link, paid — or did not', familyWide: true },
+  { id: 'influencers', href: 'influencers.html', icon: '🤝', label: 'Influencers', hint: 'Influencer applications, promo codes, sales and withdrawals — every exam', familyWide: true },
+  { id: 'support',    href: 'support.html',    icon: '🆘', label: 'Support',    hint: 'Student tickets: reply, send invite links, check payments', familyWide: true },
   { id: 'health',     href: 'health.html',     icon: '🩺', label: 'Health',     hint: 'System status and security posture' }
 ];
 
@@ -603,7 +605,7 @@ function buildTopBar(activePage) {
   const identity = el('div', { class: 'top-identity' }, [
     el('h1', { class: 'top-title', text: 'Questions Dashboard' }),
     el('div', { class: 'top-group', id: 'groupSwitcher' }, [
-      el('span', { class: 'top-group-label', text: 'Posting to' }),
+      el('span', { class: 'top-group-label', text: isFamilyWide(activePage) ? 'Showing' : 'Posting to' }),
       groupSelect
     ])
   ]);
@@ -671,7 +673,43 @@ function buildGroupChooser(groups) {
 }
 
 /** Fills the top-bar switcher and returns whether a valid group is selected. */
-async function applyGroupSelection() {
+/** True for the pages whose data is per payment bot rather than per group. */
+function isFamilyWide(pageId) {
+  const page = PAGES.find((p) => p.id === pageId);
+  return Boolean(page && page.familyWide);
+}
+
+/**
+ * familyOptions — one switcher entry per payment bot: "APPSC Newspaper —
+ * English & Telugu" rather than two entries that show identical data. The
+ * value is the bot's first group, which is where its data lives.
+ */
+export function familyOptions(groups) {
+  const families = [];
+  for (const group of groups) {
+    const key = group.paymentBotEnv || `group:${group.id}`;
+    let family = families.find((f) => f.key === key);
+    if (!family) {
+      family = { key, groups: [] };
+      families.push(family);
+    }
+    family.groups.push(group);
+  }
+  return families.map(({ groups: members }) => {
+    const first = members[0];
+    const languages = members.map((g) => g.language).filter(Boolean);
+    return {
+      value: first.id,
+      ids: members.map((g) => g.id),
+      text: members.length > 1
+        ? `${first.label || first.shortName} — ${languages.join(' & ')}`
+        : (first.shortName || first.displayName),
+      title: members.map((g) => g.displayName || g.shortName).join(' + ')
+    };
+  });
+}
+
+async function applyGroupSelection(activePage) {
   let groups = [];
   try {
     groups = await listGroups();
@@ -688,7 +726,19 @@ async function applyGroupSelection() {
   if (selected && !valid) rememberSelectedGroup('');
 
   const select = $('groupSelect');
-  if (select) {
+  if (select && isFamilyWide(activePage)) {
+    // One entry per bot. The remembered group is left alone, so going back to
+    // Upload still lands on the language that was being worked in.
+    select.innerHTML = '';
+    familyOptions(ready).forEach((family) => {
+      const option = document.createElement('option');
+      option.value = family.value;
+      option.textContent = family.text;
+      option.title = family.title;
+      if (family.ids.includes(selected)) option.selected = true;
+      select.appendChild(option);
+    });
+  } else if (select) {
     select.innerHTML = '';
     ready.forEach((group) => {
       const option = document.createElement('option');
@@ -1141,7 +1191,7 @@ export async function initDashboard({ page, onReady }) {
     // Nothing on the page may load until a group is chosen. Everything below
     // this point reads or writes one group's sheet, so starting without one
     // would mean the first request of the session picks a group by accident.
-    const selection = await applyGroupSelection();
+    const selection = await applyGroupSelection(page);
     if (!selection.ok) {
       if (selection.error) {
         showBanner('error', 'Could not load the group list.', selection.error);

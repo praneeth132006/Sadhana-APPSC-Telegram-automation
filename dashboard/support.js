@@ -211,14 +211,7 @@ function renderHowItWorks() {
 function renderNotices(context) {
   const notes = [];
   if (!context) return;
-  if (!context.isPrimary) {
-    notes.push(el('div', { class: 'banner tone-info' }, [
-      el('div', { class: 'banner-body' }, [
-        el('strong', { text: 'Shared bot. ' }),
-        el('span', { text: `This group uses the same payment bot as ${context.primaryGroupName}, so you are seeing that bot's tickets.` })
-      ])
-    ]));
-  }
+  // English and Telugu share a bot and its tickets; the switcher already says both.
   if (!context.botConfigured) {
     notes.push(el('div', { class: 'banner tone-warn' }, [
       el('div', { class: 'banner-body' }, [

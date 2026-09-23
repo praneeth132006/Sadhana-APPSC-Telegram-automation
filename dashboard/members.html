@@ -10,6 +10,27 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="shared.css">
+  <style>
+    .mb-headline { margin-bottom: 18px; }
+    .mb-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 16px; }
+    .mb-chart, .mb-weekly { border: 1px solid var(--border-card); border-radius: 12px; padding: 16px; background: var(--bg-card); }
+    .mb-weekly { margin-top: 16px; }
+    .mb-chart-title { margin: 0; font-size: 0.95rem; font-weight: 700; color: var(--text-primary); }
+    .mb-chart-sub { margin: 2px 0 12px; font-size: 0.8rem; color: var(--text-muted); }
+    .mb-chart-body { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .mb-donut-svg { width: 160px; height: 160px; flex: 0 0 160px; }
+    .mb-slice { transition: opacity 0.15s ease; cursor: default; }
+    .mb-donut-svg:hover .mb-slice { opacity: 0.55; }
+    .mb-donut-svg .mb-slice:hover { opacity: 1; }
+    .mb-donut-total { fill: var(--text-primary); font-size: 20px; font-weight: 800; }
+    .mb-donut-caption { fill: var(--text-muted); font-size: 11px; }
+    .mb-legend { list-style: none; margin: 0; padding: 0; flex: 1 1 160px; min-width: 0; display: grid; gap: 7px; }
+    .mb-legend li { display: flex; align-items: center; gap: 8px; font-size: 0.84rem; }
+    .mb-swatch { width: 10px; height: 10px; border-radius: 3px; flex: 0 0 10px; }
+    .mb-legend-label { flex: 1 1 auto; min-width: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+    .mb-legend-value { color: var(--text-primary); font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    @media (max-width: 480px) { .mb-donut-svg { width: 140px; height: 140px; flex-basis: 140px; } }
+  </style>
 </head>
 <body>
   <div class="app-container">
