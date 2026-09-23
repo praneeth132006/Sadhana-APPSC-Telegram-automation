@@ -397,7 +397,7 @@ code. It replaced the member-to-member referral system, which was hard to track 
 
 | | |
 |---|---|
-| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and gives an email and mobile number · `/payout` gives and changes what RazorpayX needs to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
+| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and gives an email and mobile number · `/payout` gives and changes what RazorpayX needs (email and mobile are locked once approved) to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
 | **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · pays a withdrawal from RazorpayX using the **Pay to** details beside it, then marks it paid with the reference · sees every influencer's payout details and whether they are complete · opens a code to see every student who joined with it and everyone who opened the link but has not paid · pauses, resumes or re-terms a code |
 | **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
@@ -435,7 +435,9 @@ APPSC ones are on for now. Closing an exam stops new applications and never brea
 that already exists.
 
 **Applying** asks for an email and a mobile number, nothing else. Both land on the
-influencer's row, so the payout details are already half done.
+influencer's row, so the payout details are already half done. Either can be changed
+until the admin decides (the waiting request's Details follow the change); once approved
+they are locked in the bot, and only the admin can change them on the sheet.
 
 **Alerts.** New applications, withdrawal requests and influencers' questions are posted to
 the Support Team chat (or `AFFILIATE_ADMIN_CHAT_ID`) with a button to the Influencers page.
