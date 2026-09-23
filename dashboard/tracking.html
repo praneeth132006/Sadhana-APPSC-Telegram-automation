@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Code Tracking — Sadhana APPSC</title>
+  <meta name="description" content="Everyone who clicked a coupon or promo code's link, applied it, made a payment link and paid — or did not.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    .tr-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+    .tr-toolbar .support-field { flex: 1 1 220px; min-width: 0; }
+    .tr-toolbar .btn { flex: 0 0 auto; width: auto; }
+    .tr-link { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; padding: 10px 12px;
+      border: 1px dashed var(--border-card); border-radius: 10px; background: var(--bg-elevated); }
+    .tr-link code { font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 0.84rem; word-break: break-all;
+      color: var(--text-primary); flex: 1 1 260px; min-width: 0; }
+    .tr-link .btn { flex: 0 0 auto; width: auto; }
+    .tr-funnel { display: grid; gap: 8px; margin-top: 16px; }
+    .tr-id { font-family: var(--font-mono, 'JetBrains Mono', monospace); font-size: 0.74rem; color: var(--text-muted); }
+    .tr-sub { color: var(--text-muted); font-size: 0.76rem; margin-top: 2px; }
+    .tr-when { color: var(--text-secondary); font-size: 0.8rem; white-space: nowrap; }
+    .tr-code-row { cursor: pointer; }
+    .tr-code-row:hover > td { background: var(--bg-hover); }
+    .tr-tabs { margin: 4px 0 12px; }
+    .tr-reason { color: var(--text-muted); font-size: 0.76rem; max-width: 240px; }
+    @media (max-width: 720px) {
+      .tr-toolbar .support-field { flex-basis: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <main id="pageRoot" class="page-root" style="display:none">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Code Tracking</h1>
+          <p class="page-subtitle">
+            For every coupon or promo code: who clicked its link, who applied it, who made a payment link, who paid —
+            and who made a link and never paid. Also kept in the sheet's Code Tracking tab.
+          </p>
+        </div>
+        <div class="page-actions">
+          <button id="checkBtn" class="btn btn-ghost">Check payments with Razorpay</button>
+          <button id="refreshBtn" class="btn btn-primary">Refresh</button>
+        </div>
+      </div>
+
+      <div id="notices"></div>
+      <div id="controlPanel"></div>
+      <div id="summaryPanel"></div>
+      <div id="peoplePanel"></div>
+    </main>
+  </div>
+
+  <script type="module" src="tracking.js"></script>
+</body>
+</html>

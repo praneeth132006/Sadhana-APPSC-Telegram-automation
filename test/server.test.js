@@ -144,6 +144,8 @@ stub(sheets, 'getRevenue', { totalMembers: 1, active: 1, totalRevenue: 299, byPl
 stub(sheets, 'upsertSubscriber', { telegram_id: '555' });
 
 const server = require('../server');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 
 // .env names the real support chat. Tests that want one set it themselves.
 delete process.env.SUPPORT_CHAT_ID;

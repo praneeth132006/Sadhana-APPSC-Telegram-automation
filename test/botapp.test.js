@@ -32,6 +32,8 @@ process.env.TELEGRAM_GROUP_UPSC = process.env.TELEGRAM_GROUP_UPSC || '-100999999
 process.env.TELEGRAM_PAYBOT_UPSC = process.env.TELEGRAM_PAYBOT_UPSC || '123:TEST';
 
 const { createPaymentBot } = require('../src/botapp');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 
 // No test may reach the real Telegram API. The server reads .env, which holds
 // real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a

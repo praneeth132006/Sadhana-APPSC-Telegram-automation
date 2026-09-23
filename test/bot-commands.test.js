@@ -161,6 +161,8 @@ test('every command on the menu is answered by the bot in a private chat', async
   // looks like the bot is broken.
   const sheets = require('../src/sheets');
   const { createPaymentBot } = require('../src/botapp');
+  // Code tracking off: a local .env would otherwise point it at the real sheets.
+  require('../src/code-tracking').isConfigured = () => false;
   const sheet = new Proxy({}, {
     get: (target, name) => {
       if (name === 'then') return undefined;

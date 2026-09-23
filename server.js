@@ -40,6 +40,7 @@ const support = require('./src/support');
 const pricing = require('./src/pricing');
 const affiliates = require('./src/affiliates');
 const affiliateStore = require('./src/affiliate-store');
+const codeTracking = require('./src/code-tracking');
 const affiliateNotify = require('./src/affiliate-notify');
 const affiliateBotFactory = require('./src/affiliatebot');
 const sheetTabs = require('./src/sheet-tabs');
@@ -664,6 +665,28 @@ async function recordCouponUse(notes, paymentId, paidPaise) {
 }
 
 /**
+ * recordCodePaid — marks the student paid on the Code Tracking tab. Never
+ * fails the webhook (safeRecord swallows and logs): the student has paid.
+ */
+async function recordCodePaid(notes, paymentId, paidPaise) {
+  let group;
+  try {
+    group = groupRegistry.requireGroup(notes.group_id);
+  } catch (err) {
+    return;
+  }
+  await codeTracking.safeRecord(group.paymentBotEnv, {
+    type: 'paid',
+    code: notes.promo_code || notes.coupon_code,
+    kind: notes.promo_code ? 'promo' : 'coupon',
+    student: { id: notes.telegram_id, username: notes.telegram_username || '', name: notes.student_name || '' },
+    group: group.shortName,
+    paymentId,
+    paidPaise
+  });
+}
+
+/**
  * sweepTrials — warns the previews that are nearly over and ends the ones
  * that are, in every group.
  *
@@ -1124,6 +1147,10 @@ async function handlePaymentEvent(event) {
     }
     if (notes.promo_code) {
       await recordAffiliateSale(notes, payment.id || link.id, paidPaise);
+    }
+    // The last step of the Code Tracking funnel: this student paid.
+    if ((notes.coupon_code || notes.promo_code) && !granted.alreadyProcessed) {
+      await recordCodePaid(notes, payment.id || link.id, paidPaise);
     }
 
     // A repeat delivery of the same payment must not send a second message.
@@ -3039,6 +3066,74 @@ async function handlePricingRoute(pathname, method, req, res, query, groupId, ac
       return true;
     }
     sendJSON(res, 200, { success: true, data: result });
+    return true;
+  }
+
+  // ---- Code tracking: who clicked a code's link, applied it, made a payment
+  // link and paid — or did not.
+  if (pathname === '/api/pricing/tracking' && method === 'GET') {
+    const payBotEnv = group.paymentBotEnv;
+    if (!codeTracking.isConfigured(payBotEnv)) {
+      sendJSON(res, 200, { success: true, data: { context, configured: false, codes: [], rows: [], totals: codeTracking.summarise([]) } });
+      return true;
+    }
+    const wanted = pricing.normaliseCode(query.get('code'));
+    const code = pricing.COUPON_CODE_PATTERN.test(wanted) ? wanted : '';
+    const [all, coupons, botUsername] = await Promise.all([
+      codeTracking.list(payBotEnv),
+      db.listCoupons().catch(() => []),
+      paymentBotUsername(payBotEnv).catch(() => null)
+    ]);
+    const rows = code ? all.filter((r) => String(r.code).toUpperCase() === code) : all;
+    // Every code worth picking: the ones with activity, and every coupon, so
+    // a brand-new ad code can be chosen (and its link copied) before anyone uses it.
+    const codes = codeTracking.summariseByCode(all);
+    for (const c of coupons) {
+      if (!codes.some((x) => x.code === c.code)) {
+        codes.push(Object.assign({ code: c.code, kind: 'coupon' }, codeTracking.summarise([])));
+      }
+    }
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        context,
+        configured: true,
+        botUsername: botUsername || '',
+        linkBase: botUsername ? `https://t.me/${botUsername}?start=promo_` : '',
+        stages: codeTracking.STAGES,
+        code,
+        codes,
+        totals: codeTracking.summarise(rows),
+        rows: rows.map((r) => { const out = Object.assign({}, r); delete out._row; return out; })
+      }
+    });
+    return true;
+  }
+
+  if (pathname === '/api/pricing/tracking/refresh' && method === 'POST') {
+    const payBotEnv = group.paymentBotEnv;
+    if (!codeTracking.isConfigured(payBotEnv)) {
+      sendJSON(res, 409, { success: false, error: 'Code tracking needs this group\'s SHEET_ID and the service account.' });
+      return true;
+    }
+    if (!razorpay.isConfigured()) {
+      sendJSON(res, 409, { success: false, error: 'Razorpay is not configured, so payment links cannot be checked.' });
+      return true;
+    }
+    const body = await readJsonBody(req);
+    const wanted = pricing.normaliseCode(body.code);
+    const result = await codeTracking.refreshFromRazorpay(payBotEnv, {
+      getPaymentLink: (id) => razorpay.getPaymentLink(id),
+      code: pricing.COUPON_CODE_PATTERN.test(wanted) ? wanted : ''
+    });
+    const parts = [`Checked ${result.checked} payment link(s) with Razorpay`];
+    if (result.changed) parts.push(`${result.changed} updated`);
+    if (result.failed) parts.push(`${result.failed} could not be read`);
+    if (result.remaining) parts.push(`${result.remaining} more to check — press again`);
+    if (result.unrecorded.length) {
+      parts.push(`⚠️ ${result.unrecorded.length} paid on Razorpay but never recorded — check those students on the Members page`);
+    }
+    sendJSON(res, 200, { success: true, data: result, message: parts.join(' · ') + '.' });
     return true;
   }
 

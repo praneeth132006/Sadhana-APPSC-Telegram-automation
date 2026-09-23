@@ -46,6 +46,8 @@ const sheets = require('../src/sheets');
 const razorpay = require('../src/razorpay');
 const botCommands = require('../src/bot-commands');
 const { createPaymentBot } = require('../src/botapp');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 
 delete process.env.SUPPORT_CHAT_ID;
 delete process.env.SUPPORT_THREAD_ID;

@@ -36,6 +36,7 @@ const support = require('./support');
 const pricing = require('./pricing');
 const affiliates = require('./affiliates');
 const affiliateStore = require('./affiliate-store');
+const codeTracking = require('./code-tracking');
 const affiliateNotify = require('./affiliate-notify');
 const botCommands = require('./bot-commands');
 // For buildQuizPost only: the taster posts a sample exactly as the group would.
@@ -168,6 +169,34 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   return held.code;
   }
 
+  /**
+   * ":CODE" for a button's callback data. The code from a link is held in
+   * memory, and on the deployment the next tap can reach a different instance
+   * that never saw the /start — so it also rides on every button between the
+   * welcome and the price.
+   */
+  function codeSuffix(user) {
+  const code = user ? takePendingPromo(user.id) : '';
+  return code ? ':' + code : '';
+  }
+
+  /** Takes back a code that rode in on a button, unless one is already held. */
+  function adoptCode(user, code) {
+  const clean = pricing.normaliseCode(code);
+  if (!user || !clean || !pricing.COUPON_CODE_PATTERN.test(clean)) return;
+  if (!takePendingPromo(user.id)) pendingPromo.set(String(user.id), { code: clean, at: Date.now() });
+  }
+
+  /**
+   * trackCode — notes how far a student got with a code, for the dashboard's
+   * Code Tracking page. Behind the reply and never fatal: tracking must not
+   * slow down or break a purchase.
+   */
+  function trackCode(event) {
+  if (!codeTracking.isConfigured(payBotEnv)) return;
+  keepAlive(codeTracking.safeRecord(payBotEnv, event));
+  }
+
   /** Keyboard with a single button that opens the support menu. */
   const SUPPORT_BUTTON = { inline_keyboard: [[{ text: '🆘 Support', callback_data: 'sup:menu' }]] };
 
@@ -255,11 +284,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * Only shown when the family has more than one. A bot serving a single group
    * asking "which group?" is a question with one answer.
    */
-  function groupKeyboard() {
+  function groupKeyboard(user = null) {
+  const suffix = codeSuffix(user);
   return {
     inline_keyboard: familyGroups().map((group) => ([{
       text: `${group.language === 'Telugu' ? '🇮🇳 తెలుగు (Telugu)' : '🔤 English'}`,
-      callback_data: `pick:${group.id}`
+      callback_data: `pick:${group.id}${suffix}`
     }]))
   };
   }
@@ -348,7 +378,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (!show && user) {
     const waiting = takePendingPromo(user.id);
     if (waiting) {
-      const { result } = await checkCode(waiting, user, group);
+      const { result } = await checkCode(waiting, user, group, 'link');
       if (result.ok) show = result;
       else {
         refused = result.reason;
@@ -390,7 +420,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   await bot.sendMessage(chatId, chooseGroupMessage(), {
     parse_mode: 'HTML',
-    reply_markup: groupKeyboard()
+    reply_markup: groupKeyboard(user)
   });
   }
 
@@ -427,7 +457,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       }
     };
   }
-  return { pass, result: pricing.evaluateCoupon(coupon, { amountPaise: pass.amountPaise }) };
+  return { pass, result: pricing.evaluateCoupon(coupon, { amountPaise: pass.amountPaise }), known: Boolean(coupon) };
   }
 
   /** Buttons after a coupon was refused. */
@@ -449,7 +479,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       { reply_markup: couponRetryKeyboard(group) });
     return;
   }
-  const { pass, result } = await checkCode(code, msg.from, group);
+  const { pass, result } = await checkCode(code, msg.from, group, 'typed');
   if (!result.ok) {
     await bot.sendMessage(msg.chat.id, `❌ <b>${esc(code)}</b>: ${esc(result.reason)}`,
       { parse_mode: 'HTML', reply_markup: couponRetryKeyboard(group) });
@@ -492,7 +522,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    *
    * @returns {Promise<{pass: Object|null, result: Object}>}
    */
-  async function checkCode(code, user, group) {
+  async function lookUpCode(code, user, group) {
   const pass = await passFor(group.id);
   if (!pass) return { pass: null, result: { ok: false, reason: 'Nothing is on sale for this group right now.' } };
   if (!allowCouponCheck(String(user.id))) {
@@ -504,7 +534,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const clean = pricing.normaliseCode(code);
   try {
     const promo = await checkPromo(clean, user, pass);
-    if (promo) return { pass, result: promo };
+    if (promo) return { pass, result: promo, kind: 'promo', known: true };
   } catch (err) {
     console.error(`[bot] ${payBotEnv}: could not look up promo code ${clean} — ${err.message}`);
     return {
@@ -512,7 +542,24 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       result: { ok: false, reason: 'Codes cannot be checked right now. Please try again in a few minutes, or pay the full price.' }
     };
   }
-  return checkCoupon(clean, user.id, group);
+  return Object.assign({ kind: 'coupon' }, await checkCoupon(clean, user.id, group));
+  }
+
+  /**
+   * checkCode — lookUpCode, and when the student brought the code themselves
+   * (`source`: link or typed), a note of whether it worked. A code that does
+   * not exist is not tracked: a typo is not a campaign.
+   */
+  async function checkCode(code, user, group, source = '') {
+  const found = await lookUpCode(code, user, group);
+  if (source && found.known) {
+    trackCode({
+      type: found.result.ok ? 'applied' : 'refused',
+      code: pricing.normaliseCode(code), kind: found.kind, student: user, group: group.shortName,
+      source, reason: found.result.ok ? '' : found.result.reason
+    });
+  }
+  return found;
   }
 
   /**
@@ -695,6 +742,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const promo = affiliates.codeFromStartPayload(match && match[1]);
   if (promo) {
     pendingPromo.set(String(msg.from.id), { code: promo, at: Date.now() });
+    // Who clicked the code's link — an ad's or an influencer's — for the
+    // Code Tracking page. Behind the reply, like the open below.
+    trackCode({ type: 'clicked', code: promo, student: msg.from, source: 'link' });
     // Who opened the influencer's link, for the Influencers page. Behind the
     // reply, never before it: the welcome must not wait on a spreadsheet.
     if (affiliateStore.isConfigured()) {
@@ -716,7 +766,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     '<i>Need help? Send /support.</i>',
     {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: 'go:plans' }]] }
+      reply_markup: { inline_keyboard: [[{ text: 'Continue →', callback_data: `go:plans${promo ? ':' + promo : ''}` }]] }
     }
   );
   });
@@ -997,7 +1047,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   if (index + 1 < total) {
     await bot.sendMessage(chatId,
       `<i>Question ${index + 1} of ${total}. Tap below for the next one.</i>`,
-      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Next →', callback_data: `smp:${group.id}:${index + 1}` }]] } });
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Next →', callback_data: `smp:${group.id}:${index + 1}${codeSuffix(user)}` }]] } });
     return;
   }
 
@@ -1033,7 +1083,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   };
 
   // ---- the welcome's Continue button --------------------------------------
-  if (data === 'go:plans') {
+  if (data === 'go:plans' || data.startsWith('go:plans:')) {
+    adoptCode(user, data.slice('go:plans:'.length));
     await ack();
     // Continue from the welcome: language, then the questions, then the price.
     await offerGroups(user.id, user, { taster: true });
@@ -1056,7 +1107,9 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   //   plain:<groupId>  — show me this group's plain price
   if (data.startsWith('pick:') || data.startsWith('plain:')) {
     const plain = data.startsWith('plain:');
-    const group = familyGroup(data.slice(plain ? 6 : 5));
+    const [, groupId, carried] = data.split(':');
+    const group = familyGroup(groupId);
+    if (!plain) adoptCode(user, carried);
     if (!group) {
       await ack('That group is not available here.');
       return;
@@ -1071,12 +1124,13 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   // ---- the taster ---------------------------------------------------------
   if (data.startsWith('smp:')) {
-    const [, groupId, index] = data.split(':');
+    const [, groupId, index, carried] = data.split(':');
     const group = familyGroup(groupId);
     if (!group) {
       await ack('That group is not available here.');
       return;
     }
+    adoptCode(user, carried);
     await ack();
     await sendSample(user.id, group, Number(index) || 0, user);
     return;
@@ -1199,6 +1253,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     }
 
     const checkout = await createCheckout(group, pass, user, applied);
+    if (applied) {
+      trackCode({
+        type: 'link_created', code: applied.code, kind: applied.kind === 'promo' ? 'promo' : 'coupon',
+        student: user, group: group.shortName, amountPaise: applied.finalPaise, linkId: checkout.linkId
+      });
+    }
     const amount = applied ? applied.finalPaise : pass.amountPaise;
 
     await bot.sendMessage(user.id,
@@ -1267,6 +1327,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       });
     } else {
       extraNotes.coupon_code = applied.code;
+      // So the Code Tracking tab names who paid, not only their Telegram id.
+      extraNotes.student_name = name;
     }
   }
 
@@ -1279,7 +1341,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     callbackUrl: base ? `${base}/payment-success.html` : undefined,
     extraNotes
   });
-  return { url: link.short_url };
+  return { url: link.short_url, linkId: link.id || '' };
   }
 
   // ---------------------------------------------------------------------------
