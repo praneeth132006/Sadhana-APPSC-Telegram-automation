@@ -398,7 +398,7 @@ code. It replaced the member-to-member referral system, which was hard to track 
 
 | | |
 |---|---|
-| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and gives an email and mobile number · `/payout` gives and changes what RazorpayX needs (email and mobile are locked once approved) to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
+| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and gives a name, email, mobile and UPI ID — in one message · `/payout` gives and changes what RazorpayX needs (email and mobile are locked once approved) to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
 | **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · pays a withdrawal from RazorpayX using the **Pay to** details beside it, then marks it paid with the reference · sees every influencer's payout details and whether they are complete · opens a code to see every student who joined with it and everyone who opened the link but has not paid · pauses, resumes or re-terms a code |
 | **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
@@ -435,14 +435,27 @@ and the support email.
 APPSC ones are on for now. Closing an exam stops new applications and never breaks a code
 that already exists.
 
-**Applying** asks for an email and a mobile number, nothing else. Both land on the
-influencer's row, so the payout details are already half done. Either can be changed
-until the admin decides (the waiting request's Details follow the change); once approved
-they are locked in the bot, and only the admin can change them on the sheet.
+**Applying** asks for four things and nothing else: **name** (as on the bank account),
+**email**, **mobile** and **UPI ID**. They can all go in one message, one per line, in any
+order — labels ("Email: …"), numbering and commas are all understood — or, with the
+**✍️ Enter them one at a time** button, one by one. Whatever cannot be read is named, what
+can is kept, and only the rest is asked for again. Details already on file are never asked
+for twice. With all four in, the payout details are complete (UPI) the moment the
+application is sent.
+
+Any of them can be changed until the admin decides (**✏️ Change my details**, or all at once
+from `/payout`), and the waiting request's Details follow the change. Once approved, email
+and mobile are locked in the bot; only the admin can change them on the sheet.
 
 **Alerts.** New applications, withdrawal requests and influencers' questions are posted to
 the Support Team chat (or `AFFILIATE_ADMIN_CHAT_ID`) with a button to the Influencers page.
 The influencer bot must be a member of that chat.
+
+**On the dashboard, on every page:** the 🤝 Influencers link carries a red count of what is
+waiting (withdrawals + applications), and every other page shows a banner — *"💸 Influencer
+withdrawal requested · 2 withdrawals to pay (₹53.82)"*, with the latest one and a link
+straight to the Withdrawals tab. Pages check every minute, and a withdrawal requested while
+a page is open pops up once.
 
 **The sheet** (`AFFILIATE_SHEET_ID`) is separate from every exam's sheet and needs no Apps
 Script: share a blank Google Sheet with the service account as an Editor, and its tabs are

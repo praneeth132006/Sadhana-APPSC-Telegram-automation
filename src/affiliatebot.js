@@ -6,9 +6,10 @@
 // pass, or the other way round.
 //
 // An influencer can:
-//   /apply     — pick an exam (one per payment bot) and give an email and
-//                mobile number, changeable until the admin decides; the admin
-//                gets an alert and decides on the Influencers dashboard
+//   /apply     — pick an exam (one per payment bot) and give a name, email,
+//                mobile and UPI ID — all four in one message, or one at a
+//                time; changeable until the admin decides. The admin gets an
+//                alert and decides on the Influencers dashboard
 //   /codes     — every code they hold: its terms, share link, sales, and
 //                what is earned, requested and paid
 //   /withdraw  — ask for a code's available earnings (weekly or monthly, as
@@ -40,8 +41,12 @@ const esc = support.esc;
 /** First lines of the prompts whose replies this bot reads back. */
 const PROMPT = {
   application: '📝 Application — ',
+  applyAll: '📝 Application for ',
+  applyName: '✏️ Name to apply for ',
   applyEmail: '✉️ Apply for ',
   applyPhone: '📱 Mobile number for ',
+  applyUpi: '💳 UPI ID to apply for ',
+  all: '📝 Your details — all at once',
   upi: '💳 UPI ID for payouts',
   legal_name: '✏️ Your name as on your bank account',
   phone: '📱 Your mobile number',
@@ -49,6 +54,22 @@ const PROMPT = {
   pan: '🪪 Your PAN',
   bank: '🏦 Bank account for payouts',
   question: '🆘 Question for the admin'
+};
+
+/** One application step per field: its prompt, what to ask, an example. */
+const APPLY_STEPS = {
+  legal_name: ['applyName', 'Reply with your <b>full name</b> exactly as it appears on your bank account.', 'Ravi Kumar'],
+  email: ['applyEmail', 'Reply with your <b>email address</b>. Payout receipts go here.', 'ravi@gmail.com'],
+  phone: ['applyPhone', 'Reply with your <b>10-digit mobile number</b>. RazorpayX needs it to pay you.', '9876543210'],
+  upi_id: ['applyUpi', 'Reply with the <b>UPI ID</b> we should send your earnings to.', 'ravi@okicici']
+};
+
+/** How each detail is asked for and named in the all-at-once message. */
+const DETAIL_LINES = {
+  legal_name: ['✏️ Your name (as on your bank account)', 'Ravi Kumar'],
+  email: ['✉️ Email', 'ravi@gmail.com'],
+  phone: ['📱 Mobile number', '9876543210'],
+  upi_id: ['💳 UPI ID', 'ravi@okicici']
 };
 
 /** What each single-field prompt asks for, with an example. */
@@ -165,7 +186,7 @@ function createAffiliateBot({ polling = false } = {}) {
       esc(botCommands.AFFILIATE_ABOUT) + '\n\n' +
       '<b>How it works</b>\n' +
       '1. Tap <b>Apply</b> and choose the exam you want to promote.\n' +
-      '2. Give your email and mobile number. An admin reviews your application.\n' +
+      '2. Send your name, email, mobile and UPI ID — all in one message. An admin reviews your application.\n' +
       '3. Once approved you get your own promo code and link. Your followers get a discount.\n' +
       '4. You earn on every student who pays with your code, and withdraw by UPI or bank transfer.\n\n' +
       'The discount, your commission and how often you can withdraw are set by the admin when approving.',
@@ -209,37 +230,10 @@ function createAffiliateBot({ polling = false } = {}) {
           'Send /support to ask the admin about it.');
       return;
     }
-    // Remembered on their row, so an email or mobile sent without tapping
-    // Reply still finds its way into this application.
+    // Remembered on their row, so details sent without tapping Reply still
+    // find their way into this application.
     const influencer = await store.upsertInfluencer(user, { applying_for: exam.id });
     await continueApplication(chatId, user, exam, influencer);
-  }
-
-  async function askApplyEmail(chatId, exam) {
-    await reply(chatId,
-      `${PROMPT.applyEmail}${esc(exam.label)}\n\n` +
-      'Reply with your <b>email address</b>. We use it for your account and for payout receipts.\n' +
-      '<i>Example: ravi@gmail.com</i>',
-      { reply_markup: { force_reply: true, input_field_placeholder: 'ravi@gmail.com' } });
-  }
-
-  async function askApplyPhone(chatId, exam) {
-    await reply(chatId,
-      `${PROMPT.applyPhone}${esc(exam.label)}\n\n` +
-      'Reply with your <b>10-digit mobile number</b>. RazorpayX needs it to pay you.\n' +
-      '<i>Example: 9876543210</i>',
-      { reply_markup: { force_reply: true, input_field_placeholder: '9876543210' } });
-  }
-
-  /**
-   * continueApplication — asks for whichever of email and mobile is still
-   * missing, and sends the application once both are in. Details already on
-   * their row are not asked for again.
-   */
-  async function continueApplication(chatId, user, exam, influencer) {
-    if (!influencer.email) { await askApplyEmail(chatId, exam); return; }
-    if (!influencer.phone) { await askApplyPhone(chatId, exam); return; }
-    await submitApplication(chatId, user, exam, influencer);
   }
 
   /** The exam an apply prompt (or their row) names, if it is still open. */
@@ -247,7 +241,84 @@ function createAffiliateBot({ polling = false } = {}) {
     return affiliates.listExams().find((e) => e.label === examIdOrLabel || e.id === examIdOrLabel) || null;
   }
 
-  /** Saves the email or mobile given for an application, says so, and moves on. */
+  /** Which of name, email, mobile and UPI ID are still to come. */
+  function missingForApplication(influencer) {
+    return affiliates.APPLY_FIELDS.filter((f) => !String((influencer || {})[f] || '').trim());
+  }
+
+  /**
+   * continueApplication — asks for what is still missing, and sends the
+   * application once name, email, mobile and UPI ID are all in. Details
+   * already on their row are never asked for again.
+   *
+   * Several missing: one message asking for all of them at once, with a
+   * button to go one at a time instead. One missing, or one-at-a-time chosen:
+   * just that one.
+   */
+  async function continueApplication(chatId, user, exam, influencer, { oneByOne = false } = {}) {
+    const missing = missingForApplication(influencer);
+    if (!missing.length) { await submitApplication(chatId, user, exam, influencer); return; }
+    if (oneByOne || missing.length === 1) { await askApplyStep(chatId, exam, missing[0]); return; }
+    await askApplyAll(chatId, exam, missing, influencer);
+  }
+
+  async function askApplyAll(chatId, exam, missing, influencer = {}) {
+    const have = affiliates.APPLY_FIELDS.filter((f) => !missing.includes(f));
+    await reply(chatId,
+      `${PROMPT.applyAll}${esc(exam.label)}\n\n` +
+      `Send ${missing.length === 4 ? 'all four' : 'these'} in <b>one message</b>, one per line:\n` +
+      missing.map((f) => DETAIL_LINES[f][0]).join('\n') + '\n\n' +
+      '<i>Example:\n' + missing.map((f) => esc(DETAIL_LINES[f][1])).join('\n') + '</i>' +
+      (have.length
+        ? '\n\nAlready saved: ' + have.map((f) => `${esc(affiliates.PAYOUT_FIELDS[f].label)} <b>${esc(influencer[f])}</b>`).join(' · ')
+        : ''),
+      { reply_markup: { inline_keyboard: [[{ text: '✍️ Enter them one at a time', callback_data: `aff:one:${exam.id}` }]] } });
+  }
+
+  async function askApplyStep(chatId, exam, field) {
+    const [promptKey, ask, example] = APPLY_STEPS[field];
+    await reply(chatId,
+      `${PROMPT[promptKey]}${esc(exam.label)}\n\n${ask}\n<i>Example: ${esc(example)}</i>`,
+      { reply_markup: { force_reply: true, input_field_placeholder: example } });
+  }
+
+  /** "Name, Email and UPI ID" */
+  function listLabels(fields) {
+    const labels = fields.map((f) => affiliates.PAYOUT_FIELDS[f].label);
+    return labels.length > 1 ? `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}` : labels.join('');
+  }
+
+  /** What was saved and what was not, from one all-at-once message. */
+  function savedSummary(result, problems) {
+    const lines = [];
+    if (result.saved.length) {
+      lines.push('✅ Saved: ' + result.saved.map((f) =>
+        `${esc(affiliates.PAYOUT_FIELDS[f].label)} <b>${esc(result.influencer[f])}</b>`).join(' · '));
+    }
+    for (const r of result.refused) lines.push(`❌ ${esc(affiliates.PAYOUT_FIELDS[r.field].label)}: ${esc(r.reason)}`);
+    for (const p of problems) lines.push(`❌ “${esc(p.line.slice(0, 60))}” — ${esc(p.reason)}`);
+    return lines.join('\n');
+  }
+
+  /**
+   * saveApplyAll — a message with several details for an application: saves
+   * whatever it can read, says exactly what it did, and asks for the rest.
+   */
+  async function saveApplyAll(msg, exam, parsed) {
+    if (!Object.keys(parsed.values).length) {
+      await reply(msg.chat.id,
+        '❌ I could not read any details in that. Send them one per line, like the example — ' +
+        'or tap below to enter them one at a time.' +
+        (parsed.problems.length ? '\n\n' + savedSummary({ saved: [], refused: [] }, parsed.problems) : ''),
+        { reply_markup: { inline_keyboard: [[{ text: '✍️ Enter them one at a time', callback_data: `aff:one:${exam.id}` }]] } });
+      return;
+    }
+    const result = await store.setPayoutFields(msg.from, parsed.values);
+    await reply(msg.chat.id, savedSummary(result, parsed.problems));
+    await continueApplication(msg.chat.id, msg.from, exam, result.influencer);
+  }
+
+  /** One detail for an application, from a reply to its own prompt. */
   async function saveApplyDetail(msg, examLabel, field) {
   const exam = openExam(examLabel);
   if (!exam) {
@@ -257,16 +328,14 @@ function createAffiliateBot({ polling = false } = {}) {
   const saved = await store.setPayoutField(msg.from, field, support.messageText(msg));
   if (!saved.ok) {
     await reply(msg.chat.id, `❌ ${esc(saved.reason)}`,
-      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:exam:${exam.id}` }]] } });
+      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:step:${exam.id}:${field}` }]] } });
     return;
   }
-  await reply(msg.chat.id, field === 'email'
-    ? `✅ Your email is set: <b>${esc(saved.value)}</b>`
-    : `✅ Your mobile number is set: <b>${esc(saved.value)}</b>`);
-  await continueApplication(msg.chat.id, msg.from, exam, saved.influencer);
+  await reply(msg.chat.id, `✅ Your ${esc(affiliates.PAYOUT_FIELDS[field].label.toLowerCase())} is set: <b>${esc(saved.value)}</b>`);
+  await continueApplication(msg.chat.id, msg.from, exam, saved.influencer, { oneByOne: true });
   }
 
-  /** Both details are in: the application goes to the admin. */
+  /** All four are in: the application goes to the admin. */
   async function submitApplication(chatId, user, exam, influencer) {
   const result = await store.createRequest(user, exam.id, store.contactDetails(influencer));
   if (!result.ok) {
@@ -278,16 +347,16 @@ function createAffiliateBot({ polling = false } = {}) {
   await reply(chatId,
     `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
     `Reference: <code>${esc(result.request.request_id)}</code>\n` +
-    `Email: <b>${esc(influencer.email)}</b> · Mobile: <b>${esc(influencer.phone)}</b>\n\n` +
+    `Name: <b>${esc(influencer.legal_name)}</b>\n` +
+    `Email: <b>${esc(influencer.email)}</b>\n` +
+    `Mobile: <b>${esc(influencer.phone)}</b>\n` +
+    `UPI ID: <b>${esc(influencer.upi_id)}</b>\n\n` +
     'An admin will review it and you will get a message here with your promo code and terms.\n' +
-    'Until then you can change your email or mobile below. Once approved they are fixed.\n\n' +
-    (details.complete
-      ? '💳 Your payout details are all set up, so you can be paid as soon as you earn.'
-      : `💳 To get paid, we still need: <b>${esc(details.missingLabels.join(', '))}</b>. ` +
-        'Tap below to add them while you wait.'),
+    'Until then you can change any of these below. Once approved, your email and mobile are fixed.' +
+    (details.complete ? '\n\n💳 Your payout details are all set up, so you can be paid as soon as you earn.' : ''),
     { reply_markup: { inline_keyboard: [
-      CHANGE_CONTACT_ROW,
-      [{ text: details.complete ? '💳 Payout details' : '💳 Add payout details', callback_data: 'aff:payout' }]
+      [{ text: '✏️ Change my details', callback_data: 'aff:set:all' }],
+      [{ text: '💳 Payout details', callback_data: 'aff:payout' }]
     ] } });
   await notify.alertAdmins(notify.applicationAlert(result.request));
   }
@@ -297,10 +366,6 @@ function createAffiliateBot({ polling = false } = {}) {
   // with a tick or a cross so it is obvious what is left and how to change it.
 
   const PAYOUT_BUTTON = { inline_keyboard: [[{ text: '💳 Payout details', callback_data: 'aff:payout' }]] };
-  const CHANGE_CONTACT_ROW = [
-    { text: '✉️ Change email', callback_data: 'aff:set:email' },
-    { text: '📱 Change mobile', callback_data: 'aff:set:phone' }
-  ];
 
   async function sendPayoutCard(chatId, user, heading = '') {
     if (!(await requireStore(chatId))) return;
@@ -346,6 +411,7 @@ function createAffiliateBot({ polling = false } = {}) {
           [fixed('email') ? null : set(i.email ? '✉️ Change email' : '✉️ Add email', 'email'),
             set(i.pan ? '🪪 Change PAN' : '🪪 Add PAN', 'pan')].filter(Boolean),
           [set(i.upi_id ? '💳 Change UPI ID' : '💳 Add UPI ID', 'upi_id'), set(i.account_number ? '🏦 Change bank account' : '🏦 Add bank account', 'bank')],
+          [set('📝 Name, email, mobile & UPI in one message', 'all')],
           [
             { text: (status.method === 'upi' ? '● ' : '○ ') + 'Pay me by UPI', callback_data: 'aff:method:upi' },
             { text: (status.method === 'bank' ? '● ' : '○ ') + 'Pay me by bank', callback_data: 'aff:method:bank' }
@@ -365,6 +431,18 @@ function createAffiliateBot({ polling = false } = {}) {
         '<i>Example:\nRavi Kumar\n123456789012\nHDFC0001234</i>' +
         (i.account_number ? `\n\nCurrent: ${esc(i.account_holder)}, ${esc(affiliates.maskAccount(i.account_number))}, ${esc(i.ifsc)}` : ''),
         { reply_markup: { force_reply: true, input_field_placeholder: 'Name / account number / IFSC' } });
+      return;
+    }
+    if (field === 'all') {
+      const fields = affiliates.APPLY_FIELDS;
+      await reply(chatId,
+        `${PROMPT.all}\n\n` +
+        'Reply with these in <b>one message</b>, one per line. Leave out any you do not want to change.\n' +
+        fields.map((f) => DETAIL_LINES[f][0]).join('\n') + '\n\n' +
+        '<i>Example:\n' + fields.map((f) => esc(DETAIL_LINES[f][1])).join('\n') + '</i>' +
+        (fields.some((f) => i[f]) ? '\n\nNow: ' + fields.filter((f) => i[f])
+          .map((f) => `${esc(affiliates.PAYOUT_FIELDS[f].label)} <code>${esc(i[f])}</code>`).join(' · ') : ''),
+        { reply_markup: { force_reply: true, input_field_placeholder: 'One per line' } });
       return;
     }
     const [promptKey, ask, example] = FIELD_PROMPTS[field] || [];
@@ -390,6 +468,19 @@ function createAffiliateBot({ polling = false } = {}) {
       (await store.listRequests()).some((r) => r.telegram_id === String(msg.from.id) && r.status === 'pending');
     await sendPayoutCard(msg.chat.id, msg.from, `✅ Saved: <b>${esc(affiliates.PAYOUT_FIELDS[field].label)}</b>` +
       (waiting ? ' — your application now shows the new one.' : '') + '\n');
+  }
+
+  /** A reply to the all-at-once prompt on the payout card. */
+  async function saveAllFields(msg) {
+    const parsed = affiliates.parseDetails(support.messageText(msg));
+    if (!Object.keys(parsed.values).length) {
+      await reply(msg.chat.id, '❌ I could not read any details in that. Send them one per line, like the example.' +
+        (parsed.problems.length ? '\n\n' + savedSummary({ saved: [], refused: [] }, parsed.problems) : ''),
+      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: 'aff:set:all' }]] } });
+      return;
+    }
+    const result = await store.setPayoutFields(msg.from, parsed.values);
+    await sendPayoutCard(msg.chat.id, msg.from, savedSummary(result, parsed.problems) + '\n');
   }
 
   async function saveBank(msg) {
@@ -536,7 +627,7 @@ function createAffiliateBot({ polling = false } = {}) {
   async function sendHelp(chatId) {
     await reply(chatId,
       '<b>How the influencer programme works</b>\n\n' +
-      '1. /apply — choose an exam channel and give your email and mobile number.\n' +
+      '1. /apply — choose an exam channel and send your name, email, mobile and UPI ID (one message is enough).\n' +
       '2. The admin reviews it and sets your terms: the discount your followers get, what you earn per ' +
       'student, and whether you withdraw weekly or monthly.\n' +
       '3. You get a promo code and a link. Your code works only in that exam\'s payment bot.\n' +
@@ -617,6 +708,21 @@ function createAffiliateBot({ polling = false } = {}) {
       if (data === 'aff:codes') { await ack(); await sendCodes(chatId, user); return; }
       if (data === 'aff:withdraw') { await ack(); await sendWithdrawChoice(chatId, user); return; }
       if (data === 'aff:payout' || data === 'aff:upi') { await ack(); await sendPayoutCard(chatId, user); return; }
+      if (data.startsWith('aff:one:')) {
+        await ack();
+        const exam = openExam(data.slice(8));
+        if (!exam) { await reply(chatId, 'That exam is not open for promotion any more. Send /apply to see what is.'); return; }
+        const influencer = await store.upsertInfluencer(user, { applying_for: exam.id });
+        await continueApplication(chatId, user, exam, influencer, { oneByOne: true });
+        return;
+      }
+      if (data.startsWith('aff:step:')) {
+        await ack();
+        const [, , examId, field] = data.split(':');
+        const exam = openExam(examId);
+        if (exam && APPLY_STEPS[field]) await askApplyStep(chatId, exam, field);
+        return;
+      }
       if (data.startsWith('aff:set:')) { await ack(); await askForField(chatId, user, data.slice(8)); return; }
       if (data.startsWith('aff:method:')) { await ack(); await chooseMethod(chatId, user, data.slice(11)); return; }
       if (data.startsWith('aff:wd:')) { await ack('Requesting…'); await withdraw(chatId, user, data.slice(7)); return; }
@@ -628,19 +734,26 @@ function createAffiliateBot({ polling = false } = {}) {
   });
 
   /**
-   * savePlainDetail — a message that is plainly an email or a mobile number,
-   * sent without replying to the prompt. Mid-application it continues the
-   * application; otherwise it is saved as a payout detail. False when the
-   * message is neither, so the caller can point the way instead.
+   * savePlainDetail — details typed without replying to a prompt. While an
+   * application is open they go into it (one or all four at once); otherwise
+   * they are saved as payout details. False when the message holds no
+   * detail at all, so the caller can point the way instead.
    */
   async function savePlainDetail(msg) {
+    if (!store.isConfigured()) return false;
     const text = support.messageText(msg);
-    const field = ['email', 'phone'].find((f) => affiliates.checkPayoutField(f, text).ok);
-    if (!field || !store.isConfigured()) return false;
     const influencer = (await store.getInfluencer(msg.from.id)) || {};
     const exam = influencer.applying_for ? openExam(influencer.applying_for) : null;
-    if (exam) await saveApplyDetail(msg, exam.label, field);
-    else await saveField(msg, field);
+    // A lone name is only taken when the application is waiting for one:
+    // anywhere else "ok" or "thanks" would become somebody's name.
+    const parsed = affiliates.parseDetails(text, { allowLoneName: Boolean(exam && !influencer.legal_name) });
+    if (!Object.keys(parsed.values).length) return false;
+    if (exam) {
+      await saveApplyAll(msg, exam, parsed);
+      return true;
+    }
+    const result = await store.setPayoutFields(msg.from, parsed.values);
+    await sendPayoutCard(msg.chat.id, msg.from, savedSummary(result, parsed.problems) + '\n');
     return true;
   }
 
@@ -660,14 +773,20 @@ function createAffiliateBot({ polling = false } = {}) {
     try {
       const replied = msg.reply_to_message;
       const prompt = replied && replied.from && replied.from.is_bot ? support.messageText(replied) : '';
-      if (prompt.startsWith(PROMPT.applyEmail)) {
-        await saveApplyDetail(msg, prompt.split('\n')[0].slice(PROMPT.applyEmail.length).trim(), 'email');
+      // A reply to one of the application's own prompts: which exam is in its first line.
+      const examIn = (key) => prompt.split('\n')[0].slice(PROMPT[key].length).trim();
+      if (prompt.startsWith(PROMPT.applyAll)) {
+        const exam = openExam(examIn('applyAll'));
+        if (!exam) { await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.'); return; }
+        await saveApplyAll(msg, exam, affiliates.parseDetails(support.messageText(msg)));
         return;
       }
-      if (prompt.startsWith(PROMPT.applyPhone)) {
-        await saveApplyDetail(msg, prompt.split('\n')[0].slice(PROMPT.applyPhone.length).trim(), 'phone');
+      const step = Object.keys(APPLY_STEPS).find((f) => prompt.startsWith(PROMPT[APPLY_STEPS[f][0]]));
+      if (step) {
+        await saveApplyDetail(msg, examIn(APPLY_STEPS[step][0]), step);
         return;
       }
+      if (prompt.startsWith(PROMPT.all)) { await saveAllFields(msg); return; }
       if (prompt.startsWith(PROMPT.bank)) { await saveBank(msg); return; }
       const field = Object.keys(FIELD_PROMPTS).find((f) => prompt.startsWith(PROMPT[FIELD_PROMPTS[f][0]]));
       if (field) { await saveField(msg, field); return; }

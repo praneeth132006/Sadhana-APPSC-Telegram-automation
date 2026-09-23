@@ -303,18 +303,65 @@ async function setPayoutField(user, field, raw) {
   const saved = await upsertInfluencer(user, patch);
   await log(`Influencer ${saved.telegram_id}`, `${field}_set`, saved.telegram_id,
     field === 'account_number' ? affiliates.maskAccount(checked.value) : checked.value);
-  if (CONTACT_FIELDS.includes(field)) await refreshPendingDetails(saved);
+  if (DETAIL_FIELDS.includes(field)) await refreshPendingDetails(saved);
   return { ok: true, influencer: saved, value: checked.value };
 }
 
-/** The details the admin approves an application on. */
+/**
+ * setPayoutFields — several details in one go (the "all at once" message),
+ * each checked, and written in a single update. What cannot be saved — a bad
+ * value, or an email or mobile already locked by an approval — is reported
+ * per field while the rest are still saved.
+ *
+ * @param {Object} user Telegram user
+ * @param {Object} values { legal_name, email, phone, upi_id, … } raw values
+ * @returns {Promise<{ok: boolean, influencer: Object, saved: string[], refused: Array<{field, reason}>}>}
+ */
+async function setPayoutFields(user, values) {
+  const id = String(user.id || user.telegram_id);
+  const current = (await getInfluencer(id)) || {};
+  const patch = {};
+  const saved = [];
+  const refused = [];
+  let locked = null;
+  for (const [field, raw] of Object.entries(values || {})) {
+    const checked = affiliates.checkPayoutField(field, raw);
+    if (!checked.ok) {
+      refused.push({ field, reason: checked.reason });
+      continue;
+    }
+    if (CONTACT_FIELDS.includes(field) && current[field] && current[field] !== checked.value) {
+      if (locked === null) locked = await contactLocked(id);
+      if (locked) {
+        refused.push({ field, reason: CONTACT_LOCKED_REASON });
+        continue;
+      }
+    }
+    patch[field] = checked.value;
+    saved.push(field);
+  }
+  if (!saved.length) return { ok: false, influencer: current, saved, refused };
+
+  if (patch.upi_id && !current.payout_method) patch.payout_method = 'upi';
+  patch.details_complete = affiliates.payoutDetails(Object.assign({}, current, patch)).complete ? 'yes' : 'no';
+  const influencer = await upsertInfluencer(user, patch);
+  await log(`Influencer ${influencer.telegram_id}`, 'details_set', influencer.telegram_id,
+    saved.map((f) => `${f}=${patch[f]}`).join(', '));
+  if (saved.some((f) => DETAIL_FIELDS.includes(f))) await refreshPendingDetails(influencer);
+  return { ok: true, influencer, saved, refused };
+}
+
+/** Locked once an application is approved. */
 const CONTACT_FIELDS = ['email', 'phone'];
+/** What an application carries, so a change to any of them reaches a waiting request. */
+const DETAIL_FIELDS = ['legal_name', 'email', 'phone', 'upi_id'];
 const CONTACT_LOCKED_REASON = 'Your email and mobile number cannot be changed once your application is approved. ' +
   'To change them, send /support and ask the admin.';
 
 /** An application's Details line, from the influencer's row. */
 function contactDetails(influencer) {
-  return `Email: ${influencer.email || '—'} · Mobile: ${influencer.phone || '—'}`;
+  return `Name: ${influencer.legal_name || '—'} · Email: ${influencer.email || '—'} · ` +
+    `Mobile: ${influencer.phone || '—'} · UPI: ${influencer.upi_id || '—'}`;
 }
 
 /** True once the admin has approved any application: they hold a code. */
@@ -906,6 +953,7 @@ module.exports = {
   upsertInfluencer,
   setUpi,
   setPayoutField,
+  setPayoutFields,
   contactLocked,
   contactDetails,
   CONTACT_LOCKED_REASON,

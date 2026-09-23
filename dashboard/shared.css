@@ -1788,3 +1788,19 @@
   .net-activity-bar::before,
   .progress-track.indeterminate .progress-fill { animation-duration: 3s; }
 }
+
+/* Influencer queue: the badge on the Influencers link, and the banner on every other page. */
+.nav-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px; margin-left: 2px;
+  border-radius: 999px; background: #ef4444; color: #fff;
+  font-size: 0.7rem; font-weight: 700; line-height: 1;
+}
+.queue-banner-host { max-width: 1400px; margin: 12px auto 0; padding: 0 24px; }
+.queue-banner-host:empty { display: none; }
+.queue-banner .queue-latest { color: var(--text-secondary); }
+.queue-banner .queue-link { margin-left: 10px; font-weight: 600; white-space: nowrap; }
+@media (max-width: 720px) {
+  .queue-banner-host { padding: 0 16px; }
+  .queue-banner .queue-link { display: inline-block; margin: 6px 12px 0 0; }
+}

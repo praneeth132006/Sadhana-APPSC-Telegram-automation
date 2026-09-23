@@ -262,3 +262,63 @@ test('payout details say what is missing for the chosen method', () => {
   assert.equal(affiliates.payoutDetails({ legal_name: 'R', phone: '9', email: 'e', upi_id: 'x@y', payout_method: 'bank' }).complete, false,
     'choosing bank needs the bank account, even with a UPI ID on file');
 });
+
+// ---------------------------------------------------------------------------
+// Reading an influencer's details from one message
+// ---------------------------------------------------------------------------
+
+test('parseDetails reads name, email, mobile and UPI ID in any order', () => {
+  const want = { legal_name: 'Ravi Kumar', email: 'ravi@gmail.com', phone: '9876543210', upi_id: 'ravi@okicici' };
+  for (const text of [
+    'Ravi Kumar\nravi@gmail.com\n9876543210\nravi@okicici',
+    'ravi@okicici\n+91 98765 43210\nRAVI@GMAIL.COM\nRavi Kumar',
+    '  Ravi Kumar  \n\n ravi@gmail.com \r\n 098765-43210 \n ravi@okicici ',
+    'Ravi Kumar, ravi@gmail.com, 9876543210, ravi@okicici',
+    'Ravi Kumar; ravi@gmail.com; 9876543210; ravi@okicici',
+    '1. Ravi Kumar\n2. ravi@gmail.com\n3. 9876543210\n4. ravi@okicici',
+    '1) Ravi Kumar\n2) ravi@gmail.com\n3) 9876543210\n4) ravi@okicici',
+    '- Ravi Kumar\n• ravi@gmail.com\n* 9876543210\n- ravi@okicici',
+    'Name: Ravi Kumar\nEmail: ravi@gmail.com\nMobile: 9876543210\nUPI ID: ravi@okicici',
+    'Full name - Ravi Kumar\nE-mail id = ravi@gmail.com\nPhone number: 9876543210\nUPI: ravi@okicici',
+    'Name as on bank account: Ravi Kumar\nEmail address: ravi@gmail.com\nMobile no: 9876543210\nupi id: ravi@okicici'
+  ]) {
+    const { values, problems } = affiliates.parseDetails(text);
+    assert.deepEqual(values, want, `misread:\n${text}`);
+    assert.deepEqual(problems, [], `complained about:\n${text}`);
+  }
+});
+
+test('parseDetails never mistakes an email for a UPI ID or the other way round', () => {
+  assert.deepEqual(affiliates.parseDetails('ravi.kumar@gmail.com').values, { email: 'ravi.kumar@gmail.com' });
+  assert.deepEqual(affiliates.parseDetails('ravi.kumar@okicici').values, { upi_id: 'ravi.kumar@okicici' });
+  assert.deepEqual(affiliates.parseDetails('9876543210@ybl').values, { upi_id: '9876543210@ybl' });
+  assert.deepEqual(affiliates.parseDetails('ravi-k@company.co.in').values, { email: 'ravi-k@company.co.in' });
+});
+
+test('parseDetails keeps what it can read and names every line it cannot', () => {
+  const { values, problems } = affiliates.parseDetails('Ravi Kumar\nMobile: 12345\n98765\nravi@gmail.com\nravi@gmail.com');
+  assert.deepEqual(values, { legal_name: 'Ravi Kumar', email: 'ravi@gmail.com' });
+  assert.deepEqual(problems.map((p) => p.line), ['Mobile: 12345', '98765', 'ravi@gmail.com']);
+  assert.match(problems[0].reason, /^Mobile number: Send a 10-digit/);
+  assert.match(problems[1].reason, /Not recognised/);
+  assert.match(problems[2].reason, /given twice/);
+});
+
+test('parseDetails does not turn sentences or chatter into a name', () => {
+  for (const text of ['I promote on YouTube', 'my channel has 40k subscribers', 'please approve me', 'hi', 'ok', 'Thanks']) {
+    assert.equal(affiliates.parseDetails(text).values.legal_name, undefined, `"${text}" became a name`);
+  }
+  // A name with a label is taken as given, even if short.
+  assert.equal(affiliates.parseDetails('Name: Sai').values.legal_name, 'Sai');
+  // A real name on its own is taken — unless the caller says a lone name is not expected.
+  assert.equal(affiliates.parseDetails('Sai Teja').values.legal_name, 'Sai Teja');
+  assert.deepEqual(affiliates.parseDetails('Sai Teja', { allowLoneName: false }).values, {});
+  // ...but a name next to other details is always taken.
+  assert.equal(affiliates.parseDetails('Sai Teja\nsai@gmail.com', { allowLoneName: false }).values.legal_name, 'Sai Teja');
+});
+
+test('parseDetails of nothing is nothing', () => {
+  for (const text of ['', '   ', '\n\n', null, undefined]) {
+    assert.deepEqual(affiliates.parseDetails(text), { values: {}, problems: [] });
+  }
+});

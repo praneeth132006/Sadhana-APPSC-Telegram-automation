@@ -413,6 +413,96 @@ function payoutDetails(influencer) {
   return { method, complete: missing.length === 0, missing, missingLabels: missing.map((f) => PAYOUT_FIELDS[f].label) };
 }
 
+/** The four details an application asks for, in the order they are asked. */
+const APPLY_FIELDS = ['legal_name', 'email', 'phone', 'upi_id'];
+
+/** A labelled line ("Email: …", "UPI ID = …"), and which field each label means. */
+const LABELLED_LINE = new RegExp('^(' + [
+  '(?:full\\s+)?name(?:\\s+as\\s+on\\s+(?:your\\s+)?bank(?:\\s+account)?)?',
+  'e-?mail(?:\\s+(?:id|address))?',
+  '(?:mobile|phone|contact)(?:\\s+(?:no\\.?|number))?',
+  'number',
+  'upi(?:\\s+id)?'
+].join('|') + ')\\s*[:=\\-–]\\s*(.+)$', 'i');
+
+function labelField(label) {
+  const l = label.toLowerCase();
+  if (/name/.test(l)) return 'legal_name';
+  if (/mail/.test(l)) return 'email';
+  if (/upi/.test(l)) return 'upi_id';
+  return 'phone';
+}
+
+/** Short replies that are not anyone's name. */
+const NOT_A_NAME = /^(?:hi|hii+|hello|hey|ok|okay|yes|no|thanks|thank you|start|help|done|sure)$/i;
+
+/** Words that make a line a sentence rather than somebody's name. */
+const SENTENCE_WORDS = new Set(['i', 'im', 'am', 'is', 'are', 'was', 'on', 'in', 'at', 'the', 'my', 'me', 'and', 'or',
+  'to', 'of', 'for', 'with', 'we', 'you', 'your', 'our', 'it', 'this', 'that', 'will', 'can', 'please', 'promote',
+  'channel', 'youtube', 'instagram', 'telegram', 'followers', 'subscribers', 'name', 'email', 'mobile', 'upi']);
+
+/**
+ * looksLikeName — a line with no label is taken as a name only if it reads
+ * like one: at most five words, none of them the words of a sentence.
+ */
+function looksLikeName(text) {
+  const words = String(text).trim().toLowerCase().split(/\s+/);
+  return words.length <= 5 && !words.some((w) => SENTENCE_WORDS.has(w.replace(/[^a-z]/g, '')));
+}
+
+/**
+ * parseDetails — an influencer's name, email, mobile and UPI ID from one
+ * message, in any order, one per line (or separated by commas).
+ *
+ * Each line may carry a label ("Email: …", "2. 98765 43210"); a line without
+ * one is recognised by its shape. The four shapes cannot be mistaken for each
+ * other: an email has a dot after the @, a UPI ID never does, a mobile is
+ * digits and a name is letters.
+ *
+ * @param {string} text
+ * @param {Object} [options]
+ * @param {boolean} [options.allowLoneName] Accept a message that is only a
+ *   name. Off for chatter, where "ok" would otherwise become a name.
+ * @returns {{values: Object, problems: Array<{line: string, reason: string}>}}
+ */
+function parseDetails(text, { allowLoneName = true } = {}) {
+  let lines = String(text || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 1 && /[,;|]/.test(lines[0])) lines = lines[0].split(/[,;|]/).map((l) => l.trim()).filter(Boolean);
+
+  const values = {};
+  const problems = [];
+  const take = (field, raw, line) => {
+    if (values[field] !== undefined) {
+      problems.push({ line, reason: `${PAYOUT_FIELDS[field].label} was given twice; the first one was kept.` });
+      return;
+    }
+    const checked = checkPayoutField(field, raw);
+    if (checked.ok) values[field] = checked.value;
+    else problems.push({ line, reason: `${PAYOUT_FIELDS[field].label}: ${checked.reason}` });
+  };
+
+  for (const line of lines) {
+    // "1. Ravi", "2) ravi@…", "- 98765…"
+    const bare = line.replace(/^(?:\d{1,2}\s*[.)\-:]|[-•*])\s*/, '');
+    const labelled = bare.match(LABELLED_LINE);
+    if (labelled) {
+      take(labelField(labelled[1]), labelled[2].trim(), line);
+      continue;
+    }
+    const field = ['email', 'upi_id', 'phone', 'legal_name']
+      .find((f) => checkPayoutField(f, bare).ok && (f !== 'legal_name' || looksLikeName(bare)));
+    if (field) take(field, bare, line);
+    else problems.push({ line, reason: 'Not recognised as a name, email, mobile number or UPI ID.' });
+  }
+
+  // A message that is only a name is usually chatter ("ok", "hi").
+  const onlyName = Object.keys(values).length === 1 && values.legal_name;
+  if (onlyName && (!allowLoneName || NOT_A_NAME.test(values.legal_name))) {
+    delete values.legal_name;
+  }
+  return { values, problems };
+}
+
 /** "XXXXXX1234" — enough to recognise an account without showing it. */
 function maskAccount(number) {
   const text = String(number || '');
@@ -526,5 +616,7 @@ module.exports = {
   PAYOUT_FIELDS,
   checkPayoutField,
   payoutDetails,
-  maskAccount
+  maskAccount,
+  APPLY_FIELDS,
+  parseDetails
 };

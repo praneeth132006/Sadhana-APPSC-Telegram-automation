@@ -698,6 +698,13 @@ async function load({ quiet = false } = {}) {
 initDashboard({
   page: 'influencers',
   onReady: async () => {
+    // Opened from the "withdrawal requested" banner: influencers.html?tab=payouts
+    try {
+      const wanted = new URLSearchParams(window.location.search).get('tab');
+      if (['requests', 'payouts', 'people', 'codes', 'sales', 'history'].includes(wanted)) activeTab = wanted;
+    } catch (err) {
+      // No query string; the page picks what needs a decision.
+    }
     $('refreshBtn').addEventListener('click', () => load());
     $('exportBtn').addEventListener('click', () => { if (data && data.sales) exportCsv(); });
     $('helpBtn').addEventListener('click', () => {

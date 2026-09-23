@@ -431,3 +431,44 @@ test('the paid message names a bank transfer as one, not as UPI', () => {
   const upi = notify.payoutPaidMessage({ payout_method: 'upi', upi_id: 'ravi@okicici', amount_paise: 5000, code: 'RAVI10', reference: 'R1' });
   assert.match(upi, /Sent to <code>ravi@okicici/);
 });
+
+test('setPayoutFields saves several details in one write, and reports what it could not', async () => {
+  const { book, api } = fresh();
+  const out = await store.setPayoutFields(RAVI, { legal_name: 'Ravi Kumar', email: 'RAVI@GMAIL.COM', phone: '123', upi_id: 'ravi@okicici' });
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.saved, ['legal_name', 'email', 'upi_id']);
+  assert.deepEqual(out.refused.map((r) => r.field), ['phone']);
+  assert.equal(out.influencer.email, 'ravi@gmail.com');
+  assert.equal(out.influencer.payout_method, 'upi');
+  assert.equal(out.influencer.details_complete, 'no', 'the mobile is still missing');
+  const person = await store.getInfluencer(501);
+  assert.equal(person.legal_name, 'Ravi Kumar');
+  assert.equal(book.Influencers.length, 2, 'one person, one row');
+
+  // Four details are one write to their row, not four.
+  const rowWrites = () => api.calls.filter((c) => c.method === 'POST' && c.body && Array.isArray(c.body.data) &&
+    c.body.data.some((d) => /^'Influencers'!/.test(d.range))).length;
+  const before = rowWrites();
+  await store.setPayoutFields(RAVI, { legal_name: 'Ravi K', email: 'ravi@yahoo.com', phone: '9876543210', upi_id: 'ravi@ybl' });
+  assert.equal(rowWrites() - before, 1);
+
+  const nothing = await store.setPayoutFields(RAVI, { phone: 'nope' });
+  assert.equal(nothing.ok, false);
+  assert.deepEqual(nothing.saved, []);
+});
+
+test('setPayoutFields keeps a waiting application\'s details current, and respects the lock after approval', async () => {
+  const { book } = fresh();
+  await store.setPayoutFields(RAVI, { legal_name: 'Ravi Kumar', email: 'ravi@gmail.com', phone: '9876543210', upi_id: 'ravi@okicici' });
+  const applied = await store.createRequest(RAVI, 'news', store.contactDetails(await store.getInfluencer(501)));
+  assert.equal(applied.ok, true);
+  await store.setPayoutFields(RAVI, { upi_id: 'ravi@ybl', legal_name: 'Ravi K' });
+  const [header, row] = book.Requests;
+  assert.equal(row[header.indexOf('Details')], 'Name: Ravi K · Email: ravi@gmail.com · Mobile: 9876543210 · UPI: ravi@ybl');
+
+  await store.approveRequest(applied.request.request_id, TERMS, 'Admin');
+  const locked = await store.setPayoutFields(RAVI, { email: 'new@gmail.com', upi_id: 'ravi@okaxis' });
+  assert.deepEqual(locked.saved, ['upi_id']);
+  assert.match(locked.refused[0].reason, /cannot be changed once your application is approved/);
+  assert.equal((await store.getInfluencer(501)).email, 'ravi@gmail.com');
+});

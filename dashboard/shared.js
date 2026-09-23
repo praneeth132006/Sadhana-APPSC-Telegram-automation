@@ -580,6 +580,7 @@ function buildTopBar(activePage) {
 
   const nav = el('nav', { class: 'main-nav' },
     PAGES.map((page) => el('a', {
+      id: `nav-${page.id}`,
       class: 'nav-link' + (page.id === activePage ? ' active' : ''),
       href: withGroup(page.href),
       title: page.hint
@@ -1157,6 +1158,10 @@ export async function initDashboard({ page, onReady }) {
       return;
     }
 
+    // Withdrawals and applications waiting, on every page — not only on the
+    // Influencers page, where nobody looks until they already know.
+    watchInfluencerQueue(page);
+
     try {
       await onReady(user);
     } catch (err) {
@@ -1185,6 +1190,98 @@ export async function initDashboard({ page, onReady }) {
 }
 
 /** Signs the current curator out. */
+// ---------------------------------------------------------------------------
+// Influencer queue: withdrawals and applications waiting for an admin
+// ---------------------------------------------------------------------------
+
+/** How often every open page checks for new withdrawals and applications. */
+const QUEUE_POLL_MS = 60 * 1000;
+/** Withdrawal ids already seen, so only a new one raises a toast. */
+let seenPayouts = null;
+let queueTimer = null;
+
+const queueRupees = (paise) => {
+  const r = (Number(paise) || 0) / 100;
+  return '₹' + (Number.isInteger(r) ? r : r.toFixed(2));
+};
+
+/**
+ * renderInfluencerQueue — the Influencers link's badge, and on every other
+ * page a banner while a withdrawal or application is waiting. Exported for
+ * the tests; pages never call it.
+ */
+export function renderInfluencerQueue(queue, activePage) {
+  const waiting = (Number(queue.payouts) || 0) + (Number(queue.requests) || 0);
+  const parts = [];
+  if (queue.payouts) parts.push(`${queue.payouts} withdrawal${queue.payouts === 1 ? '' : 's'} to pay (${queueRupees(queue.payoutPaise)})`);
+  if (queue.requests) parts.push(`${queue.requests} application${queue.requests === 1 ? '' : 's'} to decide`);
+
+  const link = document.getElementById('nav-influencers');
+  if (link) {
+    let badge = document.getElementById('navInfluencersBadge');
+    if (!badge) {
+      badge = el('span', { id: 'navInfluencersBadge', class: 'nav-badge' });
+      link.append(badge);
+    }
+    badge.textContent = waiting ? String(waiting) : '';
+    badge.style.display = waiting ? '' : 'none';
+    link.setAttribute('title', waiting ? `Waiting: ${parts.join(' · ')}` : 'Influencer applications, promo codes, sales and withdrawals');
+  }
+
+  const root = $('pageRoot');
+  let host = document.getElementById('influencerQueueBanner');
+  if (!host && root && root.parentNode) {
+    host = el('div', { id: 'influencerQueueBanner', class: 'queue-banner-host' });
+    root.parentNode.insertBefore(host, root);
+  }
+  if (!host) return;
+  // The Influencers page shows the same thing in its own tabs.
+  if (!waiting || activePage === 'influencers') {
+    replaceChildren(host);
+    return;
+  }
+  const selected = getSelectedGroup();
+  const href = (tab) => `influencers.html?${selected ? `group=${encodeURIComponent(selected)}&` : ''}tab=${tab}`;
+  const latest = (queue.latestPayouts || [])[0];
+  replaceChildren(host, el('div', { class: 'banner tone-warn queue-banner' }, [
+    el('div', { class: 'banner-body' }, [
+      el('strong', { text: queue.payouts ? '💸 Influencer withdrawal requested. ' : '📝 Influencer application waiting. ' }),
+      el('span', { text: parts.join(' · ') + '.' }),
+      latest ? el('span', { class: 'queue-latest', text: ` Latest: ${latest.name || (latest.username ? '@' + latest.username : 'an influencer')}` +
+        `${latest.code ? ` (${latest.code})` : ''} — ${queueRupees(latest.amount_paise)}${latest.requested_at ? `, ${String(latest.requested_at).replace(/ IST$/, '')}` : ''}.` }) : null,
+      ' ',
+      queue.payouts ? el('a', { id: 'queuePayoutsLink', class: 'queue-link', href: href('payouts'), text: 'Open withdrawals →' }) : null,
+      queue.requests ? el('a', { id: 'queueRequestsLink', class: 'queue-link', href: href('requests'), text: 'Open applications →' }) : null
+    ])
+  ]));
+}
+
+/** One check: fetch the queue, draw it, and toast any withdrawal that is new. */
+async function refreshInfluencerQueue(activePage) {
+  let queue;
+  try {
+    queue = await api('/api/affiliates/pending');
+  } catch (err) {
+    return; // A missed check is not worth interrupting anyone over.
+  }
+  if (!queue || !queue.configured) return;
+  renderInfluencerQueue(queue, activePage);
+  const ids = (queue.latestPayouts || []).map((p) => p.payout_id);
+  if (seenPayouts) {
+    const fresh = (queue.latestPayouts || []).filter((p) => !seenPayouts.has(p.payout_id));
+    for (const p of fresh) {
+      showToast('warn', `💸 New withdrawal request: ${p.name || (p.username ? '@' + p.username : 'an influencer')} — ` +
+        `${queueRupees(p.amount_paise)}${p.code ? ` (${p.code})` : ''}. Open Influencers → Withdrawals to pay it.`, 12000);
+    }
+  }
+  seenPayouts = new Set([...(seenPayouts || []), ...ids]);
+}
+
+function watchInfluencerQueue(activePage) {
+  refreshInfluencerQueue(activePage);
+  if (!queueTimer) queueTimer = setInterval(() => refreshInfluencerQueue(activePage), QUEUE_POLL_MS);
+}
+
 export function logout() {
   return signOut(auth);
 }
