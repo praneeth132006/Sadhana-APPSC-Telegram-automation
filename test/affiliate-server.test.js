@@ -294,3 +294,37 @@ test('the daily sweep puts back a bot menu that drifted, and leaves a correct on
     globalThis.fetch = previous;
   }
 });
+
+test('every dashboard page can see what is waiting: applications and withdrawals, newest first', async () => {
+  assert.equal((await api('/api/affiliates/pending', { token: null })).status, 401);
+  const empty = (await api('/api/affiliates/pending')).json.data;
+  assert.deepEqual(empty, { configured: true, requests: 0, payouts: 0, payoutPaise: 0, latestPayouts: [] });
+
+  const requestId = await pendingRequest();
+  assert.equal((await api('/api/affiliates/pending')).json.data.requests, 1);
+
+  await api('/api/affiliates/approve', { method: 'POST', body: { requestId, terms: Object.assign({ code: 'RAVI10' }, TERMS) } });
+  await store.setPayoutFields(RAVI, { legal_name: 'Ravi Kumar', phone: '9876543210', email: 'ravi@example.com', upi_id: 'ravi@okicici' });
+  await store.recordSale({ code: 'RAVI10', payment_id: 'pay_1', student_id: 900, paid_paise: 17910, commission_paise: 3582 });
+  const { payout } = await store.requestPayout('RAVI10', 501);
+
+  const waiting = (await api('/api/affiliates/pending')).json.data;
+  assert.equal(waiting.requests, 0, 'the approved application is no longer waiting');
+  assert.equal(waiting.payouts, 1);
+  assert.equal(waiting.payoutPaise, 3582);
+  assert.equal(waiting.latestPayouts[0].payout_id, payout.payout_id);
+  assert.equal(waiting.latestPayouts[0].code, 'RAVI10');
+  assert.equal(waiting.latestPayouts[0].amount_paise, 3582);
+  assert.ok(waiting.latestPayouts[0].name);
+
+  // Paid: nothing left waiting.
+  await api('/api/affiliates/payout', { method: 'POST', body: { payoutId: payout.payout_id, decision: 'paid', reference: 'UTR1' } });
+  assert.equal((await api('/api/affiliates/pending')).json.data.payouts, 0);
+});
+
+test('the waiting count never asks Telegram anything (it is polled every minute)', async () => {
+  let asked = 0;
+  notify.useClient({ getMe: async () => { asked++; return { username: 'x' }; }, sendMessage: async () => ({}) });
+  await api('/api/affiliates/pending');
+  assert.equal(asked, 0);
+});

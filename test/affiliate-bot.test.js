@@ -110,148 +110,233 @@ test('the welcome explains the programme and offers the four actions', async () 
   assert.deepEqual(buttons(out).map((b) => b.callback_data), ['aff:apply', 'aff:codes', 'aff:withdraw', 'aff:payout']);
 });
 
-test('applying: choose an exam, give email and mobile, and the admin is alerted', async () => {
-  const { tap, answer, alerts, book } = makeBot();
+const APPLY_ALL = `${PROMPT.applyAll}APPSC Newspaper`;
+const FOUR = 'Ravi Kumar\nRavi@Gmail.com\n+91 98765 43210\nravi@okicici';
+const TERMS_FOR_TESTS = () => affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
+  commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
 
+test('applying asks for exactly four things — name, email, mobile, UPI ID — in one message', async () => {
+  const { tap } = makeBot();
   const exams = await tap('aff:apply');
-  // One button per exam open to influencers — the APPSC ones for now.
   const offered = buttons(exams).map((b) => [b.text, b.callback_data]);
   assert.deepEqual(offered, affiliates.listExams().map((e) => [e.label, `aff:exam:${e.id}`]));
-  assert.ok(offered.some(([, data]) => data === 'aff:exam:news'));
   assert.ok(!offered.some(([, data]) => /upsc|epfo/.test(data)), 'a closed exam was offered');
 
-  const emailPrompt = await tap('aff:exam:news');
-  assert.ok(emailPrompt[0].args[1].startsWith(`${PROMPT.applyEmail}APPSC Newspaper`));
-  assert.equal(emailPrompt[0].args[2].reply_markup.force_reply, true);
-  assert.match(textOf(await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'not-an-email')), /does not look like an email/);
+  const ask = await tap('aff:exam:news');
+  assert.equal(ask.length, 1);
+  const text = ask[0].args[1];
+  assert.ok(text.startsWith(APPLY_ALL));
+  assert.match(text, /all four<\/b>|all four in <b>one message/);
+  for (const bit of ['Your name', 'Email', 'Mobile number', 'UPI ID']) assert.match(text, new RegExp(bit));
+  // Nothing else: no PAN, no bank account, no "where will you promote".
+  assert.doesNotMatch(text, /PAN|bank account number|IFSC|promote|audience/i);
+  assert.deepEqual(buttons(ask).map((b) => b.callback_data), ['aff:one:news'], 'one-at-a-time must be offered');
+});
 
-  const phonePrompt = await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'Ravi@Gmail.com');
-  // The email is confirmed out loud before the next question.
-  assert.match(phonePrompt[0].args[1], /Your email is set: <b>ravi@gmail\.com/);
-  assert.ok(phonePrompt[1].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
-  assert.match(textOf(await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '123')), /10-digit/);
+test('all four in one message: saved, confirmed, and the application sent at once', async () => {
+  const { tap, answer, alerts, book } = makeBot();
+  await tap('aff:exam:news');
+  const done = await answer(APPLY_ALL, FOUR);
+  assert.match(done[0].args[1], /Saved: Name as on your bank account <b>Ravi Kumar<\/b> · Email <b>ravi@gmail\.com<\/b> · Mobile number <b>9876543210<\/b> · UPI ID <b>ravi@okicici<\/b>/);
+  const sent = done[1].args[1];
+  assert.match(sent, /Application sent for APPSC Newspaper/);
+  assert.match(sent, /REQ-\d{8}-/);
+  for (const bit of ['Ravi Kumar', 'ravi@gmail\\.com', '9876543210', 'ravi@okicici']) assert.match(sent, new RegExp(bit));
+  assert.match(sent, /payout details are all set up/, 'name + mobile + email + UPI is everything RazorpayX needs');
+  assert.deepEqual(buttons(done).map((b) => b.callback_data), ['aff:set:all', 'aff:payout']);
 
-  const done = await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '+91 98765 43210');
-  assert.match(done[0].args[1], /Your mobile number is set: <b>9876543210/);
-  assert.match(done[1].args[1], /Application sent for APPSC Newspaper/);
-  assert.match(done[1].args[1], /REQ-\d{8}-/);
-  assert.match(done[1].args[1], /ravi@gmail\.com/);
-  assert.match(done[1].args[1], /9876543210/);
-  assert.match(done[1].args[1], /we still need: <b>Name as on your bank account, UPI ID/);
-  assert.deepEqual(buttons(done).map((b) => b.callback_data), ['aff:set:email', 'aff:set:phone', 'aff:payout']);
-
-  // The contact details are on their row, ready for a payout.
   const person = await store.getInfluencer(501);
-  assert.equal(person.email, 'ravi@gmail.com');
-  assert.equal(person.phone, '9876543210');
+  assert.deepEqual([person.legal_name, person.email, person.phone, person.upi_id, person.payout_method, person.details_complete],
+    ['Ravi Kumar', 'ravi@gmail.com', '9876543210', 'ravi@okicici', 'upi', 'yes']);
+  assert.equal(person.applying_for, '', 'the application is finished');
 
-  // In the sheet, as the admin will see it.
   const [header, row] = book.Requests;
   const cell = (name) => row[header.indexOf(name)];
-  assert.equal(cell('Telegram ID'), '501');
   assert.equal(cell('Exam'), 'news');
-  assert.equal(cell('Exam Bot'), 'TELEGRAM_PAYBOT_NEWS');
   assert.equal(cell('Status'), 'pending');
-  assert.match(cell('Details'), /ravi@gmail\.com · Mobile: 9876543210/);
+  assert.equal(cell('Details'), 'Name: Ravi Kumar · Email: ravi@gmail.com · Mobile: 9876543210 · UPI: ravi@okicici');
 
-  // And the admins were told, in Support Team, with a way to decide it.
   assert.equal(alerts.length, 1);
-  assert.equal(alerts[0].chatId, '-1005555555555');
   assert.match(alerts[0].text, /New influencer application/);
-  assert.match(alerts[0].text, /ravi_teaches/);
   assert.equal(alerts[0].extra.reply_markup.inline_keyboard[0][0].url, 'https://appscsadhana.vercel.app/influencers.html');
 });
 
-test('an email or mobile sent without tapping Reply still continues the application', async () => {
+test('the four can come in any order, labelled or numbered, or on one line with commas', async () => {
+  for (const message of [
+    'ravi@okicici\n9876543210\nravi@gmail.com\nRavi Kumar',
+    '1. Name: Ravi Kumar\n2. Email: ravi@gmail.com\n3. Mobile: 98765 43210\n4. UPI ID: ravi@okicici',
+    'Ravi Kumar, ravi@gmail.com, 9876543210, ravi@okicici'
+  ]) {
+    const { tap, answer } = makeBot();
+    await tap('aff:exam:news');
+    const out = await answer(APPLY_ALL, message);
+    assert.match(textOf(out), /Application sent/, `not understood:\n${message}`);
+  }
+});
+
+test('some details wrong: the good ones are kept, the bad ones named, and only the rest asked for', async () => {
+  const { tap, answer } = makeBot();
+  await tap('aff:exam:news');
+  const out = await answer(APPLY_ALL, 'Ravi Kumar\nravi@gmail.com\n12345\nhello world 42');
+  const text = textOf(out);
+  assert.match(text, /Saved: Name as on your bank account <b>Ravi Kumar<\/b> · Email <b>ravi@gmail\.com<\/b>/);
+  assert.match(text, /“12345” — Not recognised/);
+  assert.match(text, /“hello world 42” — Not recognised/);
+  // The follow-up asks only for what is missing, and says what it already has.
+  const again = out.at(-1).args[1];
+  assert.ok(again.startsWith(APPLY_ALL));
+  assert.match(again, /📱 Mobile number\n💳 UPI ID/);
+  assert.doesNotMatch(again, /Your name \(as on/);
+  assert.match(again, /Already saved: Name as on your bank account <b>Ravi Kumar<\/b> · Email <b>ravi@gmail\.com<\/b>/);
+
+  const done = await answer(APPLY_ALL, 'ravi@okicici\n9876543210');
+  assert.match(textOf(done), /Application sent/);
+});
+
+test('a labelled detail that is wrong says why', async () => {
+  const { tap, answer } = makeBot();
+  await tap('aff:exam:news');
+  const out = await answer(APPLY_ALL, 'Name: Ravi Kumar\nEmail: ravi@gmail.com\nMobile: 123\nUPI: ravi@okicici');
+  assert.match(textOf(out), /Mobile number: Send a 10-digit Indian mobile number/);
+  // Only the mobile is left, so it is asked for on its own.
+  assert.ok(out.at(-1).args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
+});
+
+test('nothing readable: said plainly, with the one-at-a-time way offered', async () => {
+  const { tap, answer } = makeBot();
+  await tap('aff:exam:news');
+  const out = await answer(APPLY_ALL, 'I promote on YouTube');
+  assert.match(textOf(out), /could not read any details/);
+  assert.ok(buttons(out).some((b) => b.callback_data === 'aff:one:news'));
+  assert.equal(await store.getInfluencer(501).then((i) => i.legal_name || ''), '');
+});
+
+test('one at a time: name, email, mobile, UPI ID, each confirmed, then sent', async () => {
+  const { tap, answer, alerts } = makeBot();
+  await tap('aff:exam:news');
+  const first = await tap('aff:one:news');
+  assert.ok(first[0].args[1].startsWith(`${PROMPT.applyName}APPSC Newspaper`));
+  assert.equal(first[0].args[2].reply_markup.force_reply, true);
+
+  const steps = [
+    [PROMPT.applyName, 'Ravi Kumar', /Your name as on your bank account is set: <b>Ravi Kumar/, PROMPT.applyEmail],
+    [PROMPT.applyEmail, 'ravi@gmail.com', /Your email is set: <b>ravi@gmail\.com/, PROMPT.applyPhone],
+    [PROMPT.applyPhone, '9876543210', /Your mobile number is set: <b>9876543210/, PROMPT.applyUpi]
+  ];
+  for (const [prompt, value, confirmed, next] of steps) {
+    const out = await answer(`${prompt}APPSC Newspaper`, value);
+    assert.match(out[0].args[1], confirmed);
+    assert.ok(out[1].args[1].startsWith(`${next}APPSC Newspaper`), `after ${value} it did not ask for the next one`);
+  }
+  assert.match(textOf(await answer(`${PROMPT.applyUpi}APPSC Newspaper`, 'not a upi')), /does not look like a UPI ID/);
+  const done = await answer(`${PROMPT.applyUpi}APPSC Newspaper`, 'ravi@okicici');
+  assert.match(textOf(done), /Application sent for APPSC Newspaper/);
+  assert.equal(alerts.length, 1);
+});
+
+test('details sent without tapping Reply still go into the application', async () => {
   const { tap, say, alerts } = makeBot();
   await tap('aff:exam:news');
-  const afterEmail = await say('ravi@gmail.com');
-  assert.match(afterEmail[0].args[1], /Your email is set: <b>ravi@gmail\.com/);
-  assert.ok(afterEmail[1].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
-
-  const done = await say('9876543210');
+  const done = await say(FOUR);
   assert.match(textOf(done), /Application sent for APPSC Newspaper/);
   assert.equal(alerts.length, 1);
 
   // Once sent, a stray email is saved as a payout detail, and said so.
   const later = await say('new@gmail.com');
-  assert.match(textOf(later), /Saved: <b>Email/);
+  assert.match(textOf(later), /Saved: Email <b>new@gmail\.com/);
   assert.equal((await store.getInfluencer(501)).email, 'new@gmail.com');
 });
 
-test('details already given are not asked for again, and a finished payout setup is said so', async () => {
+test('chatter is not mistaken for a name', async () => {
+  const { tap, say } = makeBot();
+  await tap('aff:exam:news');
+  const out = await say('ok');
+  assert.match(textOf(out), /\/apply/, 'it should point the way, not save "ok"');
+  assert.equal((await store.getInfluencer(501)).legal_name || '', '');
+  // But mid-application, a real name on its own is taken.
+  const named = await say('Ravi Kumar');
+  assert.match(textOf(named), /Saved: Name as on your bank account <b>Ravi Kumar/);
+});
+
+test('details already given are not asked for again', async () => {
   const { tap, answer } = makeBot();
-  await answer(PROMPT.legal_name, 'Ravi Kumar');
-  await answer(PROMPT.upi, 'ravi@okicici');
-  await answer(PROMPT.email, 'ravi@gmail.com');
-  await answer(PROMPT.phone, '9876543210');
+  await answer(PROMPT.all, FOUR);
   const out = await tap('aff:exam:news');
   assert.equal(out.length, 1, 'it asked for a detail it already had');
   assert.match(out[0].args[1], /Application sent for APPSC Newspaper/);
   assert.match(out[0].args[1], /payout details are all set up/);
-  assert.deepEqual(buttons(out).map((b) => b.text), ['✉️ Change email', '📱 Change mobile', '💳 Payout details']);
 });
 
-test('email and mobile can be changed while the application waits, and the admin sees the new ones', async () => {
+test('the payout card offers all four in one message, and it works there too', async () => {
+  const { tap, answer } = makeBot();
+  const card = await tap('aff:payout');
+  assert.ok(buttons(card).some((b) => b.callback_data === 'aff:set:all'));
+  const prompt = await tap('aff:set:all');
+  assert.ok(prompt[0].args[1].startsWith(PROMPT.all));
+  assert.equal(prompt[0].args[2].reply_markup.force_reply, true);
+  const saved = await answer(PROMPT.all, FOUR);
+  assert.match(textOf(saved), /Saved: Name as on your bank account <b>Ravi Kumar<\/b>/);
+  assert.match(textOf(saved), /All set/);
+  // Leaving some out changes only what was sent.
+  await answer(PROMPT.all, 'ravi.new@gmail.com');
+  const person = await store.getInfluencer(501);
+  assert.deepEqual([person.legal_name, person.email, person.upi_id], ['Ravi Kumar', 'ravi.new@gmail.com', 'ravi@okicici']);
+});
+
+test('any detail can be changed while the application waits, and the admin sees the new ones', async () => {
   const { tap, answer, book } = makeBot();
   await tap('aff:exam:news');
-  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
-  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
-
-  const prompt = await tap('aff:set:email');
-  assert.ok(prompt[0].args[1].startsWith(PROMPT.email));
-  const saved = await answer(PROMPT.email, 'ravi.new@gmail.com');
-  assert.match(textOf(saved), /your application now shows the new one/);
-  await answer(PROMPT.phone, '9123456780');
-
+  await answer(APPLY_ALL, FOUR);
+  const changed = await answer(PROMPT.all, 'Ravi K Sharma\nravi.new@gmail.com\n9123456780\nravi@ybl');
+  assert.match(textOf(changed), /Saved:/);
   const [header, row] = book.Requests;
-  assert.equal(row[header.indexOf('Details')], 'Email: ravi.new@gmail.com · Mobile: 9123456780');
+  assert.equal(row[header.indexOf('Details')], 'Name: Ravi K Sharma · Email: ravi.new@gmail.com · Mobile: 9123456780 · UPI: ravi@ybl');
+
+  // One at a time from the payout card works the same.
+  await answer(PROMPT.upi, 'ravi@okaxis');
+  assert.match(book.Requests[1][header.indexOf('Details')], /UPI: ravi@okaxis$/);
 });
 
-test('once approved, email and mobile are locked; the rest can still change', async () => {
+test('once approved, email and mobile are locked — even in an all-at-once message — the rest can change', async () => {
   const { tap, answer, say } = makeBot();
   await tap('aff:exam:news');
-  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
-  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
+  await answer(APPLY_ALL, FOUR);
   const [request] = await store.listRequests();
-  const terms = affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
-    commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
-  await store.approveRequest(request.request_id, Object.assign({}, terms, { code: 'RAVI10' }), 'Admin');
+  await store.approveRequest(request.request_id, Object.assign({}, TERMS_FOR_TESTS(), { code: 'RAVI10' }), 'Admin');
 
-  // The card shows them locked, with no button to change them.
   const card = await tap('aff:payout');
   assert.match(textOf(card), /cannot be changed here/);
   const data = buttons(card).map((b) => b.callback_data);
   assert.ok(!data.includes('aff:set:email') && !data.includes('aff:set:phone'), 'offered to change a locked detail');
-  assert.ok(data.includes('aff:set:upi_id'));
 
-  // An old button, a stale prompt or a typed address is refused all the same.
   assert.match(textOf(await tap('aff:set:email')), /cannot be changed once your application is approved/);
   assert.match(textOf(await answer(PROMPT.phone, '9123456780')), /cannot be changed/);
   assert.match(textOf(await say('other@gmail.com')), /cannot be changed/);
-  const person = await store.getInfluencer(501);
-  assert.equal(person.email, 'ravi@gmail.com');
-  assert.equal(person.phone, '9876543210');
+  const mixed = await answer(PROMPT.all, 'Ravi K Sharma\nother@gmail.com\nravi@ybl');
+  assert.match(textOf(mixed), /Saved: Name as on your bank account <b>Ravi K Sharma<\/b> · UPI ID <b>ravi@ybl<\/b>/);
+  assert.match(textOf(mixed), /❌ Email: Your email and mobile number cannot be changed/);
 
-  // Other payout details are unaffected.
-  assert.match(textOf(await answer(PROMPT.upi, 'ravi@okicici')), /Saved: <b>UPI ID/);
+  const person = await store.getInfluencer(501);
+  assert.deepEqual([person.legal_name, person.email, person.phone, person.upi_id],
+    ['Ravi K Sharma', 'ravi@gmail.com', '9876543210', 'ravi@ybl']);
 });
 
 test('a second application for the same exam is stopped before anything is typed', async () => {
   const { tap, answer } = makeBot();
   await tap('aff:exam:news');
-  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
-  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
+  await answer(APPLY_ALL, FOUR);
   const again = await tap('aff:exam:news');
   assert.match(again[0].args[1], /already with the admin/);
   assert.ok(!again[0].args[2] || !again[0].args[2].reply_markup, 'it asked for the details again');
 });
 
 test('an application for an exam that has been closed is refused', async () => {
-  const { answer } = makeBot();
+  const { answer, tap } = makeBot();
   // UPSC is not open to influencers, so a stale prompt cannot smuggle one in.
   const out = await answer(`${PROMPT.applyEmail}UPSC`, 'ravi@gmail.com');
   assert.match(textOf(out), /not open for promotion/);
+  assert.match(textOf(await answer(`${PROMPT.applyAll}UPSC`, FOUR)), /not open for promotion/);
+  assert.match(textOf(await tap('aff:one:upsc')), /not open for promotion/);
 });
 
 test('payout details: each is asked for, checked, saved, and can be changed', async () => {

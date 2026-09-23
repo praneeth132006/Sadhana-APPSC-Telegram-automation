@@ -833,6 +833,33 @@ async function examPass(exam) {
 async function handleAffiliateRoute(pathname, method, req, res, user) {
   const actor = user.name ? `${user.name} (${user.email})` : user.email;
 
+  // What is waiting for the admin — every dashboard page polls this for the
+  // Influencers badge and the "withdrawal requested" banner, so it reads only
+  // the two tabs it needs and never asks Telegram anything.
+  if (pathname === '/api/affiliates/pending' && method === 'GET') {
+    if (!affiliateStore.isConfigured()) {
+      sendJSON(res, 200, { success: true, data: { configured: false, requests: 0, payouts: 0, payoutPaise: 0, latestPayouts: [] } });
+      return true;
+    }
+    const [requests, payouts] = await Promise.all([affiliateStore.listRequests(), affiliateStore.listPayouts()]);
+    const waiting = payouts.filter((p) => p.status === 'requested');
+    sendJSON(res, 200, {
+      success: true,
+      data: {
+        configured: true,
+        requests: requests.filter((r) => r.status === 'pending').length,
+        payouts: waiting.length,
+        payoutPaise: waiting.reduce((sum, p) => sum + (Number(p.amount_paise) || 0), 0),
+        // Newest first, for "new withdrawal from …".
+        latestPayouts: waiting.slice().reverse().slice(0, 5).map((p) => ({
+          payout_id: p.payout_id, requested_at: p.requested_at, name: p.name, username: p.username,
+          code: p.code, amount_paise: p.amount_paise
+        }))
+      }
+    });
+    return true;
+  }
+
   const status = {
     sheet: affiliateStore.isConfigured(),
     bot: affiliateNotify.isConfigured(),
