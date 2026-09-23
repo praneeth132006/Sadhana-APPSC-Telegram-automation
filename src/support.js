@@ -287,20 +287,6 @@ const SETTINGS = [
       'What an influencer actually earns is set per code on the Influencers page.'
   },
   {
-    key: 'trial_enabled', section: 'pass', label: 'Free group preview', type: 'toggle', default: 'yes',
-    hint: 'Lets a student who has never joined this group in for a few minutes, read-only, before paying.'
-  },
-  {
-    key: 'trial_minutes', section: 'pass', label: 'Preview lasts (minutes)', type: 'minutes', maxLength: 4,
-    default: '10',
-    hint: 'How long the free preview lasts before they are removed. 1 to 1440 (a day).'
-  },
-  {
-    key: 'trial_warn_minutes', section: 'pass', label: 'Warn after (minutes)', type: 'minutes', maxLength: 4,
-    default: '8',
-    hint: 'When to tell them the preview is ending, counted from the start. Must be less than the length.'
-  },
-  {
     key: 'sample_questions', section: 'pass', label: 'Sample questions before the price', type: 'minutes',
     maxLength: 2, default: '3',
     hint: 'How many real questions the bot shows a newcomer, one at a time, before the pass. 0 switches them off.'
@@ -423,33 +409,7 @@ function validateSettingsPatch(patch) {
     }
     value[key] = text;
   }
-
-  // A warning after the preview has already ended would never be sent.
-  const warn = Number(value.trial_warn_minutes);
-  const length = Number(value.trial_minutes);
-  if (value.trial_warn_minutes !== undefined && value.trial_minutes !== undefined && warn >= length) {
-    return { ok: false, error: 'The warning must come before the preview ends.' };
-  }
   return { ok: true, value };
-}
-
-/**
- * trialSettings — the free preview's rules, as numbers, with the defaults
- * applied. `warnAfterMs` is measured from the moment the preview starts.
- */
-function trialSettings(settings = {}) {
-  const normalised = normaliseSettings(settings);
-  const minutes = Math.min(Math.max(Number(normalised.trial_minutes) || 10, 1), 1440);
-  const warnRaw = Number(normalised.trial_warn_minutes);
-  // Default to two minutes before the end when it is missing or impossible.
-  const warn = warnRaw > 0 && warnRaw < minutes ? warnRaw : Math.max(minutes - 2, 0);
-  return {
-    enabled: !/^(no|false|off|0)$/i.test(String(normalised.trial_enabled || 'yes')),
-    minutes,
-    warnAfterMinutes: warn,
-    lastsMs: minutes * 60 * 1000,
-    warnAfterMs: warn * 60 * 1000
-  };
 }
 
 /** How many sample questions to show before the pass. */
@@ -994,7 +954,6 @@ module.exports = {
   messageText,
   hasMedia,
   createSettingsCache,
-  trialSettings,
   sampleCount,
   createThrottle
 };

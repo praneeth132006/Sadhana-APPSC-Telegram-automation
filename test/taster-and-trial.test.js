@@ -319,17 +319,6 @@ test('a preview with an unreadable expiry is ended rather than left open for eve
   assert.deepEqual(removed, ['900']);
 });
 
-test('the preview length and warning are the admin\'s, from the sheet', async () => {
-  // 30-minute preview, warned at 25: at 26 minutes in, that is a warning.
-  const { serverModule, sent } = loadSweep({
-    settings: { trial_minutes: '30', trial_warn_minutes: '25' },
-    trials: [{ telegram_id: '900', plan: 'trial', status: 'trial', start_date: minutesAgo(26), expiry_date: minutesAhead(4), reminder_sent: '' }]
-  });
-  const result = await serverModule.sweepTrials();
-  assert.equal(result.warned.length, 1);
-  assert.match(sent[0].text, /4 minute\(s\) left/);
-});
-
 test('a failed payment link still lets the message through', async () => {
   const { serverModule, sent } = loadSweep({
     trials: [{ telegram_id: '900', plan: 'trial', status: 'trial', start_date: minutesAgo(9), expiry_date: minutesAhead(1), reminder_sent: '' }]
@@ -362,15 +351,12 @@ test('/affiliate offers the programme, the figure the admin set, and the way in'
   assert.match(textOf(await plain.say('/earn')), /<b>up to ₹50 for each successful referral<\/b>/);
 });
 
-test('the trial and taster settings are on the Pass & Coupons page, with sane limits', () => {
+test('the taster and referral settings are on the Pass & Coupons page; the preview ones are gone', () => {
   const keys = support.SETTINGS.filter((s) => s.section === 'pass').map((s) => s.key);
-  for (const key of ['trial_enabled', 'trial_minutes', 'trial_warn_minutes', 'sample_questions', 'affiliate_earn_upto']) {
+  for (const key of ['sample_questions', 'affiliate_earn_upto']) {
     assert.ok(keys.includes(key), `${key} cannot be edited on the dashboard`);
   }
-  assert.equal(support.validateSettingsPatch({ trial_minutes: '10', trial_warn_minutes: '12' }).ok, false);
-  assert.equal(support.validateSettingsPatch({ trial_minutes: '4000' }).ok, false);
-  assert.equal(support.validateSettingsPatch({ trial_minutes: '30', trial_warn_minutes: '25' }).ok, true);
-  assert.equal(support.trialSettings({ trial_minutes: '10' }).warnAfterMinutes, 8);
-  assert.equal(support.trialSettings({ trial_minutes: '10', trial_warn_minutes: '99' }).warnAfterMinutes, 8,
-    'a warning after the end falls back to two minutes before it');
+  for (const key of ['trial_enabled', 'trial_minutes', 'trial_warn_minutes']) {
+    assert.ok(!keys.includes(key), `${key} is still on the dashboard`);
+  }
 });

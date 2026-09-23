@@ -690,16 +690,8 @@ async function sweepTrials({ now = new Date() } = {}) {
     if (!trials.length) continue;
     result.checked += trials.length;
 
-    let rules;
-    try {
-      rules = support.trialSettings(await sheets.forGroup(group.id).getBotSettings());
-    } catch (err) {
-      rules = support.trialSettings({});
-    }
-
     for (const member of trials) {
       const expiry = membership.parseIst(member.expiry_date);
-      const started = membership.parseIst(member.start_date);
       try {
         // Unreadable dates would otherwise keep someone in for ever.
         if (!expiry) {
@@ -719,7 +711,8 @@ async function sweepTrials({ now = new Date() } = {}) {
           continue;
         }
 
-        const warnAt = started ? started.getTime() + rules.warnAfterMs : expiry.getTime() - 2 * 60 * 1000;
+        // Previews are no longer offered; any still open is warned two minutes before it ends.
+        const warnAt = expiry.getTime() - 2 * 60 * 1000;
         if (member.reminder_sent !== 'warned' && now.getTime() >= warnAt) {
           await membership.markTrialWarned(group.id, member);
           result.warned.push({ group: group.id, telegram_id: member.telegram_id });
