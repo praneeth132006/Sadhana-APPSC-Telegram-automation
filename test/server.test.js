@@ -1383,6 +1383,90 @@ test('the payment confirmation describes the pass, and leaks no secrets', async 
   }
 });
 
+/** Razorpay answering for one payment link, for the confirmation tests. */
+async function withRazorpayLink(link, fn) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    if (!String(url).includes('api.razorpay.com')) return originalFetch(url, opts);
+    const payload = JSON.stringify(link);
+    return { ok: true, status: 200, text: async () => payload, json: async () => JSON.parse(payload) };
+  };
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('once the pass is granted, the confirmation hands the page the group invite to go straight in', async () => {
+  const parts = { linkId: 'plink_in', paymentId: 'pay_in', referenceId: 'ref_in', status: 'paid' };
+  stub(sheets, 'getSubscriber', (id) => (String(id) === '4343'
+    ? { telegram_id: '4343', status: 'active', invite_link: 'https://t.me/+JOINrequestLINK', expiry_date: '30-11-2099' }
+    : null));
+  await withRazorpayLink({ id: 'plink_in', status: 'paid', amount: 19900,
+    notes: { group_id: 'appsc_news_en', plan_id: 'exam_pass', telegram_id: '4343' } }, async () => {
+    const res = await call('/api/payments/confirm?' + confirmQuery(parts, signRedirect(parts)));
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.inviteLink, 'https://t.me/+JOINrequestLINK');
+    assert.ok(calls.some((c) => c.name === 'getSubscriber' && String(c.args[0]) === '4343'));
+    assert.ok(!res.text.includes('4343'), 'the buyer telegram id leaked to the browser');
+  });
+});
+
+test('no invite on the confirmation until the webhook has granted the pass, and never for an unpaid link', async () => {
+  const parts = { linkId: 'plink_wait', paymentId: 'pay_wait', referenceId: 'ref_wait', status: 'paid' };
+  // Paid, but the webhook has not written the row yet.
+  stub(sheets, 'getSubscriber', null);
+  await withRazorpayLink({ id: 'plink_wait', status: 'paid', amount: 19900,
+    notes: { group_id: 'appsc_news_en', plan_id: 'exam_pass', telegram_id: '4444' } }, async () => {
+    const res = await call('/api/payments/confirm?' + confirmQuery(parts, signRedirect(parts)));
+    assert.equal(res.json.data.paid, true);
+    assert.equal(res.json.data.inviteLink, null);
+  });
+
+  // A lapsed row keeps its old link; it must not be handed out.
+  stub(sheets, 'getSubscriber', { telegram_id: '4444', status: 'expired', invite_link: 'https://t.me/+OLD' });
+  await withRazorpayLink({ id: 'plink_wait', status: 'paid', amount: 19900,
+    notes: { group_id: 'appsc_news_en', plan_id: 'exam_pass', telegram_id: '4444' } }, async () => {
+    const res = await call('/api/payments/confirm?' + confirmQuery(parts, signRedirect(parts)));
+    assert.equal(res.json.data.inviteLink, null);
+  });
+
+  // Unpaid: the sheet is not even asked.
+  const unpaid = { linkId: 'plink_un', paymentId: '', referenceId: 'ref_un', status: 'expired' };
+  stub(sheets, 'getSubscriber', { telegram_id: '4444', status: 'active', invite_link: 'https://t.me/+NOPE' });
+  calls.length = 0;
+  await withRazorpayLink({ id: 'plink_un', status: 'expired', amount: 19900,
+    notes: { group_id: 'appsc_news_en', plan_id: 'exam_pass', telegram_id: '4444' } }, async () => {
+    const res = await call('/api/payments/confirm?' + confirmQuery(unpaid, signRedirect(unpaid)));
+    assert.equal(res.json.data.paid, false);
+    assert.equal(res.json.data.inviteLink, null);
+    assert.ok(!calls.some((c) => c.name === 'getSubscriber'));
+  });
+
+  // A slow or broken sheet: still an answer, just without the link yet.
+  stub(sheets, 'getSubscriber', () => { throw new Error('Apps Script timed out'); });
+  await withRazorpayLink({ id: 'plink_wait', status: 'paid', amount: 19900,
+    notes: { group_id: 'appsc_news_en', plan_id: 'exam_pass', telegram_id: '4444' } }, async () => {
+    const res = await call('/api/payments/confirm?' + confirmQuery(parts, signRedirect(parts)));
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.inviteLink, null);
+  });
+});
+
+test('the thank-you page waits for the pass, then sends the student straight into the group', () => {
+  const page = require('node:fs').readFileSync('dashboard/payment-success.html', 'utf8');
+  assert.match(page, /location\.href = d\.inviteLink/, 'the page does not redirect into the group');
+  assert.match(page, /\$\('cta'\)\.href = d\.inviteLink/, 'no Join button as a backup to the redirect');
+  assert.match(page, /POLL_TRIES/, 'the page does not wait for the webhook');
+});
+
+test('the Support page filters tickets with ticketGroup, never with the page\'s own group', () => {
+  const page = require('node:fs').readFileSync('dashboard/support.js', 'utf8');
+  assert.match(page, /ticketGroup: filters\.group/);
+  assert.doesNotMatch(page, /[^a-zA-Z]group: filters\.group/);
+});
+
 test('the payment confirmation reports an unpaid link as unpaid', async () => {
   const parts = { linkId: 'plink_no', paymentId: '', referenceId: 'ref_no', status: 'expired' };
 
@@ -2401,6 +2485,24 @@ test('GET /api/support/tickets passes the queue filters and drops anything else'
   assert.equal(forwarded.status, '');
   assert.equal(forwarded.waitingOn, '');
   assert.equal(forwarded.sort, '');
+});
+
+test('the dashboard\'s own group never filters the ticket list — only ticketGroup does', async () => {
+  // The Support page showed "1 needs reply" over an empty list: the page's
+  // group travelled as `group`, which was also read as the ticket filter, so
+  // a ticket with no group (or the other language's) vanished from the list
+  // while still being counted.
+  calls.length = 0;
+  await authed(`/api/support/tickets?group=${TEST_GROUP}&waitingOn=admin`);
+  assert.equal(calls.find((c) => c.name === 'listTickets').args[0].group, '', 'the page group was used as a ticket filter');
+
+  calls.length = 0;
+  await authed(`/api/support/tickets?group=${TEST_GROUP}&ticketGroup=${TEST_GROUP}`);
+  assert.equal(calls.find((c) => c.name === 'listTickets').args[0].group, TEST_GROUP);
+
+  calls.length = 0;
+  await authed(`/api/support/tickets?group=${TEST_GROUP}&ticketGroup=not_a_group`);
+  assert.equal(calls.find((c) => c.name === 'listTickets').args[0].group, '');
 });
 
 test('GET /api/support/stats returns the sheet\'s analysis for the chosen period', async () => {

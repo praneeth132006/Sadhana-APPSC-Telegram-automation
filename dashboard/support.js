@@ -396,7 +396,10 @@ async function loadTickets() {
   try {
     const tab = TABS.find((t) => t.id === filters.tab) || TABS[0];
     const page = await api('/api/support/tickets', {
-      query: Object.assign({ search: filters.search, group: filters.group, pageSize: 100 }, tab.query)
+      // `ticketGroup`, never `group`: api() already sends `group` to say which
+      // dashboard group this is, and reusing it filtered the list to that
+      // group's tickets while the counts still included every ticket.
+      query: Object.assign({ search: filters.search, ticketGroup: filters.group, pageSize: 100 }, tab.query)
     });
     renderNotices(page.context);
     renderTabs(page.counts);

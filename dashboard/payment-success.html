@@ -147,7 +147,7 @@
         Open Telegram to get your invite
       </a>
 
-      <ol class="steps">
+      <ol class="steps" id="steps">
         <li><strong>Go back to Telegram.</strong> The bot is sending your private invite link right now.</li>
         <li><strong>Tap the link</strong> to join. It only works once, so do not forward it.</li>
         <li>Send <strong>/status</strong> to the bot any time to see your expiry date.</li>
@@ -177,62 +177,95 @@
 
     // Razorpay redirects here with the link id, status and an HMAC. Without
     // them (someone opening the page directly) the generic message stands.
-    if (!params.get('razorpay_payment_link_id')) {
-      // Nothing to confirm; leave the page as-is.
-    } else {
+    const CONFIRM = '/api/payments/confirm' + location.search;
+    // The pass is granted by the webhook, usually a second or two after
+    // Razorpay sends the student here. Ask again for about a minute.
+    const POLL_MS = 3000;
+    const POLL_TRIES = 20;
+    const REDIRECT_MS = 2500;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    function showFailed() {
+      $('card').classList.add('failed');
+      $('tickPath').setAttribute('points', '18 6 6 18');
+      // removeAttribute, not .hidden = false: the `hidden` IDL property
+      // lives on HTMLElement, so assigning it on an SVG <line> sets a
+      // stray JS property and leaves the attribute — and the CSS rule
+      // that hides it — exactly where they were.
+      $('crossPath').removeAttribute('hidden');
+      $('title').textContent = 'Payment not completed';
+      $('subtitle').textContent =
+        'This payment link has not been paid. Send /plans to the bot to try again.';
+      document.querySelector('.steps').hidden = true;
+      // Nothing was bought, so there is no invite to promise.
+      $('cta').textContent = 'Open Telegram to try again';
+      $('renewNote').hidden = true;
+      $('note').innerHTML =
+        'Charged but seeing this? Send <strong>/status</strong> to the bot — it reads ' +
+        'the payment, not this page. If it shows nothing, reply to the bot and an ' +
+        'admin will sort it out.';
+    }
+
+    function showReceipt(d) {
+      setText('rowPlan', 'valPlan', (d.planEmoji ? d.planEmoji + ' ' : '') + (d.planLabel || ''));
+      setText('rowGroup', 'valGroup', d.groupName);
+      if (typeof d.amountPaise === 'number') {
+        const rupees = d.amountPaise / 100;
+        setText('rowAmount', 'valAmount', '₹' + (Number.isInteger(rupees) ? rupees : rupees.toFixed(2)));
+      }
+      if (d.recurring) $('renewNote').hidden = false;
+    }
+
+    /** The pass is live: straight into the group, with the button as a backup. */
+    function goToGroup(d) {
+      const name = d.groupName || 'the group';
+      $('title').textContent = "You're in! 🎉";
+      $('subtitle').textContent = `Taking you to ${name} on Telegram…`;
+      $('cta').textContent = `Join ${name} now`;
+      $('cta').href = d.inviteLink;
+      $('cta').hidden = false;
+      $('steps').innerHTML =
+        '<li><strong>Telegram opens the group.</strong> Tap <strong>Request to join</strong> — you are approved automatically.</li>' +
+        '<li>Did not open? Tap the blue button above.</li>' +
+        '<li>Send <strong>/status</strong> to the bot any time to see your expiry date.</li>';
+      $('note').textContent = 'The link only works for the Telegram account that paid, so there is no need to forward it.';
+      setTimeout(() => { location.href = d.inviteLink; }, REDIRECT_MS);
+    }
+
+    async function confirmOnce() {
+      const res = await fetch(CONFIRM);
+      const payload = await res.json();
+      if (!res.ok || !payload.success) throw new Error(payload.error || 'confirmation failed');
+      return payload.data;
+    }
+
+    if (params.get('razorpay_payment_link_id')) {
       try {
-        const res = await fetch('/api/payments/confirm' + location.search);
-        const payload = await res.json();
-
-        if (!res.ok || !payload.success) {
-          // A failed lookup must not claim the payment failed — it may well
-          // have succeeded and only the confirmation call broke.
-          $('subtitle').textContent =
-            'Your pass is being activated. Check Telegram for your invite link.';
+        let d = await confirmOnce();
+        if (!d.paid) {
+          showFailed();
         } else {
-          const d = payload.data;
-
-          if (!d.paid) {
-            $('card').classList.add('failed');
-            $('tickPath').setAttribute('points', '18 6 6 18');
-            // removeAttribute, not .hidden = false: the `hidden` IDL property
-            // lives on HTMLElement, so assigning it on an SVG <line> sets a
-            // stray JS property and leaves the attribute — and the CSS rule
-            // that hides it — exactly where they were.
-            $('crossPath').removeAttribute('hidden');
-            $('title').textContent = 'Payment not completed';
-            $('subtitle').textContent =
-              'This payment link has not been paid. Send /plans to the bot to try again.';
-            document.querySelector('.steps').hidden = true;
-            // Nothing was bought, so there is no invite to promise.
-            $('cta').textContent = 'Open Telegram to try again';
-            $('renewNote').hidden = true;
-            $('note').innerHTML =
-              'Charged but seeing this? Send <strong>/status</strong> to the bot — it reads ' +
-              'the payment, not this page. If it shows nothing, reply to the bot and an ' +
-              'admin will sort it out.';
-          } else {
-            setText('rowPlan', 'valPlan',
-              (d.planEmoji ? d.planEmoji + ' ' : '') + (d.planLabel || ''));
-            setText('rowGroup', 'valGroup', d.groupName);
-            if (typeof d.amountPaise === 'number') {
-              const rupees = d.amountPaise / 100;
-              setText('rowAmount', 'valAmount',
-                '₹' + (Number.isInteger(rupees) ? rupees : rupees.toFixed(2)));
-            }
-            if (d.groupName) {
-              $('subtitle').textContent = `Your pass for ${d.groupName} is being activated.`;
-            }
-            if (d.recurring) $('renewNote').hidden = false;
+          showReceipt(d);
+          if (d.groupName) $('subtitle').textContent = `Setting up your access to ${d.groupName}…`;
+          // Waiting for the webhook to grant the pass and make the invite.
+          for (let i = 1; !d.inviteLink && i < POLL_TRIES; i++) {
+            await sleep(POLL_MS);
+            try { d = await confirmOnce(); } catch (err) { /* keep trying */ }
           }
-
-          // A real button beats the words "go back to Telegram" on a phone.
-          if (d.botUsername) {
-            $('cta').href = 'https://t.me/' + d.botUsername;
-            $('cta').hidden = false;
+          if (d.inviteLink) {
+            goToGroup(d);
+          } else if (d.groupName) {
+            $('subtitle').textContent = `Your pass for ${d.groupName} is being activated. The bot is sending your invite on Telegram.`;
           }
         }
+        // Without a group link yet, the bot is the next best place to go.
+        if (!d.inviteLink && d.botUsername) {
+          $('cta').href = 'https://t.me/' + d.botUsername;
+          $('cta').hidden = false;
+        }
       } catch (err) {
+        // A failed lookup must not claim the payment failed — it may well
+        // have succeeded and only the confirmation call broke.
         $('subtitle').textContent =
           'Your pass is being activated. Check Telegram for your invite link.';
       }

@@ -3178,6 +3178,27 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       `${user.id} (@${user.username}) — ${result.reason}`
     );
 
+    // Let in: say so, with a button straight into the group, rather than
+    // leaving them to notice Telegram's small "request approved" line.
+    if (result.approved) {
+      try {
+        await bot.sendMessage(user.id,
+          `🎉 <b>Welcome to ${esc(group.shortName)}!</b>\n\n` +
+          'You are in. Tap below to open the group — new questions are posted there every day.' +
+          (result.expiry && !/^lifetime/i.test(result.expiry) ? `\n\nYour access runs until <b>${esc(result.expiry)}</b>.` : '') +
+          '\n\n<i>Send /status here any time to see your pass.</i>',
+          {
+            parse_mode: 'HTML',
+            reply_markup: result.inviteLink
+              ? { inline_keyboard: [[{ text: `📚 Open ${group.shortName}`, url: result.inviteLink }]] }
+              : undefined
+          });
+      } catch (err) {
+        // They have never messaged this bot (an admin let them in); nothing is lost.
+      }
+      return;
+    }
+
     if (!result.approved) {
       // Telling them why turns a silent rejection into something they can act
       // on. The common case is a forwarded link, or a pass for the other
