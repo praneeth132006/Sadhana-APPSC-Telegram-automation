@@ -178,7 +178,14 @@ async function handleJoinRequest(groupId, telegramId) {
           console.error(`[membership] could not mute the preview for ${telegramId}: ${err.message}`);
         }
       }
-      return { approved: true, reason: verdict.reason, trial: Boolean(verdict.subscriber && verdict.subscriber.status === 'trial') };
+      return {
+        approved: true,
+        reason: verdict.reason,
+        trial: Boolean(verdict.subscriber && verdict.subscriber.status === 'trial'),
+        // For the welcome: tapping their own invite link once inside opens the group.
+        inviteLink: (verdict.subscriber && verdict.subscriber.invite_link) || '',
+        expiry: (verdict.subscriber && verdict.subscriber.expiry_date) || ''
+      };
     }
     await paybot.declineJoinRequest(ctx.botEnv, ctx.chatId, telegramId);
     return { approved: false, reason: verdict.reason };

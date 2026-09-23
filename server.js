@@ -628,8 +628,12 @@ async function deliverAccess(result, plan, telegramId, groupId) {
     'forwarding it will not let anyone else in.</i>\n\n' +
     'Send /status any time to see how long you have left.';
 
+  const group = groupRegistry.requireGroup(groupId);
   try {
-    await paybot.sendDirectMessage(groupRegistry.requireGroup(groupId).paymentBotEnv, telegramId, text);
+    // A button as well as the link: on a phone it is one tap straight into the group.
+    await paybot.sendDirectMessage(group.paymentBotEnv, telegramId, text, {
+      reply_markup: { inline_keyboard: [[{ text: `🚀 Join ${group.shortName} now`, url: result.inviteLink }]] }
+    });
   } catch (err) {
     // Telegram forbids a bot from opening a conversation, so this also fires
     // for someone who paid without ever messaging the bot.
@@ -2184,11 +2188,27 @@ async function handlePublicRoute(pathname, method, req, res) {
       }
     }
 
+    // Once the webhook has granted the pass, the page can take the student
+    // straight into the group instead of saying "go back to Telegram". The
+    // link is safe to hand over: this URL carries Razorpay's signature for
+    // this payment, and the link only admits the Telegram account that paid.
+    const paid = String(link.status || '').toLowerCase() === 'paid';
+    let inviteLink = null;
+    if (paid && group && notes.telegram_id) {
+      try {
+        const subscriber = await sheets.forGroup(group.id).getSubscriber(notes.telegram_id);
+        if (subscriber && subscriber.status === 'active' && subscriber.invite_link) inviteLink = subscriber.invite_link;
+      } catch (err) {
+        // Not ready yet, or the sheet is slow: the page asks again.
+      }
+    }
+
     sendJSON(res, 200, {
       success: true,
       data: {
         status: String(link.status || status || ''),
-        paid: String(link.status || '').toLowerCase() === 'paid',
+        paid,
+        inviteLink,
         amountPaise: Number(link.amount) || (plan ? plan.amountPaise : null),
         // The name the student was shown at checkout, which an admin may have set.
         planLabel: notes.plan_label || (plan ? plan.label : null),
@@ -2608,7 +2628,9 @@ async function handleSupportRoute(pathname, method, req, res, query, groupId, se
       waitingOn: ['admin', 'student'].includes(waitingOn) ? waitingOn : '',
       sort: str(query.get('sort'), 10) === 'waiting' ? 'waiting' : '',
       search: str(query.get('search'), 120),
-      group: familyIds.includes(str(query.get('group'), 40)) ? str(query.get('group'), 40) : '',
+      // Which group's tickets to list. Its own parameter: `group` is the
+      // dashboard's group, sent on every request, and is not a filter.
+      group: familyIds.includes(str(query.get('ticketGroup'), 40)) ? str(query.get('ticketGroup'), 40) : '',
       page: str(query.get('page'), 8) || '1',
       pageSize: str(query.get('pageSize'), 4) || '50'
     });

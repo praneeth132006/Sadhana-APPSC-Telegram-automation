@@ -477,6 +477,19 @@ test('the paying account is approved when it asks to join', async () => {
   }
 });
 
+test('an approved join hands back the invite link and expiry, for the welcome message', async () => {
+  const stub = stubPaybot();
+  try {
+    const row = Object.assign({}, activeRow, { invite_link: 'https://t.me/+mine' });
+    const result = await withSubscriber(row, () => membership.handleJoinRequest(TEST_GROUP, '111'));
+    assert.equal(result.approved, true);
+    assert.equal(result.inviteLink, 'https://t.me/+mine');
+    assert.equal(result.expiry, activeRow.expiry_date);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('a forwarded invite does not admit someone who never paid', async () => {
   // The exact hole: the buyer hands their link to a friend, the friend taps it.
   const stub = stubPaybot();
@@ -798,7 +811,7 @@ test('a student pays and ends up with access, start to finish', async () => {
     }
   });
   paybotModule.createJoinRequestInvite = async () => 'https://t.me/+invite-for-one';
-  paybotModule.sendDirectMessage = async (botEnv, userId, text) => { dms.push({ userId, text }); };
+  paybotModule.sendDirectMessage = async (botEnv, userId, text, extra) => { dms.push({ userId, text, extra }); };
 
   // Razorpay's API, answering the way the real one does.
   let checkoutBody = null;
@@ -865,6 +878,10 @@ test('a student pays and ends up with access, start to finish', async () => {
     assert.equal(dms.length, 1, 'the student was never told they were in');
     assert.match(dms[0].text, /t\.me\/\+invite-for-one/);
     assert.equal(dms[0].userId, '90901');
+    // One tap into the group, not just a link to copy.
+    const join = dms[0].extra.reply_markup.inline_keyboard[0][0];
+    assert.match(join.text, /^🚀 Join .+ now$/);
+    assert.equal(join.url, 'https://t.me/+invite-for-one');
 
     // ---- 6. Razorpay retries the same webhook ---------------------------
     const replayed = await serverModule.handlePaymentEvent(JSON.parse(body));
