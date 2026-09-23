@@ -383,6 +383,8 @@ function loadServerWithStubs() {
   sheets.forGroup = (groupId) => ({ groupId, upsertSubscriber: upsert });
 
   const server = require('../server');
+  // Code tracking off: a local .env would otherwise point it at the real sheets.
+  require('../src/code-tracking').isConfigured = () => false;
   return { handler: server.handlePaymentEvent, calls };
 }
 
@@ -772,6 +774,8 @@ test('a student pays and ends up with access, start to finish', async () => {
   const paybotModule = require('../src/paybot');
   const membershipModule = require('../src/membership');
   const serverModule = require('../server');
+  // Code tracking off: a local .env would otherwise point it at the real sheets.
+  require('../src/code-tracking').isConfigured = () => false;
 
   const plan = groups.getPlanFor(GROUP, 'sprint_30');
   assert.ok(plan, 'the group does not sell the pass being bought');
@@ -1374,6 +1378,8 @@ test('paying for the newspaper lifetime pass grants access with no real end date
   const paybotModule = require('../src/paybot');
   const membershipModule = require('../src/membership');
   const serverModule = require('../server');
+  // Code tracking off: a local .env would otherwise point it at the real sheets.
+  require('../src/code-tracking').isConfigured = () => false;
   const plansModule = require('../src/plans');
 
   const sheetRows = {};

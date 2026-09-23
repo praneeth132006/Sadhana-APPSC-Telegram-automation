@@ -274,7 +274,11 @@ function couponRow(c) {
     el('td', { class: 'num', text: c.max_uses ? `${num(c.times_used)} / ${num(c.max_uses)}` : num(c.times_used) }),
     el('td', { class: 'muted', text: c.expires_on || 'Never' }),
     el('td', { class: 'muted', text: c.one_per_student ? 'Once each' : 'Any number' }),
-    el('td', {}, [el('div', { class: 'pc-row-actions' }, [edit, toggle, c.times_used ? null : remove])])
+    el('td', {}, [el('div', { class: 'pc-row-actions' }, [
+      // Who clicked this code's link, applied it, made a payment link and paid.
+      el('a', { class: 'btn btn-ghost btn-sm', href: `tracking.html?code=${encodeURIComponent(c.code)}`, text: 'Track' }),
+      edit, toggle, c.times_used ? null : remove
+    ])])
   ]);
 }
 

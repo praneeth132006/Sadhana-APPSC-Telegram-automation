@@ -64,6 +64,8 @@ sheets.forGroup = () => ({
 paybot.getMe = async (env) => ({ username: env === 'TELEGRAM_PAYBOT_NEWS' ? 'appscpaymentsbot' : 'sadhanapaybot' });
 
 const server = require('../server');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 delete process.env.SUPPORT_CHAT_ID;
 
 let baseUrl;

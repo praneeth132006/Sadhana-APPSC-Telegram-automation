@@ -28,6 +28,8 @@ const BOT = { id: 123, is_bot: true, first_name: 'Pay bot', username: 'upsc_pay_
 const sheets = require('../src/sheets');
 const support = require('../src/support');
 const { createPaymentBot } = require('../src/botapp');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 
 // No test may reach the real Telegram API. The server reads .env, which holds
 // real bot tokens and the real SUPPORT_CHAT_ID; without this, any code path a
@@ -966,7 +968,9 @@ test('paying with a coupon re-checks it and charges the discounted amount, with 
     assert.equal(links[0].plan.groupId, 'upsc');
     assert.deepEqual(links[0].extraNotes, {
       plan_label: 'Target 2026', valid_until: '31-05-2099',
-      coupon_code: 'SAVE50', original_amount: '199', discount_amount: '39.8'
+      coupon_code: 'SAVE50', original_amount: '199', discount_amount: '39.8',
+      // Who paid, for the Code Tracking page.
+      student_name: 'Asha'
     });
     assert.match(messages(STUDENT.id).at(-1).args[1], /You pay <b>₹159.20<\/b> \(coupon SAVE50, you save ₹39.80\)/);
   });

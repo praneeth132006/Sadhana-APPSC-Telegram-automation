@@ -52,6 +52,8 @@ const paybot = require('../src/paybot');
 const membership = require('../src/membership');
 const support = require('../src/support');
 const { createPaymentBot } = require('../src/botapp');
+// Code tracking off: a local .env would otherwise point it at the real sheets.
+require('../src/code-tracking').isConfigured = () => false;
 
 const STUDENT = { id: 900, is_bot: false, first_name: 'Kiran', username: 'kiran' };
 

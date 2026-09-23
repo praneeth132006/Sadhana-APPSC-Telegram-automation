@@ -8,7 +8,7 @@ bot that posts on a schedule or on demand.
 
 ---
 
-## The six dashboards
+## The dashboards
 
 Live at <https://appscsadhana.vercel.app>, or locally with `npm run dashboard` at
 <http://localhost:3000>.
@@ -21,6 +21,7 @@ Live at <https://appscsadhana.vercel.app>, or locally with `npm run dashboard` a
 | 🤖 | **Automation** (`/automation.html`) | Post to Telegram straight from the browser. Queue batches for a planned time, or take them back out. Hand the queue to **Autopilot** and let it post unattended. See every subject's cron cadence and remaining runway. |
 | 💳 | **Members** (`/members.html`) | Paying members, revenue by plan, who is about to lapse, and a dry run of the nightly expiry sweep. |
 | 🎟 | **Pass & Coupons** (`/pricing.html`) | The pass students buy — name, price, valid-until date — and coupon codes with their usage. |
+| 📈 | **Code Tracking** (`/tracking.html`) | For every coupon or promo code: who clicked its link, applied it, made a payment link and paid — and who made a link and never paid. The ad link to copy for each code. |
 | 🆘 | **Support** (`/support.html`) | Student tickets: read the conversation, reply, send a new invite link, check a payment, grant a pass, resolve. |
 | 🩺 | **Health** (`/health.html`) | Is the server, the sheet and the bot reachable — and are the security controls that protect them actually switched on. |
 
@@ -677,7 +678,43 @@ discount must stay at least ₹1. Payment links already sent keep the price and 
 they were created with.
 
 Sheet tabs involved: **Bot Settings** (pass name/price/date), **Coupons**,
-**Coupon Redemptions**.
+**Coupon Redemptions**, **Code Tracking**.
+
+### Tracking a code (ads and influencers)
+
+Put a code in an ad as its link, not just its name:
+`https://t.me/<payment bot>?start=promo_<CODE>` — the **📈 Code Tracking** page shows
+it ready to copy (or press **Track** beside a coupon on Pass & Coupons). Opening
+the link starts the bot with the code already applied on the price screen.
+
+Every student who uses a code gets one row in the **Code Tracking** tab of the bot's
+first group sheet, filled in as they go:
+
+| Step | Recorded when |
+|---|---|
+| **Clicked** | they open the bot through the code's link (every click is counted) |
+| **Applied** | they see the discounted price — from the link, or by typing the code |
+| **Refused** | the code is real but cannot be used (expired, used up, already used) — with the reason |
+| **Made a payment link** | they tap Pay: the amount, the Razorpay link id, and how many links they made |
+| **Paid** | Razorpay's webhook says the link was paid |
+
+The page shows the funnel, each person's name, @username and Telegram id, and tabs
+for **Made a link, did not pay**, **Paid**, **Applied, no link**, **Clicked only** and
+**Code refused**, with search and a CSV download. A payment link lasts 24 hours, so
+an unpaid one shows as expired after that without anything being written.
+
+**Check payments with Razorpay** asks Razorpay about every unpaid link (40 per press):
+whether it expired, how many payment attempts failed, and — the one to act on —
+whether it was actually **paid but never recorded** because the webhook did not
+arrive. Those students may have paid without being let in; check them on Members or
+send an invite from Support.
+
+Someone who types the code without the link appears from the moment they apply it.
+A code that does not exist is not tracked, so typos do not clutter the page.
+Tracking needs the group's `SHEET_ID_<GROUP>` and `GOOGLE_SERVICE_ACCOUNT_JSON`
+(the sheet shared with the service account as Editor); without them the bot works
+exactly as before and the page says what is missing. Tracking never slows the bot:
+it is written after the reply, and a failure is only logged.
 
 ### Bot commands
 
