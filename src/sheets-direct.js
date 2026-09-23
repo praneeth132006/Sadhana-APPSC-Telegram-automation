@@ -439,6 +439,51 @@ async function getBotSettings(ctx) {
   return out;
 }
 
+/**
+ * sampleQuestions — a few complete questions from one subject tab, for the
+ * taster a newcomer is shown before the price. Read-only: nothing is claimed,
+ * marked or counted, so showing samples can never disturb the posting queue.
+ */
+async function sampleQuestions(ctx, subject, count = 3) {
+  const { map, rows } = await readTab(ctx, subject);
+  const out = [];
+  // Newest first: the most recent questions are the ones worth showing off.
+  for (let i = rows.length - 1; i >= 0 && out.length < count; i--) {
+    const q = rowToQuestion(rows[i], map, subject, i);
+    const options = [q.option_a, q.option_b, q.option_c, q.option_d].map((o) => String(o || '').trim());
+    if (!q.question_text || options.some((o) => !o)) continue;
+    if (!/^[ABCD]$/.test(q.correct_answer)) continue;
+    if (['Rejected', 'Archived', 'Deleted', 'Draft'].includes(q.status)) continue;
+    out.push(q);
+  }
+  return out;
+}
+
+/** Everyone on a free preview right now, for the minute-by-minute sweep. */
+async function listTrialMembers(ctx) {
+  const range = encodeURIComponent(`${quoteTab('Subscribers')}!A2:S`);
+  let body;
+  try {
+    body = await call('GET', `/${ctx.spreadsheetId}/values/${range}?valueRenderOption=UNFORMATTED_VALUE`);
+  } catch (err) {
+    if (/Unable to parse range/i.test(err.message)) return [];
+    throw err;
+  }
+  const text = (row, i) => String(row[i] === undefined || row[i] === null ? '' : row[i]).trim();
+  return (body.values || [])
+    .map((row, index) => {
+      const out = {};
+      SUBSCRIBER_FIELDS.forEach((field, i) => { out[field] = text(row, i); });
+      out.status = out.status.toLowerCase();
+      out.row_number = index + 2;
+      return out;
+    })
+    .filter((sub) => sub.telegram_id && sub.plan === TRIAL_PLAN_ID && sub.status === 'trial');
+}
+
+/** The plan id a free preview is recorded under. */
+const TRIAL_PLAN_ID = 'trial';
+
 /** Subscribers columns A–S, in the Apps Script's order. */
 const SUBSCRIBER_FIELDS = ['telegram_id', 'username', 'name', 'plan', 'plan_label', 'status', 'start_date',
   'expiry_date', 'amount', 'payment_id', 'link_id', 'subscription_id', 'total_paid', 'renewals',
@@ -1404,7 +1449,7 @@ async function reissueCollidingIds(ctx, subject, firstRow, count, code, stamp, i
 
 /** The operations served directly when a group is set up for it. */
 const DIRECT = {
-  getBotSettings, getSubscriber,
+  getBotSettings, getSubscriber, sampleQuestions, listTrialMembers,
   readConfig, getUnpostedQuestions, claimQuestions, releaseQuestions, markAsPosted,
   holdQuestions, recoverStaleClaims, listPosted, unpostQuestions, addQuestions, markDeleted,
   scheduleQuestions, unscheduleQuestions, bulkStatus, formatQuestions

@@ -40,6 +40,8 @@ const esc = support.esc;
 /** First lines of the prompts whose replies this bot reads back. */
 const PROMPT = {
   application: '📝 Application — ',
+  applyEmail: '✉️ Apply for ',
+  applyPhone: '📱 Mobile number for ',
   upi: '💳 UPI ID for payouts',
   legal_name: '✏️ Your name as on your bank account',
   phone: '📱 Your mobile number',
@@ -206,35 +208,62 @@ function createAffiliateBot({ polling = false } = {}) {
       return;
     }
     await reply(chatId,
-      `${PROMPT.application}${esc(exam.label)}\n\n` +
-      'Reply to this message with:\n' +
-      '• your name\n' +
-      '• where you will promote it (links to your YouTube, Instagram, Telegram channel…)\n' +
-      '• roughly how many followers you have\n\n' +
-      '<i>Example: Ravi Kumar — youtube.com/@ravi, t.me/ravichannel — 40k subscribers</i>',
-      { reply_markup: { force_reply: true, input_field_placeholder: 'Name, links, followers' } });
+      `${PROMPT.applyEmail}${esc(exam.label)}\n\n` +
+      'Reply with your <b>email address</b>. We use it for your account and for payout receipts.\n' +
+      '<i>Example: ravi@gmail.com</i>',
+      { reply_markup: { force_reply: true, input_field_placeholder: 'ravi@gmail.com' } });
   }
 
-  async function submitApplication(msg, examLabel) {
-    const exam = affiliates.listExams().find((e) => e.label === examLabel);
-    if (!exam) {
-      await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.');
-      return;
-    }
-    const result = await store.createRequest(msg.from, exam.id, support.messageText(msg));
-    if (!result.ok) {
-      await reply(msg.chat.id, `❌ ${esc(result.reason)}`);
-      return;
-    }
-    const influencer = await store.getInfluencer(msg.from.id);
-    await reply(msg.chat.id,
-      `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
-      `Reference: <code>${esc(result.request.request_id)}</code>\n` +
-      'An admin will review it and you will get a message here with your code and terms.' +
-      (affiliates.payoutDetails(influencer).complete ? ''
-        : '\n\n💳 While you wait, add your payout details so we can pay you — tap below.'),
-      affiliates.payoutDetails(influencer).complete ? {} : { reply_markup: PAYOUT_BUTTON });
-    await notify.alertAdmins(notify.applicationAlert(result.request));
+  /** Step one of an application: the email. Then we ask for the mobile. */
+  async function saveApplyEmail(msg, examLabel) {
+  const exam = affiliates.listExams().find((e) => e.label === examLabel);
+  if (!exam) {
+    await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.');
+    return;
+  }
+  const saved = await store.setPayoutField(msg.from, 'email', support.messageText(msg));
+  if (!saved.ok) {
+    await reply(msg.chat.id, `❌ ${esc(saved.reason)}`,
+      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:exam:${exam.id}` }]] } });
+    return;
+  }
+  await reply(msg.chat.id,
+    `${PROMPT.applyPhone}${esc(exam.label)}\n\n` +
+    'Reply with your <b>10-digit mobile number</b>. RazorpayX needs it to pay you.\n' +
+    '<i>Example: 9876543210</i>',
+    { reply_markup: { force_reply: true, input_field_placeholder: '9876543210' } });
+  }
+
+  /** Step two: the mobile — and with it, the application goes to the admin. */
+  async function saveApplyPhone(msg, examLabel) {
+  const exam = affiliates.listExams().find((e) => e.label === examLabel);
+  if (!exam) {
+    await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.');
+    return;
+  }
+  const saved = await store.setPayoutField(msg.from, 'phone', support.messageText(msg));
+  if (!saved.ok) {
+    await reply(msg.chat.id, `❌ ${esc(saved.reason)}`,
+      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:exam:${exam.id}` }]] } });
+    return;
+  }
+
+  const influencer = saved.influencer;
+  const result = await store.createRequest(msg.from, exam.id,
+    `Email: ${influencer.email} · Mobile: ${influencer.phone}`);
+  if (!result.ok) {
+    await reply(msg.chat.id, `❌ ${esc(result.reason)}`);
+    return;
+  }
+  const details = affiliates.payoutDetails(influencer);
+  await reply(msg.chat.id,
+    `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
+    `Reference: <code>${esc(result.request.request_id)}</code>\n` +
+    `Email: <b>${esc(influencer.email)}</b> · Mobile: <b>${esc(influencer.phone)}</b>\n\n` +
+    'An admin will review it and you will get a message here with your promo code and terms.' +
+    (details.complete ? '' : '\n\n💳 While you wait, finish your payout details so we can pay you — tap below.'),
+    details.complete ? {} : { reply_markup: PAYOUT_BUTTON });
+  await notify.alertAdmins(notify.applicationAlert(result.request));
   }
 
   // ---- payout details --------------------------------------------------------
@@ -459,7 +488,7 @@ function createAffiliateBot({ polling = false } = {}) {
   async function sendHelp(chatId) {
     await reply(chatId,
       '<b>How the influencer programme works</b>\n\n' +
-      '1. /apply — choose an exam channel and tell us where you will promote it.\n' +
+      '1. /apply — choose an exam channel and give your email and mobile number.\n' +
       '2. The admin reviews it and sets your terms: the discount your followers get, what you earn per ' +
       'student, and whether you withdraw weekly or monthly.\n' +
       '3. You get a promo code and a link. Your code works only in that exam\'s payment bot.\n' +
@@ -566,8 +595,12 @@ function createAffiliateBot({ polling = false } = {}) {
     try {
       const replied = msg.reply_to_message;
       const prompt = replied && replied.from && replied.from.is_bot ? support.messageText(replied) : '';
-      if (prompt.startsWith(PROMPT.application)) {
-        await submitApplication(msg, prompt.split('\n')[0].slice(PROMPT.application.length).trim());
+      if (prompt.startsWith(PROMPT.applyEmail)) {
+        await saveApplyEmail(msg, prompt.split('\n')[0].slice(PROMPT.applyEmail.length).trim());
+        return;
+      }
+      if (prompt.startsWith(PROMPT.applyPhone)) {
+        await saveApplyPhone(msg, prompt.split('\n')[0].slice(PROMPT.applyPhone.length).trim());
         return;
       }
       if (prompt.startsWith(PROMPT.bank)) { await saveBank(msg); return; }

@@ -123,7 +123,9 @@ async function isEligible(groupId, telegramId) {
   const ctx = contextFor(groupId);
   const subscriber = await ctx.sheet.getSubscriber(telegramId);
   if (!subscriber) return { ok: false, reason: 'no subscription on record', subscriber: null };
-  if (subscriber.status !== 'active') {
+  // A free preview is a real, time-limited membership: it is let in the same
+  // way, and the expiry check below is what ends it.
+  if (subscriber.status !== 'active' && subscriber.status !== 'trial') {
     return { ok: false, reason: `subscription is ${subscriber.status}`, subscriber };
   }
 
@@ -165,7 +167,18 @@ async function handleJoinRequest(groupId, telegramId) {
   try {
     if (verdict.ok) {
       await paybot.approveJoinRequest(ctx.botEnv, ctx.chatId, telegramId);
-      return { approved: true, reason: verdict.reason };
+      // A preview reads; it does not post. Best effort: being let in matters
+      // more than being muted, and the preview ends either way.
+      if (verdict.subscriber && verdict.subscriber.status === 'trial') {
+        const until = parseIst(verdict.subscriber.expiry_date);
+        try {
+          await paybot.readOnlyMember(ctx.botEnv, ctx.chatId, telegramId,
+            until ? until.getTime() / 1000 + 60 : undefined);
+        } catch (err) {
+          console.error(`[membership] could not mute the preview for ${telegramId}: ${err.message}`);
+        }
+      }
+      return { approved: true, reason: verdict.reason, trial: Boolean(verdict.subscriber && verdict.subscriber.status === 'trial') };
     }
     await paybot.declineJoinRequest(ctx.botEnv, ctx.chatId, telegramId);
     return { approved: false, reason: verdict.reason };
@@ -328,6 +341,84 @@ async function grantAccess(options) {
   // A renewal by someone already sitting in the group does not, and sending a
   // fresh link every month would train members to expect one and to share it.
   return { subscriber, inviteLink, alreadyProcessed: false, expiry, isRejoining };
+}
+
+// ---------------------------------------------------------------------------
+// The free preview
+// ---------------------------------------------------------------------------
+// A newcomer sees the group for a few minutes, read-only, before being asked
+// for money — the bot proves what it is selling instead of demanding payment
+// on the first screen. One per person per group, ever: the Subscribers row it
+// writes is what says they have had theirs.
+
+/** The plan id a preview is recorded under, and its label in the sheet. */
+const TRIAL_PLAN_ID = 'trial';
+const TRIAL_PLAN_LABEL = 'Free preview';
+
+/**
+ * startTrial — gives someone their one free preview of a group.
+ *
+ * @param {string} groupId
+ * @param {Object} user Telegram user
+ * @param {number} minutes How long it lasts
+ * @returns {Promise<{ok: boolean, reason?: string, inviteLink?: string, expiry?: Date, subscriber?: Object}>}
+ */
+async function startTrial(groupId, user, minutes) {
+  const ctx = contextFor(groupId);
+  const existing = await ctx.sheet.getSubscriber(user.id);
+  if (existing) {
+    // Anyone with a row has either had their preview or bought the pass.
+    const reason = existing.status === 'active' ? 'already a member'
+      : existing.plan === TRIAL_PLAN_ID ? 'preview already used' : 'was a member before';
+    return { ok: false, reason, subscriber: existing };
+  }
+
+  const now = new Date();
+  const expiry = new Date(now.getTime() + Math.max(1, Number(minutes) || 10) * 60 * 1000);
+  // The invite is made first: a row saying they are in a group they never got
+  // into would cost them their one preview for nothing.
+  const inviteLink = await createSingleUseInvite(groupId, user.id);
+  const subscriber = await ctx.sheet.upsertSubscriber({
+    telegram_id: String(user.id),
+    username: user.username || '',
+    name: [user.first_name, user.last_name].filter(Boolean).join(' '),
+    plan: TRIAL_PLAN_ID,
+    plan_label: TRIAL_PLAN_LABEL,
+    status: 'trial',
+    start_date: formatIst(now),
+    expiry_date: formatIst(expiry),
+    amount: 0,
+    invite_link: inviteLink,
+    reminder_sent: '',
+    notes: `Free preview of ${minutes} minute(s)`,
+    is_payment: false
+  }, 'trial.started');
+  return { ok: true, inviteLink, expiry, subscriber };
+}
+
+/** Marks a preview as warned, so nobody is told twice. */
+async function markTrialWarned(groupId, subscriber) {
+  return contextFor(groupId).sheet.upsertSubscriber({
+    telegram_id: subscriber.telegram_id,
+    reminder_sent: 'warned',
+    is_payment: false
+  }, 'trial.warned');
+}
+
+/**
+ * endTrial — the preview is over: out of the group, and the row says so, so
+ * the same person is never given a second one.
+ */
+async function endTrial(groupId, subscriber) {
+  const removed = await removeMember(groupId, subscriber.telegram_id);
+  await contextFor(groupId).sheet.upsertSubscriber({
+    telegram_id: subscriber.telegram_id,
+    status: 'trial_expired',
+    invite_link: '',
+    notes: `Free preview ended ${formatIst(new Date())}`,
+    is_payment: false
+  }, 'trial.ended');
+  return removed;
 }
 
 /**
@@ -587,6 +678,11 @@ async function runDailyCheckAllGroups({ dryRun = false } = {}) {
 }
 
 module.exports = {
+  TRIAL_PLAN_ID,
+  TRIAL_PLAN_LABEL,
+  startTrial,
+  markTrialWarned,
+  endTrial,
   isLifetimeSubscriber,
   IST_OFFSET_MS,
   contextFor,

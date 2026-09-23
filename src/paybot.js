@@ -136,6 +136,33 @@ async function approveJoinRequest(envName, chatId, userId) {
 }
 
 /**
+ * readOnlyMember — lets someone read a group without posting in it.
+ *
+ * What a free preview is: every question visible, nothing they can send. The
+ * bot needs "Ban Users" for this, which it already has for removals. Telegram
+ * takes the permissions as a JSON string on the form.
+ *
+ * @param {string|number} chatId
+ * @param {string|number} userId
+ * @param {number} [untilSeconds] Unix time the restriction lifts itself
+ */
+async function readOnlyMember(envName, chatId, userId, untilSeconds) {
+  const form = {
+    permissions: JSON.stringify({
+      can_send_messages: false, can_send_audios: false, can_send_documents: false,
+      can_send_photos: false, can_send_videos: false, can_send_video_notes: false,
+      can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false,
+      can_add_web_page_previews: false, can_change_info: false, can_invite_users: false,
+      can_pin_messages: false, can_manage_topics: false
+    })
+  };
+  // Telegram lifts it on its own if we never get to: a preview that ends while
+  // the server is down must not leave someone muted for ever.
+  if (untilSeconds) form.until_date = Math.floor(untilSeconds);
+  return botFor(envName).restrictChatMember(chatId, userId, form);
+}
+
+/**
  * declineJoinRequest — turns someone away.
  *
  * @param {string|number} chatId
@@ -204,6 +231,7 @@ module.exports = {
   getTokenSource,
   createJoinRequestInvite,
   approveJoinRequest,
+  readOnlyMember,
   declineJoinRequest,
   sendDirectMessage,
   removeFromChat,

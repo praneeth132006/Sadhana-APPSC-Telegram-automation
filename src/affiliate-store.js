@@ -351,7 +351,9 @@ async function listRequests() {
  */
 async function createRequest(user, examId, details) {
   const exam = affiliates.getExam(examId);
-  if (!exam) return { ok: false, reason: 'That exam is not open for promotion right now.' };
+  if (!exam || !affiliates.isExamOpen(examId)) {
+    return { ok: false, reason: 'That exam is not open for promotion right now.' };
+  }
   const text = String(details || '').trim();
   if (text.length < 10) {
     return { ok: false, reason: 'Please tell us a little more — your name, where you will promote, and your audience.' };

@@ -919,7 +919,9 @@ test('/plans shows the one pass with its name, date and price, and a coupon butt
   const buttons = offer.args[2].reply_markup.inline_keyboard.flat();
   assert.equal(buttons[0].text, '💳 Pay ₹199');
   assert.equal(buttons[0].callback_data, 'buy:upsc:exam_pass');
-  assert.equal(buttons[1].callback_data, 'cpn:upsc');
+  // The free preview sits between paying and applying a code.
+  assert.equal(buttons[1].callback_data, 'trial:upsc');
+  assert.equal(buttons[2].callback_data, 'cpn:upsc');
 });
 
 test('a valid coupon shows the discounted price and a pay button that carries the code', async () => {

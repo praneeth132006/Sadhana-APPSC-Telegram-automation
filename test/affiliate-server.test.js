@@ -28,11 +28,13 @@ process.env.RAZORPAY_KEY_SECRET = 'dummy_secret';
 process.env.RATE_LIMIT_MAX = '100000';
 process.env.CURATOR_EMAILS = '';
 process.env.LEGACY_GROUP_ID = '';
-for (const prefix of ['UPSC', 'EPFO']) {
+for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_TE', 'UPSC', 'EPFO']) {
   process.env[`SHEET_URL_${prefix}`] = `https://script.google.com/macros/s/test-${prefix}/exec`;
   process.env[`SHEET_TOKEN_${prefix}`] = `token-${prefix}`;
-  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + (prefix === 'UPSC' ? '11' : '22');
+  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + Math.abs(prefix.length * 7919);
 }
+process.env.TELEGRAM_PAYBOT_NEWS = '111:TEST';
+process.env.TELEGRAM_PAYBOT_SADHANA = '222:TEST';
 process.env.TELEGRAM_PAYBOT_UPSC = '333:TEST';
 process.env.TELEGRAM_PAYBOT_EPFO = '444:TEST';
 
@@ -59,7 +61,7 @@ sheets.forGroup = () => ({
   getBotSettings: async () => ({}),
   getCoupon: async (code) => (COUPONS.has(code) ? { code } : null)
 });
-paybot.getMe = async (env) => ({ username: env === 'TELEGRAM_PAYBOT_UPSC' ? 'prelimspaymentbot' : 'epfoallinonebot' });
+paybot.getMe = async (env) => ({ username: env === 'TELEGRAM_PAYBOT_NEWS' ? 'appscpaymentsbot' : 'sadhanapaybot' });
 
 const server = require('../server');
 delete process.env.SUPPORT_CHAT_ID;
@@ -96,7 +98,7 @@ const RAVI = { id: 501, first_name: 'Ravi', last_name: 'Kumar', username: 'ravi_
 const TERMS = { discount_type: 'percent', discount_value: 10, commission_type: 'percent', commission_value: 20,
   payout_cycle: 'weekly', min_payout: 0, one_per_student: true };
 
-async function pendingRequest(exam = 'upsc') {
+async function pendingRequest(exam = 'news') {
   const out = await store.createRequest(RAVI, exam, 'Ravi, youtube.com/@ravi_teaches, 40k subscribers');
   assert.equal(out.ok, true, out.reason);
   return out.request.request_id;
@@ -114,9 +116,9 @@ test('the overview has every exam with its price, and suggests a code for a wait
   await pendingRequest();
   const { json } = await api('/api/affiliates');
   const data = json.data;
-  assert.ok(data.exams.some((e) => e.id === 'upsc' && e.pricePaise === 19900));
+  assert.ok(data.exams.some((e) => e.id === 'news' && e.pricePaise === 19900));
   assert.equal(data.totals.pendingRequests, 1);
-  assert.match(data.requests[0].suggested_code, /^RAVIKUUPSC\d{2}$/);
+  assert.match(data.requests[0].suggested_code, /^RAVIKUNEWS\d{2}$/);
 });
 
 test('approving creates the code and sends the influencer their code, terms and link', async () => {
@@ -124,16 +126,16 @@ test('approving creates the code and sends the influencer their code, terms and 
   const res = await api('/api/affiliates/approve', { method: 'POST', body: { requestId, terms: Object.assign({ code: 'ravi10' }, TERMS) } });
   assert.equal(res.status, 200, JSON.stringify(res.json));
   assert.equal(res.json.code.code, 'RAVI10');
-  assert.equal(res.json.code.share_link, 'https://t.me/prelimspaymentbot?start=promo_RAVI10');
+  assert.equal(res.json.code.share_link, 'https://t.me/appscpaymentsbot?start=promo_RAVI10');
   assert.equal(res.json.notified, true);
 
   const message = told.find((t) => t.chatId === '501');
   assert.ok(message, 'the influencer was not told');
-  assert.match(message.text, /approved for UPSC/);
+  assert.match(message.text, /approved for APPSC Newspaper/);
   assert.match(message.text, /<code>RAVI10<\/code>/);
   assert.match(message.text, /Students get: <b>10% off<\/b>/);
-  assert.match(message.text, /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
-  assert.match(message.text, /only in the UPSC payment bot/);
+  assert.match(message.text, /t\.me\/appscpaymentsbot\?start=promo_RAVI10/);
+  assert.match(message.text, /only in the APPSC Newspaper payment bot/);
 
   const [header, row] = book.Codes;
   assert.equal(row[header.indexOf('Created By')], 'Admin (admin@example.com)');

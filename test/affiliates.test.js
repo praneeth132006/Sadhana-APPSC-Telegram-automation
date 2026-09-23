@@ -37,12 +37,21 @@ function upscCode(overrides = {}) {
 // Exams
 // ---------------------------------------------------------------------------
 
-test('there are four exams to promote, one per payment bot, named without the language', () => {
+test('the exams open to influencers are the APPSC ones, named without the language', () => {
   const exams = affiliates.listExams();
-  assert.deepEqual(exams.map((e) => e.id), ['news', 'sadhana', 'upsc', 'epfo']);
-  assert.deepEqual(exams.map((e) => e.label), ['APPSC Newspaper', 'Sadhana APPSC', 'UPSC', 'EPFO']);
+  assert.deepEqual(exams.map((e) => e.id), ['news', 'sadhana']);
+  assert.deepEqual(exams.map((e) => e.label), ['APPSC Newspaper', 'Sadhana APPSC']);
   // Both languages of an exam are sold by its one bot, so its code covers both.
   assert.deepEqual(exams[0].groups.map((g) => g.id), ['appsc_news_en', 'appsc_news_te']);
+});
+
+test('a closed exam takes no new applications but still names its codes', () => {
+  // Closing UPSC to influencers must never leave an approved UPSC code
+  // nameless — the student is still told which exam it is for.
+  assert.equal(affiliates.isExamOpen('upsc'), false);
+  assert.equal(affiliates.isExamOpen('news'), true);
+  assert.equal(affiliates.getExam('upsc').label, 'UPSC');
+  assert.deepEqual(affiliates.listExams({ includeClosed: true }).map((e) => e.id), ['news', 'sadhana', 'upsc', 'epfo']);
 });
 
 test('an exam whose bot has no token is not offered', () => {

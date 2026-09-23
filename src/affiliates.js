@@ -44,16 +44,20 @@ function examIdFor(payBotEnv) {
  * listExams — what an influencer can apply to promote: one entry per payment
  * bot, because a promo code is honoured by exactly one bot.
  *
- * Only bots with a token and at least one ready group are offered. Promoting
- * an exam whose bot cannot sell is promoting nothing.
+ * Only bots with a token, at least one ready group, and `affiliate` left on in
+ * groups.config.json are offered. Promoting an exam whose bot cannot sell is
+ * promoting nothing, and an exam the admin has not opened is not on offer.
  *
  * @returns {Array<{id: string, label: string, botEnv: string, groups: Array<Object>}>}
  */
-function listExams() {
+function listExams({ includeClosed = false } = {}) {
   const byBot = new Map();
   for (const group of groupRegistry.listGroups()) {
     if (!group.ready || !group.paymentBotEnv) continue;
     if (!String(process.env[group.paymentBotEnv] || '').trim()) continue;
+    // Only the exams opened to influencers, per groups.config.json — unless
+    // the caller wants every exam, for naming a code that already exists.
+    if (!includeClosed && group.affiliate === false) continue;
     if (!byBot.has(group.paymentBotEnv)) {
       byBot.set(group.paymentBotEnv, {
         id: examIdFor(group.paymentBotEnv),
@@ -69,9 +73,20 @@ function listExams() {
   return [...byBot.values()];
 }
 
-/** One exam by id, or null. */
+/**
+ * getExam — one exam by id, open or not.
+ *
+ * Closing an exam stops new applications; it must never make an approved code
+ * nameless, so this looks at every exam and `isExamOpen` is what applications
+ * are checked against.
+ */
 function getExam(examId) {
-  return listExams().find((exam) => exam.id === String(examId || '').toLowerCase()) || null;
+  return listExams({ includeClosed: true }).find((exam) => exam.id === String(examId || '').toLowerCase()) || null;
+}
+
+/** Whether influencers may apply to promote this exam right now. */
+function isExamOpen(examId) {
+  return listExams().some((exam) => exam.id === String(examId || '').toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +511,7 @@ module.exports = {
   examIdFor,
   listExams,
   getExam,
+  isExamOpen,
   normaliseCode,
   codeFromStartPayload,
   shareLink,

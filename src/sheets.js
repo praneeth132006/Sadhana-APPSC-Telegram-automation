@@ -52,7 +52,7 @@ function sheetRowOf(q) {
   }
   return Number(q && q.row_index) + 2;
 }
-const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions', 'markDeleted'];
+const API_NAMES = ['ping', 'readConfig', 'getSubjects', 'writeConfig', 'getUnpostedQuestions', 'markAsPosted', 'getStats', 'getAnalytics', 'listQuestions', 'checkDuplicates', 'addQuestions', 'updateQuestion', 'deleteQuestion', 'bulkDelete', 'claimQuestions', 'releaseQuestions', 'unpostQuestions', 'listPosted', 'bulkStatus', 'scheduleQuestions', 'getSubscriber', 'listSubscribers', 'getExpiring', 'getRevenue', 'upsertSubscriber', 'getBotSettings', 'updateBotSettings', 'createTicket', 'appendTicketMessage', 'setTicketStatus', 'listTickets', 'getTicket', 'logTicketEvent', 'listCoupons', 'getCoupon', 'upsertCoupon', 'deleteCoupon', 'recordRedemption', 'listRedemptions', 'getSupportStats', 'findPayment', 'setTicketGroup', 'recoverStaleClaims', 'holdQuestions', 'unscheduleQuestions', 'formatQuestions', 'markDeleted', 'sampleQuestions', 'listTrialMembers'];
 
 /**
  * getWebAppUrl — resolves and validates the deployed Apps Script URL.
@@ -500,6 +500,26 @@ async function getAnalytics(ctx) {
 async function listQuestions(ctx, filters = {}) {
   const result = await request(ctx, 'GET', Object.assign({ action: 'listQuestions' }, filters));
   return result.data || { total: 0, questions: [], page: 1, totalPages: 1 };
+}
+
+/**
+ * sampleQuestions — a few complete questions from one subject, for the taster
+ * a newcomer is shown before the price. The direct client reads the tab; this
+ * is the Apps Script route, for a group without the Sheets API.
+ */
+async function sampleQuestions(ctx, subject, count = 3) {
+  const list = await listQuestions(ctx, { subject, pageSize: Math.max(count * 4, 12), page: 1 });
+  return (list.questions || [])
+    .filter((q) => q.question_text && q.option_a && q.option_b && q.option_c && q.option_d &&
+      /^[ABCD]$/.test(String(q.correct_answer || '').toUpperCase()) &&
+      !['Rejected', 'Archived', 'Deleted', 'Draft'].includes(String(q.status || '')))
+    .slice(0, count);
+}
+
+/** Everyone on a free preview right now, for the minute-by-minute sweep. */
+async function listTrialMembers(ctx) {
+  const list = await listSubscribers(ctx, { pageSize: 500, page: 1 });
+  return (list.subscribers || []).filter((sub) => sub.plan === 'trial' && sub.status === 'trial');
 }
 
 /** Reports which of the supplied duplicate hashes already exist. */
@@ -1012,7 +1032,7 @@ const IMPLEMENTATIONS = {
   updateQuestion, deleteQuestion, bulkDelete, claimQuestions, releaseQuestions,
   recoverStaleClaims, holdQuestions,
   unpostQuestions, listPosted, markDeleted, bulkStatus, scheduleQuestions,
-  unscheduleQuestions, formatQuestions, getSubscriber,
+  unscheduleQuestions, formatQuestions, getSubscriber, sampleQuestions, listTrialMembers,
   listSubscribers, getExpiring, getRevenue, upsertSubscriber,
   getBotSettings, updateBotSettings, createTicket, appendTicketMessage,
   setTicketStatus, listTickets, getTicket, logTicketEvent, listCoupons, getCoupon,

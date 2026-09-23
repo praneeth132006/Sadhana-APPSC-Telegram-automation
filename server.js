@@ -664,6 +664,112 @@ async function recordCouponUse(notes, paymentId, paidPaise) {
 }
 
 /**
+ * sweepTrials — warns the previews that are nearly over and ends the ones
+ * that are, in every group.
+ *
+ * Both messages carry a real payment link, because the moment someone has
+ * just read the group is the moment they will pay. A link that cannot be
+ * created is not fatal: the message still goes, with a button that opens the
+ * pass instead.
+ *
+ * Nothing here trusts the clock to have run on time — a preview found an hour
+ * late is simply ended then.
+ */
+async function sweepTrials({ now = new Date() } = {}) {
+  const result = { checked: 0, warned: [], ended: [], failed: [] };
+
+  for (const group of groupRegistry.listGroups()) {
+    if (!group.ready) continue;
+    let trials = [];
+    try {
+      trials = await sheets.forGroup(group.id).listTrialMembers();
+    } catch (err) {
+      result.failed.push({ group: group.id, error: err.message });
+      continue;
+    }
+    if (!trials.length) continue;
+    result.checked += trials.length;
+
+    let rules;
+    try {
+      rules = support.trialSettings(await sheets.forGroup(group.id).getBotSettings());
+    } catch (err) {
+      rules = support.trialSettings({});
+    }
+
+    for (const member of trials) {
+      const expiry = membership.parseIst(member.expiry_date);
+      const started = membership.parseIst(member.start_date);
+      try {
+        // Unreadable dates would otherwise keep someone in for ever.
+        if (!expiry) {
+          await membership.endTrial(group.id, member);
+          result.ended.push({ group: group.id, telegram_id: member.telegram_id, reason: 'unreadable expiry' });
+          continue;
+        }
+
+        if (now.getTime() >= expiry.getTime()) {
+          await membership.endTrial(group.id, member);
+          result.ended.push({ group: group.id, telegram_id: member.telegram_id });
+          const offer = await payNowMessage(group, member);
+          await tellStudent(group, member.telegram_id,
+            `⌛ <b>Your free preview of ${support.esc(group.shortName)} has ended</b> and you have been removed from the group.\n\n` +
+            'Everything you saw is posted every day — join to keep getting it.',
+            offer);
+          continue;
+        }
+
+        const warnAt = started ? started.getTime() + rules.warnAfterMs : expiry.getTime() - 2 * 60 * 1000;
+        if (member.reminder_sent !== 'warned' && now.getTime() >= warnAt) {
+          await membership.markTrialWarned(group.id, member);
+          result.warned.push({ group: group.id, telegram_id: member.telegram_id });
+          const minutesLeft = Math.max(1, Math.round((expiry.getTime() - now.getTime()) / 60000));
+          const offer = await payNowMessage(group, member);
+          await tellStudent(group, member.telegram_id,
+            `⏳ <b>${minutesLeft} minute(s) left of your free preview.</b>\n\n` +
+            `You will be removed from ${support.esc(group.shortName)} automatically when it ends. ` +
+            'Join now and you keep your place — no interruption.',
+            offer);
+        }
+      } catch (err) {
+        result.failed.push({ group: group.id, telegram_id: member.telegram_id, error: err.message });
+      }
+    }
+  }
+  return result;
+}
+
+/** A Pay button for a preview message: a real link when we can mint one. */
+async function payNowMessage(group, member) {
+  try {
+    const settings = await sheets.forGroup(group.id).getBotSettings().catch(() => ({}));
+    const pass = pricing.currentPass(group.id, settings);
+    if (!pass) return null;
+    const checkout = await createCheckoutForStudent({
+      plan: pass, telegramId: member.telegram_id, username: member.username, name: member.name
+    });
+    return {
+      inline_keyboard: [[{ text: `💳 Join now — ${pricing.rupees(pass.amountPaise)}`, url: checkout.url }]]
+    };
+  } catch (err) {
+    console.error(`[cron] could not make a payment link for ${member.telegram_id}: ${err.message}`);
+    return { inline_keyboard: [[{ text: '💳 See the pass', callback_data: 'go:plans' }]] };
+  }
+}
+
+/** Messages a student from their group's payment bot. Never fatal. */
+async function tellStudent(group, telegramId, html, replyMarkup) {
+  try {
+    await paybot.sendDirectMessage(group.paymentBotEnv, telegramId, html,
+      replyMarkup ? { reply_markup: replyMarkup } : undefined);
+    return true;
+  } catch (err) {
+    console.error(`[cron] could not message ${telegramId}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * couponExists — true when any payment bot's sheet already has this coupon
  * code, so an influencer's code can never shadow one (or be shadowed by it).
  */
@@ -2228,9 +2334,32 @@ async function handlePublicRoute(pathname, method, req, res) {
       );
       summary.supportSummaries = await postDailySupportSummaries();
       summary.menus = await syncBotMenus();
+      // Belt and braces: if the minute-by-minute pinger has been down, no
+      // preview is left open for longer than a day.
+      summary.trials = await sweepTrials();
       sendJSON(res, 200, { success: true, data: summary });
     } catch (err) {
       console.error('[cron] sweep failed:', err.message);
+      sendJSON(res, 500, { success: false, error: err.message });
+    }
+    return true;
+  }
+
+  // ---- Free preview sweep --------------------------------------------------
+  // The preview lasts minutes, so this has to run every minute — far more
+  // often than the nightly sweep. Vercel's free plan only schedules daily
+  // crons, so a free minute-by-minute pinger calls this (see the README);
+  // the nightly sweep calls it too, so a stale preview is never left open.
+  if (pathname === '/api/cron/trials' && (method === 'POST' || method === 'GET')) {
+    if (!authoriseCron(req, res)) return true;
+    try {
+      const result = await sweepTrials();
+      if (result.warned.length || result.ended.length) {
+        console.log(`[cron] previews: warned ${result.warned.length}, ended ${result.ended.length}`);
+      }
+      sendJSON(res, 200, { success: true, data: result });
+    } catch (err) {
+      console.error('[cron] preview sweep failed:', err.message);
       sendJSON(res, 500, { success: false, error: err.message });
     }
     return true;
@@ -3811,3 +3940,4 @@ module.exports.createCheckoutForStudent = createCheckoutForStudent;
 module.exports.clientAddress = clientAddress;
 module.exports.handlePaymentEvent = handlePaymentEvent;
 module.exports.syncBotMenus = syncBotMenus;
+module.exports.sweepTrials = sweepTrials;

@@ -58,7 +58,7 @@ test('the student menu is written to private chats, where students actually are'
   const shown = tg.scopes.get(tg.key({ type: 'all_private_chats' }));
   assert.ok(shown, 'nothing was written to private chats — the scope Telegram shows students');
   assert.deepEqual(shown.map((c) => c.command),
-    ['start', 'about', 'plans', 'status', 'help', 'support', 'terms']);
+    ['start', 'about', 'plans', 'status', 'help', 'affiliate', 'support', 'terms']);
 });
 
 test('a stale private-chat menu is replaced, not left shadowing the new one', async () => {
@@ -71,7 +71,7 @@ test('a stale private-chat menu is replaced, not left shadowing the new one', as
   await botCommands.registerMenus(tg.api, null);
 
   assert.deepEqual(await botCommands.menuStudentsSee(tg.api),
-    ['start', 'about', 'plans', 'status', 'help', 'support', 'terms']);
+    ['start', 'about', 'plans', 'status', 'help', 'affiliate', 'support', 'terms']);
 });
 
 test('the default menu is cleared, so the paid groups do not show dead commands', async () => {

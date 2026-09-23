@@ -31,6 +31,7 @@ const STUDENT_COMMANDS = [
   { command: 'plans', description: 'See the pass and join' },
   { command: 'status', description: 'Check your current pass' },
   { command: 'help', description: 'How it all works' },
+  { command: 'affiliate', description: 'Earn by referring students' },
   { command: 'support', description: 'Get help with a problem' },
   { command: 'terms', description: 'Terms of the pass and payments' }
 ];

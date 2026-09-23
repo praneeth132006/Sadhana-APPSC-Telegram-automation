@@ -336,6 +336,27 @@ at 0% again, and fixing it never needs the Apps Script pasted into five sheets.
 
 ## The bot: what people see
 
+**Nothing is sold on the first screen.** Telegram rejects an ad whose bot opens with a
+payment demand, so `/start` is a welcome and a **Continue →** button. Continue asks the
+language (when the bot sells two), then the bot posts real questions from that group's
+sheet as quiz polls, one at a time behind a **Next →** button. After the last one it says
+what the group posts every day and *then* shows the pass. How many questions
+(`sample_questions`, 0 switches them off) is set on the Pass & Coupons page. A group with
+no usable questions goes straight to the pass rather than showing an empty taster.
+
+**The free preview.** Under the price is a preview of the group itself: ten minutes,
+read-only, one per person per group ever. It is a real Subscribers row (`plan: trial`), so
+the join request is approved the usual way and Telegram mutes them for the length of the
+preview. A minute-by-minute sweep warns them (with a real payment link) and then removes
+them and invites them to join. Length, warning time and whether it runs at all are on the
+Pass & Coupons page.
+
+> The preview needs `/api/cron/trials` called about once a minute. Vercel's free plan only
+> schedules daily crons, so use any free pinger — cron-job.org, for example: URL
+> `https://<your domain>/api/cron/trials`, every minute, with the header
+> `Authorization: Bearer <CRON_SECRET>`. The nightly sweep calls it too, so a preview is
+> never left open for more than a day even if the pinger stops.
+
 **Speed.** A bot that is slow to answer is rejected by Telegram's ad review. `/start` never
 waits on a spreadsheet: the settings it could use (the welcome note) are read behind the
 reply and are there from the next greeting on. Bot settings and member lookups read the
@@ -385,7 +406,7 @@ code. It replaced the member-to-member referral system, which was hard to track 
 
 | | |
 |---|---|
-| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and says where they will promote it · `/payout` gives and changes what RazorpayX needs to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
+| **Influencer** — in the influencer bot (`TELEGRAM_AFFILIATE_BOT`) | `/apply` picks an exam and gives an email and mobile number · `/payout` gives and changes what RazorpayX needs to pay them — name as on the bank account, mobile, email, and a UPI ID or bank account (holder, number, IFSC), PAN optional · `/codes` shows every code, its terms, share link, sales and earnings · `/withdraw` asks for what is available |
 | **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · pays a withdrawal from RazorpayX using the **Pay to** details beside it, then marks it paid with the reference · sees every influencer's payout details and whether they are complete · opens a code to see every student who joined with it and everyone who opened the link but has not paid · pauses, resumes or re-terms a code |
 | **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
@@ -412,6 +433,18 @@ once per payment id — a redelivered webhook credits nothing — and only again
 exists. Withdrawals are manual: the influencer requests one, you send it over UPI, then mark
 it paid with the reference, which the influencer is sent. A rejected withdrawal's sales go
 back to their balance. Nothing on the page moves money.
+
+**In the payment bots.** `/affiliate` (and `/earn`) tells a student's own audience-owner
+about the programme — "earn up to ₹50 for each successful referral", the figure being
+`affiliate_earn_upto` on the Pass & Coupons page — with a button into the influencer bot
+and the support email.
+
+**Which exams are open** to influencers is `affiliate` in `groups.config.json`; only the
+APPSC ones are on for now. Closing an exam stops new applications and never breaks a code
+that already exists.
+
+**Applying** asks for an email and a mobile number, nothing else. Both land on the
+influencer's row, so the payout details are already half done.
 
 **Alerts.** New applications, withdrawal requests and influencers' questions are posted to
 the Support Team chat (or `AFFILIATE_ADMIN_CHAT_ID`) with a button to the Influencers page.
@@ -897,7 +930,7 @@ Same cause — the deployed script predates those actions. Redeploy a new versio
 npm test
 ```
 
-741 tests. The ones worth knowing about:
+777 tests. The ones worth knowing about:
 
 - `test/server.test.js` — every API route, input validation, and a regression test for
   each security finding (traversal, CORS, SSRF, body limits, forged authorship).
@@ -964,7 +997,7 @@ npm test
 │   ├── data.js               # Sheets / Excel switch
 │   ├── excel.js              # local Excel fallback
 │   └── telegram.js           # Telegram Bot API
-└── test/                     # 741 tests
+└── test/                     # 777 tests
 ```
 
 ## Notes

@@ -36,7 +36,10 @@ const support = require('./support');
 const pricing = require('./pricing');
 const affiliates = require('./affiliates');
 const affiliateStore = require('./affiliate-store');
+const affiliateNotify = require('./affiliate-notify');
 const botCommands = require('./bot-commands');
+// For buildQuizPost only: the taster posts a sample exactly as the group would.
+const telegram = require('./telegram');
 
 /**
  * createPaymentBot — builds one family's bot with all its handlers attached.
@@ -255,19 +258,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   function groupKeyboard() {
   return {
     inline_keyboard: familyGroups().map((group) => ([{
-      text: `${group.language === 'Telugu' ? '🇮🇳' : '🔤'} ${group.shortName}`,
+      text: `${group.language === 'Telugu' ? '🇮🇳 తెలుగు (Telugu)' : '🔤 English'}`,
       callback_data: `pick:${group.id}`
     }]))
   };
   }
 
-  /** The "which group?" message. */
+  /** The "which language?" message. */
   function chooseGroupMessage() {
-  const groups = familyGroups();
-  return '<b>Which group do you want to join?</b>\n\n' +
-    groups.map((g, i) => `${i + 1}. <b>${esc(g.shortName)}</b>`).join('\n') +
-    '\n\n<i>Both cost the same. Your pass and invite are for the group you pick — ' +
-    'the link will not let you into the other one.</i>';
+  return '<b>Which language do you prefer?</b>\n\n' +
+    'Your questions, your group and your pass are all in the language you pick.';
   }
 
   /** The pass a group sells right now, with the admin's name, price and date applied. */
@@ -314,7 +314,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * once applied, travel on the button, so a tap never depends on memory and
    * the code is checked again when it is used.
    */
-  function passKeyboard(group, pass, applied) {
+  function passKeyboard(group, pass, applied, { offerTrial = false } = {}) {
   const amount = applied ? applied.finalPaise : pass.amountPaise;
   // Promo codes and coupons never share a code (approving one checks the
   // coupons), so the code alone says which it is when the button comes back.
@@ -324,11 +324,14 @@ function createPaymentBot({ payBotEnv, polling = false }) {
         text: `💳 Pay ${pricing.rupees(amount)}`,
         callback_data: `buy:${group.id}:${pass.id}${applied ? ':' + applied.code : ''}`
       }],
+      offerTrial
+        ? [{ text: '🎁 Free preview of the group', callback_data: `trial:${group.id}` }]
+        : null,
       applied
         ? [{ text: applied.kind === 'promo' ? '✖️ Remove promo code' : '✖️ Remove coupon',
              callback_data: `plain:${group.id}` }]
         : [{ text: '🎟 Apply coupon or promo code', callback_data: `cpn:${group.id}` }]
-    ]
+    ].filter(Boolean)
   };
   }
 
@@ -360,7 +363,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   await bot.sendMessage(chatId, passMessage(group, pass, show), {
     parse_mode: 'HTML',
-    reply_markup: passKeyboard(group, pass, show)
+    reply_markup: passKeyboard(group, pass, show, { offerTrial: (await trialRules()).enabled })
   });
 
   // Said out loud rather than swallowed: someone who followed a friend's link
@@ -379,11 +382,12 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * with two it asks first. Either way the student only ever sees groups this
    * bot is responsible for.
    */
-  async function offerGroups(chatId, user = null) {
+  async function offerGroups(chatId, user = null, { taster = false } = {}) {
   const groups = familyGroups();
 
   if (groups.length === 1) {
-    await sendPass(chatId, groups[0], null, user);
+    if (taster) await sendSample(chatId, groups[0], 0, user);
+    else await sendPass(chatId, groups[0], null, user);
     return;
   }
 
@@ -775,6 +779,35 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
   });
 
+  // What an influencer sees: the programme, in the payment bot their audience
+  // is already in. The earning shown is the admin's figure from the dashboard;
+  // what any one influencer actually earns is set per code when approved.
+  studentCommand('affiliate', async (msg) => { await sendAffiliateCard(msg.chat.id); });
+
+  // The same thing under the name people guess.
+  studentCommand('earn', async (msg) => { await sendAffiliateCard(msg.chat.id); });
+
+  /** The influencer programme, as a student's audience-owner sees it. */
+  async function sendAffiliateCard(chatId) {
+  const settings = await settingsWithin(SUPPORT_SETTINGS_WAIT_MS);
+  const upto = pricing.rupees((Number(settings.affiliate_earn_upto) || 50) * 100);
+  const email = String(settings.support_email || '').trim();
+  const username = await affiliateBotUsername();
+  await bot.sendMessage(chatId,
+    '🤝 <b>Earn with us</b>\n\n' +
+    'Have a channel, a page or a batch of students? Share our prep groups and earn on every ' +
+    `student who joins with your own promo code — <b>up to ${esc(upto)} for each successful referral</b>.\n\n` +
+    'Your followers get a discount with your code, and you can withdraw your earnings by UPI or bank transfer.\n\n' +
+    (username ? 'Tap below for the details and to apply.' : 'Applications open shortly — please check back.') +
+    (email ? `\n\nAny questions? Email us at <b>${esc(email)}</b>.` : ''),
+    {
+      parse_mode: 'HTML',
+      reply_markup: username
+        ? { inline_keyboard: [[{ text: '🤝 Open the influencer bot', url: `https://t.me/${username}` }]] }
+        : undefined
+    });
+  }
+
   studentCommand('help', async (msg) => {
   const many = familyGroups().length > 1;
   const helpSettings = settingsNow();
@@ -884,6 +917,146 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   });
 
   // ---------------------------------------------------------------------------
+  // The taster: real questions before the price
+  // ---------------------------------------------------------------------------
+  // Telegram refused the ad while the bot asked for money on its first screen.
+  // A newcomer now answers a few real questions from the sheet — the actual
+  // product — and only then sees what it costs.
+
+  /** Questions already fetched for a group, so a second visitor waits for nothing. */
+  const sampleCache = new Map();
+  const SAMPLE_CACHE_MS = 10 * 60 * 1000;
+
+  /**
+   * samplesFor — a few complete questions from this group's sheet.
+   *
+   * Subjects are tried in a random order so two students rarely see the same
+   * three, and an empty subject is simply skipped. Never throws: no samples
+   * means the pass is shown straight away, which is where this started.
+   */
+  async function samplesFor(group, wanted) {
+  const held = sampleCache.get(group.id);
+  if (held && Date.now() - held.at < SAMPLE_CACHE_MS && held.questions.length >= wanted) return held.questions;
+
+  const sheet = sheetFor(group.id);
+  let subjects = [];
+  try {
+    subjects = (await sheet.readConfig()).map((row) => row.subject).filter(Boolean);
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: could not read subjects for samples — ${err.message}`);
+    return [];
+  }
+  const shuffled = subjects.sort(() => Math.random() - 0.5);
+  const out = [];
+  for (const subject of shuffled.slice(0, 4)) {
+    try {
+      out.push(...await sheet.sampleQuestions(subject, wanted - out.length));
+    } catch (err) {
+      // A subject tab that will not read is not worth failing the welcome over.
+    }
+    if (out.length >= wanted) break;
+  }
+  sampleCache.set(group.id, { at: Date.now(), questions: out });
+  return out;
+  }
+
+  /** One sample as the quiz poll the group itself would post. */
+  async function sendQuestionPoll(chatId, question) {
+  const post = telegram.buildQuizPost(question);
+  const correct = { A: 0, B: 1, C: 2, D: 3 }[String(question.correct_answer || '').toUpperCase()] || 0;
+  const explanation = String(question.explanation || '').slice(0, 195);
+  if (post.leadMessage) await bot.sendMessage(chatId, post.leadMessage, { parse_mode: 'HTML' });
+  await bot.sendPoll(chatId, post.pollQuestion, post.options, Object.assign({
+    type: 'quiz',
+    correct_option_id: correct,
+    is_anonymous: false
+  }, explanation ? { explanation: esc(explanation), explanation_parse_mode: 'HTML' } : {}));
+  }
+
+  /**
+   * sendSample — question number `index`, then either a Next button or, after
+   * the last one, the invitation to join and the pass.
+   */
+  async function sendSample(chatId, group, index, user) {
+  // Waited for, unlike /start: the pass that follows reads them anyway, and
+  // how many questions to show is the admin's decision, not a guess.
+  const wanted = support.sampleCount(await settingsWithin(SUPPORT_SETTINGS_WAIT_MS));
+  const questions = wanted > 0 ? await samplesFor(group, wanted) : [];
+  const total = Math.min(wanted, questions.length);
+  if (!total || index >= total) {
+    await sendPass(chatId, group, null, user);
+    return;
+  }
+
+  try {
+    await sendQuestionPoll(chatId, questions[index]);
+  } catch (err) {
+    // A poll Telegram will not take (a malformed row) must not strand anyone.
+    console.error(`[bot] ${payBotEnv}: could not send a sample question — ${err.message}`);
+    await sendPass(chatId, group, null, user);
+    return;
+  }
+
+  if (index + 1 < total) {
+    await bot.sendMessage(chatId,
+      `<i>Question ${index + 1} of ${total}. Tap below for the next one.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Next →', callback_data: `smp:${group.id}:${index + 1}` }]] } });
+    return;
+  }
+
+  await bot.sendMessage(chatId,
+    `🎓 <b>That was ${total} of the questions we post every day.</b>\n\n` +
+    `For subject-wise questions like these — every day, with answers and explanations — ` +
+    `join <b>${esc(group.shortName)}</b>.`,
+    { parse_mode: 'HTML' });
+  await sendPass(chatId, group, null, user);
+  }
+
+  // ---------------------------------------------------------------------------
+  // The free preview of the group
+  // ---------------------------------------------------------------------------
+
+  /** Whether this bot offers a preview at all, from the admin's settings. */
+  async function trialRules() {
+  return support.trialSettings(await settingsWithin(SUPPORT_SETTINGS_WAIT_MS));
+  }
+
+  /**
+   * startTrial — lets a newcomer into the group, read-only, for a few minutes.
+   * The sweep (server.js) warns them and takes them out again.
+   */
+  async function beginTrial(chatId, group, user) {
+  const rules = await trialRules();
+  if (!rules.enabled) {
+    await bot.sendMessage(chatId, 'The free preview is not running at the moment. Send /plans to join.');
+    return;
+  }
+  let result;
+  try {
+    result = await membership.startTrial(group.id, user, rules.minutes);
+  } catch (err) {
+    console.error(`[bot] ${payBotEnv}: could not start a preview — ${err.message}`);
+    await bot.sendMessage(chatId, '⚠️ Could not start your free preview just now. Please try again in a moment.',
+      { reply_markup: SUPPORT_BUTTON });
+    return;
+  }
+  if (!result.ok) {
+    await bot.sendMessage(chatId, result.reason === 'already a member'
+      ? `✅ You already have access to <b>${esc(group.shortName)}</b>. Send /status for your invite link.`
+      : `The free preview is one per person, and yours has been used. Send /plans to join <b>${esc(group.shortName)}</b> properly.`,
+      { parse_mode: 'HTML' });
+    return;
+  }
+
+  await bot.sendMessage(chatId,
+    `🎁 <b>Your free ${rules.minutes}-minute preview of ${esc(group.shortName)} is open.</b>\n\n` +
+    'Tap to join — you are let in automatically:\n' + result.inviteLink + '\n\n' +
+    `You can read everything for ${rules.minutes} minutes. You cannot post during the preview, ` +
+    'and you are removed automatically when it ends — we will remind you before that.',
+    { parse_mode: 'HTML', disable_web_page_preview: true });
+  }
+
+  // ---------------------------------------------------------------------------
   // Buying a pass
   // ---------------------------------------------------------------------------
 
@@ -909,7 +1082,8 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   // ---- the welcome's Continue button --------------------------------------
   if (data === 'go:plans') {
     await ack();
-    await offerGroups(user.id, user);
+    // Continue from the welcome: language, then the questions, then the price.
+    await offerGroups(user.id, user, { taster: true });
     return;
   }
 
@@ -935,7 +1109,35 @@ function createPaymentBot({ payBotEnv, polling = false }) {
       return;
     }
     await ack();
-    await sendPass(user.id, group, null, plain ? null : user);
+    // Picking a language starts the taster; "remove the code" goes straight
+    // back to the price, because they have already seen the questions.
+    if (plain) await sendPass(user.id, group, null, null);
+    else await sendSample(user.id, group, 0, user);
+    return;
+  }
+
+  // ---- the taster ---------------------------------------------------------
+  if (data.startsWith('smp:')) {
+    const [, groupId, index] = data.split(':');
+    const group = familyGroup(groupId);
+    if (!group) {
+      await ack('That group is not available here.');
+      return;
+    }
+    await ack();
+    await sendSample(user.id, group, Number(index) || 0, user);
+    return;
+  }
+
+  // ---- the free preview ---------------------------------------------------
+  if (data.startsWith('trial:')) {
+    const group = familyGroup(data.slice(6));
+    if (!group) {
+      await ack('That group is not available here.');
+      return;
+    }
+    await ack('Opening your preview…');
+    await beginTrial(user.id, group, user);
     return;
   }
 
@@ -2337,6 +2539,22 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   function isUnreadable(msg) {
   return ['sticker', 'location', 'venue', 'contact', 'poll', 'dice', 'game', 'story']
     .some((kind) => msg[kind]);
+  }
+
+  /** The influencer bot's @name, asked once and remembered. */
+  let affiliateName;
+  async function affiliateBotUsername() {
+  if (affiliateName !== undefined) return affiliateName;
+  affiliateName = String(process.env.AFFILIATE_BOT_USERNAME || '').replace(/^@/, '').trim() || null;
+  if (!affiliateName && affiliateNotify.isConfigured()) {
+    try {
+      affiliateName = (await affiliateNotify.bot().getMe()).username || null;
+    } catch (err) {
+      console.error(`[bot] ${payBotEnv}: could not read the influencer bot's name — ${err.message}`);
+      affiliateName = null;
+    }
+  }
+  return affiliateName;
   }
 
   /** This bot's @username, fetched once. */

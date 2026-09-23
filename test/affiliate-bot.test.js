@@ -25,11 +25,13 @@ process.env.SUPPORT_CHAT_ID = '-1005555555555';
 delete process.env.AFFILIATE_ADMIN_CHAT_ID;
 process.env.PUBLIC_BASE_URL = 'https://appscsadhana.vercel.app';
 process.env.LEGACY_GROUP_ID = '';
-for (const prefix of ['UPSC', 'EPFO']) {
+for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_TE', 'UPSC', 'EPFO']) {
   process.env[`SHEET_URL_${prefix}`] = `https://script.google.com/macros/s/test-${prefix}/exec`;
   process.env[`SHEET_TOKEN_${prefix}`] = `token-${prefix}`;
-  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + (prefix === 'UPSC' ? '11' : '22');
+  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + Math.abs(prefix.length * 7919);
 }
+process.env.TELEGRAM_PAYBOT_NEWS = '111:TEST';
+process.env.TELEGRAM_PAYBOT_SADHANA = '222:TEST';
 process.env.TELEGRAM_PAYBOT_UPSC = '333:TEST';
 process.env.TELEGRAM_PAYBOT_EPFO = '444:TEST';
 
@@ -108,35 +110,45 @@ test('the welcome explains the programme and offers the four actions', async () 
   assert.deepEqual(buttons(out).map((b) => b.callback_data), ['aff:apply', 'aff:codes', 'aff:withdraw', 'aff:payout']);
 });
 
-test('applying: choose an exam, describe the promotion, and the admin is alerted', async () => {
+test('applying: choose an exam, give email and mobile, and the admin is alerted', async () => {
   const { tap, answer, alerts, book } = makeBot();
 
   const exams = await tap('aff:apply');
-  // One button per exam on sale (a machine with the real .env offers all four).
+  // One button per exam open to influencers — the APPSC ones for now.
   const offered = buttons(exams).map((b) => [b.text, b.callback_data]);
   assert.deepEqual(offered, affiliates.listExams().map((e) => [e.label, `aff:exam:${e.id}`]));
-  assert.ok(offered.some(([, data]) => data === 'aff:exam:upsc'));
-  assert.ok(offered.some(([, data]) => data === 'aff:exam:epfo'));
+  assert.ok(offered.some(([, data]) => data === 'aff:exam:news'));
+  assert.ok(!offered.some(([, data]) => /upsc|epfo/.test(data)), 'a closed exam was offered');
 
-  const prompt = await tap('aff:exam:upsc');
-  assert.ok(prompt[0].args[1].startsWith(`${PROMPT.application}UPSC`));
-  assert.equal(prompt[0].args[2].reply_markup.force_reply, true);
+  const emailPrompt = await tap('aff:exam:news');
+  assert.ok(emailPrompt[0].args[1].startsWith(`${PROMPT.applyEmail}APPSC Newspaper`));
+  assert.equal(emailPrompt[0].args[2].reply_markup.force_reply, true);
+  assert.match(textOf(await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'not-an-email')), /does not look like an email/);
 
-  const done = await answer(`${PROMPT.application}UPSC\n\nReply to this message with…`,
-    'Ravi Kumar — youtube.com/@ravi_teaches — 40k subscribers');
-  assert.match(done[0].args[1], /Application sent for UPSC/);
+  const phonePrompt = await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'Ravi@Gmail.com');
+  assert.ok(phonePrompt[0].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
+  assert.match(textOf(await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '123')), /10-digit/);
+
+  const done = await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '+91 98765 43210');
+  assert.match(done[0].args[1], /Application sent for APPSC Newspaper/);
   assert.match(done[0].args[1], /REQ-\d{8}-/);
-  assert.match(done[0].args[1], /add your payout details/, 'no payout details yet, so they are nudged');
-  assert.equal(done[0].args[2].reply_markup.inline_keyboard[0][0].callback_data, 'aff:payout');
+  assert.match(done[0].args[1], /ravi@gmail\.com/);
+  assert.match(done[0].args[1], /9876543210/);
+  assert.match(done[0].args[1], /finish your payout details/);
+
+  // The contact details are on their row, ready for a payout.
+  const person = await store.getInfluencer(501);
+  assert.equal(person.email, 'ravi@gmail.com');
+  assert.equal(person.phone, '9876543210');
 
   // In the sheet, as the admin will see it.
   const [header, row] = book.Requests;
   const cell = (name) => row[header.indexOf(name)];
   assert.equal(cell('Telegram ID'), '501');
-  assert.equal(cell('Exam'), 'upsc');
-  assert.equal(cell('Exam Bot'), 'TELEGRAM_PAYBOT_UPSC');
+  assert.equal(cell('Exam'), 'news');
+  assert.equal(cell('Exam Bot'), 'TELEGRAM_PAYBOT_NEWS');
   assert.equal(cell('Status'), 'pending');
-  assert.match(cell('Details'), /40k subscribers/);
+  assert.match(cell('Details'), /ravi@gmail\.com · Mobile: 9876543210/);
 
   // And the admins were told, in Support Team, with a way to decide it.
   assert.equal(alerts.length, 1);
@@ -146,20 +158,21 @@ test('applying: choose an exam, describe the promotion, and the admin is alerted
   assert.equal(alerts[0].extra.reply_markup.inline_keyboard[0][0].url, 'https://appscsadhana.vercel.app/influencers.html');
 });
 
-test('a second application for the same exam is stopped before they type it all', async () => {
+test('a second application for the same exam is stopped before anything is typed', async () => {
   const { tap, answer } = makeBot();
-  await tap('aff:exam:upsc');
-  await answer(`${PROMPT.application}UPSC`, 'Ravi Kumar — youtube.com/@ravi_teaches — 40k');
-  const again = await tap('aff:exam:upsc');
+  await tap('aff:exam:news');
+  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
+  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
+  const again = await tap('aff:exam:news');
   assert.match(again[0].args[1], /already with the admin/);
   assert.ok(!again[0].args[2] || !again[0].args[2].reply_markup, 'it asked for the details again');
 });
 
-test('a one-line application is sent back for more detail', async () => {
-  const { answer, book } = makeBot();
-  const out = await answer(`${PROMPT.application}UPSC`, 'me');
-  assert.match(out[0].args[1], /tell us a little more/);
-  assert.ok(!book.Requests || book.Requests.length <= 1);
+test('an application for an exam that has been closed is refused', async () => {
+  const { answer } = makeBot();
+  // UPSC is not open to influencers, so a stale prompt cannot smuggle one in.
+  const out = await answer(`${PROMPT.applyEmail}UPSC`, 'ravi@gmail.com');
+  assert.match(textOf(out), /not open for promotion/);
 });
 
 test('payout details: each is asked for, checked, saved, and can be changed', async () => {
@@ -214,21 +227,21 @@ test('codes: terms, share link, sales and earnings, and a Withdraw button when i
     await answer(PROMPT.email, 'ravi@gmail.com');
     await answer(PROMPT.upi, 'ravi@okicici');
   };
-  const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube, 40k subscribers');
+  const applied = await store.createRequest(RAVI, 'news', 'Ravi, YouTube, 40k subscribers');
   const terms = affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
     commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
   const { code } = await store.approveRequest(applied.request.request_id, Object.assign({}, terms, { code: 'RAVI10' }),
-    'Admin', { botUsername: 'prelimspaymentbot' });
+    'Admin', { botUsername: 'appscpaymentsbot' });
   await store.recordSale({ code: code.code, payment_id: 'pay_1', student_id: 900,
     list_price_paise: 19900, discount_paise: 1990, paid_paise: 17910, commission_paise: 3582 });
 
   const noUpi = await say('/codes');
-  assert.match(noUpi[0].args[1], /RAVI10<\/b> — UPSC/);
+  assert.match(noUpi[0].args[1], /RAVI10<\/b> — APPSC Newspaper/);
   assert.match(noUpi[0].args[1], /Students get: <b>10% off<\/b>/);
   assert.match(noUpi[0].args[1], /You earn: <b>20% of what the student pays<\/b>/);
   assert.match(noUpi[0].args[1], /Students joined: <b>1<\/b>/);
   assert.match(noUpi[0].args[1], /Available: <b>₹35\.82<\/b>/);
-  assert.match(noUpi[0].args[1], /t\.me\/prelimspaymentbot\?start=promo_RAVI10/);
+  assert.match(noUpi[0].args[1], /t\.me\/appscpaymentsbot\?start=promo_RAVI10/);
   assert.match(noUpi[0].args[1], /Payout details missing/);
   assert.ok(buttons(noUpi).some((b) => b.callback_data === 'aff:payout'));
   assert.ok(!buttons(noUpi).some((b) => /^aff:wd:/.test(b.callback_data || '')), 'withdraw offered without payout details');
@@ -241,7 +254,7 @@ test('codes: terms, share link, sales and earnings, and a Withdraw button when i
 
 test('withdrawing: the request, the admin alert, and no second request for the same money', async () => {
   const { tap, answer, alerts, book } = makeBot();
-  const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube, 40k subscribers');
+  const applied = await store.createRequest(RAVI, 'news', 'Ravi, YouTube, 40k subscribers');
   const terms = affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
     commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
   await store.approveRequest(applied.request.request_id, Object.assign({}, terms, { code: 'RAVI10' }), 'Admin');
@@ -274,7 +287,7 @@ test('withdrawing: the request, the admin alert, and no second request for the s
 test('nobody can withdraw someone else\'s code by crafting the button', async () => {
   const { tap } = makeBot();
   const other = { id: 999, first_name: 'Other' };
-  const applied = await store.createRequest(other, 'upsc', 'Other person, Telegram, 5k');
+  const applied = await store.createRequest(other, 'news', 'Other person, Telegram, 5k');
   const terms = affiliates.validateTerms({ discount_type: 'flat', discount_value: 10, commission_type: 'flat',
     commission_value: 20, payout_cycle: 'weekly' }).value;
   await store.approveRequest(applied.request.request_id, Object.assign({}, terms, { code: 'OTHER10' }), 'Admin');

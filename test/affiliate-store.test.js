@@ -20,11 +20,13 @@ process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({
 });
 process.env.AFFILIATE_SHEET_ID = 'https://docs.google.com/spreadsheets/d/AFFILIATESHEET1234567890abc/edit';
 process.env.LEGACY_GROUP_ID = '';
-for (const prefix of ['UPSC', 'EPFO']) {
+for (const prefix of ['APPSC_NEWS_EN', 'APPSC_NEWS_TE', 'APPSC_Q_EN', 'APPSC_Q_TE', 'UPSC', 'EPFO']) {
   process.env[`SHEET_URL_${prefix}`] = `https://script.google.com/macros/s/test-${prefix}/exec`;
   process.env[`SHEET_TOKEN_${prefix}`] = `token-${prefix}`;
-  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + (prefix === 'UPSC' ? '1' : '2');
+  process.env[`TELEGRAM_GROUP_${prefix}`] = '-100' + Math.abs(prefix.length * 7919);
 }
+process.env.TELEGRAM_PAYBOT_NEWS = '111:TEST';
+process.env.TELEGRAM_PAYBOT_SADHANA = '222:TEST';
 process.env.TELEGRAM_PAYBOT_UPSC = '333:TEST';
 process.env.TELEGRAM_PAYBOT_EPFO = '444:TEST';
 
@@ -45,10 +47,10 @@ function fresh() {
 }
 
 async function approvedCode(terms = TERMS) {
-  const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube @ravi_teaches, 40k subscribers');
+  const applied = await store.createRequest(RAVI, 'news', 'Ravi, YouTube @ravi_teaches, 40k subscribers');
   assert.equal(applied.ok, true, applied.reason);
   const approved = await store.approveRequest(applied.request.request_id, terms, 'Admin (a@x.com)',
-    { botUsername: 'prelimspaymentbot' });
+    { botUsername: 'appscpaymentsbot' });
   assert.equal(approved.ok, true, approved.error);
   return approved.code;
 }
@@ -109,16 +111,16 @@ test('a Sheet1 with anything in it is never deleted', async () => {
 
 test('an application is recorded once per exam, and refused while one is waiting', async () => {
   const { book } = fresh();
-  const first = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube @ravi_teaches, 40k subscribers');
+  const first = await store.createRequest(RAVI, 'news', 'Ravi, YouTube @ravi_teaches, 40k subscribers');
   assert.equal(first.ok, true);
   assert.match(first.request.request_id, /^REQ-\d{8}-[0-9A-F]{6}$/);
 
-  const again = await store.createRequest(RAVI, 'upsc', 'Ravi again, same channel, please');
+  const again = await store.createRequest(RAVI, 'news', 'Ravi again, same channel, please');
   assert.equal(again.ok, false);
   assert.match(again.reason, /already with the admin/);
 
   // Another exam is another application.
-  const other = await store.createRequest(RAVI, 'epfo', 'Ravi, also a Telegram channel for EPFO aspirants');
+  const other = await store.createRequest(RAVI, 'sadhana', 'Ravi, also a Telegram channel for EPFO aspirants');
   assert.equal(other.ok, true);
 
   assert.equal(book.Requests.length, 3, 'header + two applications');
@@ -127,7 +129,7 @@ test('an application is recorded once per exam, and refused while one is waiting
 
 test('an application for an exam that is not on offer is refused', async () => {
   fresh();
-  const out = await store.createRequest(RAVI, 'appsc_q', 'Some details that are long enough');
+  const out = await store.createRequest(RAVI, 'no_such_exam', 'Some details that are long enough');
   assert.equal(out.ok, false);
   assert.match(out.reason, /not open/);
 });
@@ -135,10 +137,10 @@ test('an application for an exam that is not on offer is refused', async () => {
 test('approving creates the code with the admin\'s terms and a share link', async () => {
   const { book } = fresh();
   const code = await approvedCode();
-  assert.match(code.code, /^RAVIKUUPSC\d{2}$/);
-  assert.equal(code.exam, 'upsc');
-  assert.equal(code.exam_bot, 'TELEGRAM_PAYBOT_UPSC');
-  assert.equal(code.share_link, `https://t.me/prelimspaymentbot?start=promo_${code.code}`);
+  assert.match(code.code, /^RAVIKUNEWS\d{2}$/);
+  assert.equal(code.exam, 'news');
+  assert.equal(code.exam_bot, 'TELEGRAM_PAYBOT_NEWS');
+  assert.equal(code.share_link, `https://t.me/appscpaymentsbot?start=promo_${code.code}`);
 
   const saved = await store.getCode(code.code.toLowerCase());
   assert.equal(saved.discount_value, '10');
@@ -153,14 +155,14 @@ test('approving creates the code with the admin\'s terms and a share link', asyn
 test('an approved exam cannot be applied for again while its code is active', async () => {
   fresh();
   await approvedCode();
-  const again = await store.createRequest(RAVI, 'upsc', 'Another application for the same exam');
+  const again = await store.createRequest(RAVI, 'news', 'Another application for the same exam');
   assert.equal(again.ok, false);
   assert.match(again.reason, /already have the code/);
 });
 
 test('a custom code already used by a coupon or another influencer is refused', async () => {
   fresh();
-  const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube, 40k subscribers');
+  const applied = await store.createRequest(RAVI, 'news', 'Ravi, YouTube, 40k subscribers');
   const clash = await store.approveRequest(applied.request.request_id, Object.assign({}, TERMS, { code: 'SAVE10' }),
     'Admin', { codeTaken: async (c) => c === 'SAVE10' });
   assert.equal(clash.ok, false);
@@ -173,7 +175,7 @@ test('a custom code already used by a coupon or another influencer is refused', 
 
 test('a request is decided once', async () => {
   fresh();
-  const applied = await store.createRequest(RAVI, 'upsc', 'Ravi, YouTube, 40k subscribers');
+  const applied = await store.createRequest(RAVI, 'news', 'Ravi, YouTube, 40k subscribers');
   const rejected = await store.rejectRequest(applied.request.request_id, 'Audience too small for now', 'Admin');
   assert.equal(rejected.ok, true);
   const late = await store.approveRequest(applied.request.request_id, TERMS, 'Admin');
