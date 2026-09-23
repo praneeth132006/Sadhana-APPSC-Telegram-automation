@@ -37,8 +37,8 @@ const TABLES = {
     tab: 'Influencers',
     headers: ['Telegram ID', 'Username', 'Name', 'UPI ID', 'Joined At', 'Updated At', 'Status', 'Notes',
       'Legal Name', 'Phone', 'Email', 'Payout Method', 'Account Holder', 'Account Number', 'IFSC', 'PAN',
-      'Details Complete'],
-    widths: [130, 150, 180, 200, 190, 190, 90, 260, 190, 120, 220, 110, 190, 170, 120, 120, 120]
+      'Details Complete', 'Applying For'],
+    widths: [130, 150, 180, 200, 190, 190, 90, 260, 190, 120, 220, 110, 190, 170, 120, 120, 120, 120]
   },
   requests: {
     tab: 'Requests',

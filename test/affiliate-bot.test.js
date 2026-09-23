@@ -126,15 +126,19 @@ test('applying: choose an exam, give email and mobile, and the admin is alerted'
   assert.match(textOf(await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'not-an-email')), /does not look like an email/);
 
   const phonePrompt = await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'Ravi@Gmail.com');
-  assert.ok(phonePrompt[0].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
+  // The email is confirmed out loud before the next question.
+  assert.match(phonePrompt[0].args[1], /Your email is set: <b>ravi@gmail\.com/);
+  assert.ok(phonePrompt[1].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
   assert.match(textOf(await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '123')), /10-digit/);
 
   const done = await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '+91 98765 43210');
-  assert.match(done[0].args[1], /Application sent for APPSC Newspaper/);
-  assert.match(done[0].args[1], /REQ-\d{8}-/);
-  assert.match(done[0].args[1], /ravi@gmail\.com/);
-  assert.match(done[0].args[1], /9876543210/);
-  assert.match(done[0].args[1], /finish your payout details/);
+  assert.match(done[0].args[1], /Your mobile number is set: <b>9876543210/);
+  assert.match(done[1].args[1], /Application sent for APPSC Newspaper/);
+  assert.match(done[1].args[1], /REQ-\d{8}-/);
+  assert.match(done[1].args[1], /ravi@gmail\.com/);
+  assert.match(done[1].args[1], /9876543210/);
+  assert.match(done[1].args[1], /we still need: <b>Name as on your bank account, UPI ID/);
+  assert.equal(buttons(done)[0].callback_data, 'aff:payout');
 
   // The contact details are on their row, ready for a payout.
   const person = await store.getInfluencer(501);
@@ -156,6 +160,36 @@ test('applying: choose an exam, give email and mobile, and the admin is alerted'
   assert.match(alerts[0].text, /New influencer application/);
   assert.match(alerts[0].text, /ravi_teaches/);
   assert.equal(alerts[0].extra.reply_markup.inline_keyboard[0][0].url, 'https://appscsadhana.vercel.app/influencers.html');
+});
+
+test('an email or mobile sent without tapping Reply still continues the application', async () => {
+  const { tap, say, alerts } = makeBot();
+  await tap('aff:exam:news');
+  const afterEmail = await say('ravi@gmail.com');
+  assert.match(afterEmail[0].args[1], /Your email is set: <b>ravi@gmail\.com/);
+  assert.ok(afterEmail[1].args[1].startsWith(`${PROMPT.applyPhone}APPSC Newspaper`));
+
+  const done = await say('9876543210');
+  assert.match(textOf(done), /Application sent for APPSC Newspaper/);
+  assert.equal(alerts.length, 1);
+
+  // Once sent, a stray email is saved as a payout detail, and said so.
+  const later = await say('new@gmail.com');
+  assert.match(textOf(later), /Saved: <b>Email/);
+  assert.equal((await store.getInfluencer(501)).email, 'new@gmail.com');
+});
+
+test('details already given are not asked for again, and a finished payout setup is said so', async () => {
+  const { tap, answer } = makeBot();
+  await answer(PROMPT.legal_name, 'Ravi Kumar');
+  await answer(PROMPT.upi, 'ravi@okicici');
+  await answer(PROMPT.email, 'ravi@gmail.com');
+  await answer(PROMPT.phone, '9876543210');
+  const out = await tap('aff:exam:news');
+  assert.equal(out.length, 1, 'it asked for a detail it already had');
+  assert.match(out[0].args[1], /Application sent for APPSC Newspaper/);
+  assert.match(out[0].args[1], /payout details are all set up/);
+  assert.ok(!buttons(out).length, 'offered payout details that are already complete');
 });
 
 test('a second application for the same exam is stopped before anything is typed', async () => {

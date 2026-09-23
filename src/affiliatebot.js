@@ -207,6 +207,13 @@ function createAffiliateBot({ polling = false } = {}) {
         'Send /codes to see it.');
       return;
     }
+    // Remembered on their row, so an email or mobile sent without tapping
+    // Reply still finds its way into this application.
+    const influencer = await store.upsertInfluencer(user, { applying_for: exam.id });
+    await continueApplication(chatId, user, exam, influencer);
+  }
+
+  async function askApplyEmail(chatId, exam) {
     await reply(chatId,
       `${PROMPT.applyEmail}${esc(exam.label)}\n\n` +
       'Reply with your <b>email address</b>. We use it for your account and for payout receipts.\n' +
@@ -214,54 +221,68 @@ function createAffiliateBot({ polling = false } = {}) {
       { reply_markup: { force_reply: true, input_field_placeholder: 'ravi@gmail.com' } });
   }
 
-  /** Step one of an application: the email. Then we ask for the mobile. */
-  async function saveApplyEmail(msg, examLabel) {
-  const exam = affiliates.listExams().find((e) => e.label === examLabel);
+  async function askApplyPhone(chatId, exam) {
+    await reply(chatId,
+      `${PROMPT.applyPhone}${esc(exam.label)}\n\n` +
+      'Reply with your <b>10-digit mobile number</b>. RazorpayX needs it to pay you.\n' +
+      '<i>Example: 9876543210</i>',
+      { reply_markup: { force_reply: true, input_field_placeholder: '9876543210' } });
+  }
+
+  /**
+   * continueApplication — asks for whichever of email and mobile is still
+   * missing, and sends the application once both are in. Details already on
+   * their row are not asked for again.
+   */
+  async function continueApplication(chatId, user, exam, influencer) {
+    if (!influencer.email) { await askApplyEmail(chatId, exam); return; }
+    if (!influencer.phone) { await askApplyPhone(chatId, exam); return; }
+    await submitApplication(chatId, user, exam, influencer);
+  }
+
+  /** The exam an apply prompt (or their row) names, if it is still open. */
+  function openExam(examIdOrLabel) {
+    return affiliates.listExams().find((e) => e.label === examIdOrLabel || e.id === examIdOrLabel) || null;
+  }
+
+  /** Saves the email or mobile given for an application, says so, and moves on. */
+  async function saveApplyDetail(msg, examLabel, field) {
+  const exam = openExam(examLabel);
   if (!exam) {
     await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.');
     return;
   }
-  const saved = await store.setPayoutField(msg.from, 'email', support.messageText(msg));
+  const saved = await store.setPayoutField(msg.from, field, support.messageText(msg));
   if (!saved.ok) {
     await reply(msg.chat.id, `❌ ${esc(saved.reason)}`,
       { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:exam:${exam.id}` }]] } });
     return;
   }
-  await reply(msg.chat.id,
-    `${PROMPT.applyPhone}${esc(exam.label)}\n\n` +
-    'Reply with your <b>10-digit mobile number</b>. RazorpayX needs it to pay you.\n' +
-    '<i>Example: 9876543210</i>',
-    { reply_markup: { force_reply: true, input_field_placeholder: '9876543210' } });
+  await reply(msg.chat.id, field === 'email'
+    ? `✅ Your email is set: <b>${esc(saved.value)}</b>`
+    : `✅ Your mobile number is set: <b>${esc(saved.value)}</b>`);
+  await continueApplication(msg.chat.id, msg.from, exam, saved.influencer);
   }
 
-  /** Step two: the mobile — and with it, the application goes to the admin. */
-  async function saveApplyPhone(msg, examLabel) {
-  const exam = affiliates.listExams().find((e) => e.label === examLabel);
-  if (!exam) {
-    await reply(msg.chat.id, 'That exam is not open for promotion any more. Send /apply to see what is.');
-    return;
-  }
-  const saved = await store.setPayoutField(msg.from, 'phone', support.messageText(msg));
-  if (!saved.ok) {
-    await reply(msg.chat.id, `❌ ${esc(saved.reason)}`,
-      { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:exam:${exam.id}` }]] } });
-    return;
-  }
-
-  const influencer = saved.influencer;
-  const result = await store.createRequest(msg.from, exam.id,
+  /** Both details are in: the application goes to the admin. */
+  async function submitApplication(chatId, user, exam, influencer) {
+  const result = await store.createRequest(user, exam.id,
     `Email: ${influencer.email} · Mobile: ${influencer.phone}`);
   if (!result.ok) {
-    await reply(msg.chat.id, `❌ ${esc(result.reason)}`);
+    await reply(chatId, `❌ ${esc(result.reason)}`);
     return;
   }
-  const details = affiliates.payoutDetails(influencer);
-  await reply(msg.chat.id,
+  const after = await store.upsertInfluencer(user, { applying_for: '' });
+  const details = affiliates.payoutDetails(after);
+  await reply(chatId,
     `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
     `Reference: <code>${esc(result.request.request_id)}</code>\n` +
     `Email: <b>${esc(influencer.email)}</b> · Mobile: <b>${esc(influencer.phone)}</b>\n\n` +
-    'An admin will review it and you will get a message here with your promo code and terms.' +
-    (details.complete ? '' : '\n\n💳 While you wait, finish your payout details so we can pay you — tap below.'),
+    'An admin will review it and you will get a message here with your promo code and terms.\n\n' +
+    (details.complete
+      ? '💳 Your payout details are all set up, so you can be paid as soon as you earn.'
+      : `💳 To get paid, we still need: <b>${esc(details.missingLabels.join(', '))}</b>. ` +
+        'Tap below to add them while you wait.'),
     details.complete ? {} : { reply_markup: PAYOUT_BUTTON });
   await notify.alertAdmins(notify.applicationAlert(result.request));
   }
@@ -579,6 +600,23 @@ function createAffiliateBot({ polling = false } = {}) {
     }
   });
 
+  /**
+   * savePlainDetail — a message that is plainly an email or a mobile number,
+   * sent without replying to the prompt. Mid-application it continues the
+   * application; otherwise it is saved as a payout detail. False when the
+   * message is neither, so the caller can point the way instead.
+   */
+  async function savePlainDetail(msg) {
+    const text = support.messageText(msg);
+    const field = ['email', 'phone'].find((f) => affiliates.checkPayoutField(f, text).ok);
+    if (!field || !store.isConfigured()) return false;
+    const influencer = (await store.getInfluencer(msg.from.id)) || {};
+    const exam = influencer.applying_for ? openExam(influencer.applying_for) : null;
+    if (exam) await saveApplyDetail(msg, exam.label, field);
+    else await saveField(msg, field);
+    return true;
+  }
+
   // ---- everything else ----------------------------------------------------------
 
   bot.on('message', async (msg) => {
@@ -596,17 +634,21 @@ function createAffiliateBot({ polling = false } = {}) {
       const replied = msg.reply_to_message;
       const prompt = replied && replied.from && replied.from.is_bot ? support.messageText(replied) : '';
       if (prompt.startsWith(PROMPT.applyEmail)) {
-        await saveApplyEmail(msg, prompt.split('\n')[0].slice(PROMPT.applyEmail.length).trim());
+        await saveApplyDetail(msg, prompt.split('\n')[0].slice(PROMPT.applyEmail.length).trim(), 'email');
         return;
       }
       if (prompt.startsWith(PROMPT.applyPhone)) {
-        await saveApplyPhone(msg, prompt.split('\n')[0].slice(PROMPT.applyPhone.length).trim());
+        await saveApplyDetail(msg, prompt.split('\n')[0].slice(PROMPT.applyPhone.length).trim(), 'phone');
         return;
       }
       if (prompt.startsWith(PROMPT.bank)) { await saveBank(msg); return; }
       const field = Object.keys(FIELD_PROMPTS).find((f) => prompt.startsWith(PROMPT[FIELD_PROMPTS[f][0]]));
       if (field) { await saveField(msg, field); return; }
       if (prompt.startsWith(PROMPT.question)) { await forwardQuestion(msg); return; }
+
+      // An email or mobile typed without tapping Reply: still theirs, still
+      // saved, and still answered — never met with silence or the menu.
+      if (!prompt && (await savePlainDetail(msg))) return;
     } catch (err) {
       console.error(`[affiliate-bot] reply handling failed: ${err.message}`);
       await apologise(msg.chat.id);
