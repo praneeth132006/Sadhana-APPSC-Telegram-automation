@@ -119,11 +119,12 @@ test('an application is recorded once per exam, and refused while one is waiting
   assert.equal(again.ok, false);
   assert.match(again.reason, /already with the admin/);
 
-  // Another exam is another application.
-  const other = await store.createRequest(RAVI, 'sadhana', 'Ravi, also a Telegram channel for EPFO aspirants');
-  assert.equal(other.ok, true);
+  // Sadhana APPSC is closed to influencers, so it takes no application.
+  const closed = await store.createRequest(RAVI, 'sadhana', 'Ravi, also a Telegram channel for Sadhana aspirants');
+  assert.equal(closed.ok, false);
+  assert.match(closed.reason, /not open/);
 
-  assert.equal(book.Requests.length, 3, 'header + two applications');
+  assert.equal(book.Requests.length, 2, 'header + one application');
   assert.equal(book.Influencers.length, 2, 'one person, one row');
 });
 

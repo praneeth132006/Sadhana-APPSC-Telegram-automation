@@ -37,10 +37,10 @@ function upscCode(overrides = {}) {
 // Exams
 // ---------------------------------------------------------------------------
 
-test('the exams open to influencers are the APPSC ones, named without the language', () => {
+test('the only exam open to influencers is APPSC Newspaper, named without the language', () => {
   const exams = affiliates.listExams();
-  assert.deepEqual(exams.map((e) => e.id), ['news', 'sadhana']);
-  assert.deepEqual(exams.map((e) => e.label), ['APPSC Newspaper', 'Sadhana APPSC']);
+  assert.deepEqual(exams.map((e) => e.id), ['news']);
+  assert.deepEqual(exams.map((e) => e.label), ['APPSC Newspaper']);
   // Both languages of an exam are sold by its one bot, so its code covers both.
   assert.deepEqual(exams[0].groups.map((g) => g.id), ['appsc_news_en', 'appsc_news_te']);
 });

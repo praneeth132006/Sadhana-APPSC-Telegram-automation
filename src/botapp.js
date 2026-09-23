@@ -314,7 +314,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
    * once applied, travel on the button, so a tap never depends on memory and
    * the code is checked again when it is used.
    */
-  function passKeyboard(group, pass, applied, { offerTrial = false } = {}) {
+  function passKeyboard(group, pass, applied) {
   const amount = applied ? applied.finalPaise : pass.amountPaise;
   // Promo codes and coupons never share a code (approving one checks the
   // coupons), so the code alone says which it is when the button comes back.
@@ -324,14 +324,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
         text: `💳 Pay ${pricing.rupees(amount)}`,
         callback_data: `buy:${group.id}:${pass.id}${applied ? ':' + applied.code : ''}`
       }],
-      offerTrial
-        ? [{ text: '🎁 Free preview of the group', callback_data: `trial:${group.id}` }]
-        : null,
       applied
         ? [{ text: applied.kind === 'promo' ? '✖️ Remove promo code' : '✖️ Remove coupon',
              callback_data: `plain:${group.id}` }]
         : [{ text: '🎟 Apply coupon or promo code', callback_data: `cpn:${group.id}` }]
-    ].filter(Boolean)
+    ]
   };
   }
 
@@ -363,7 +360,7 @@ function createPaymentBot({ payBotEnv, polling = false }) {
 
   await bot.sendMessage(chatId, passMessage(group, pass, show), {
     parse_mode: 'HTML',
-    reply_markup: passKeyboard(group, pass, show, { offerTrial: (await trialRules()).enabled })
+    reply_markup: passKeyboard(group, pass, show)
   });
 
   // Said out loud rather than swallowed: someone who followed a friend's link
@@ -1013,50 +1010,6 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   }
 
   // ---------------------------------------------------------------------------
-  // The free preview of the group
-  // ---------------------------------------------------------------------------
-
-  /** Whether this bot offers a preview at all, from the admin's settings. */
-  async function trialRules() {
-  return support.trialSettings(await settingsWithin(SUPPORT_SETTINGS_WAIT_MS));
-  }
-
-  /**
-   * startTrial — lets a newcomer into the group, read-only, for a few minutes.
-   * The sweep (server.js) warns them and takes them out again.
-   */
-  async function beginTrial(chatId, group, user) {
-  const rules = await trialRules();
-  if (!rules.enabled) {
-    await bot.sendMessage(chatId, 'The free preview is not running at the moment. Send /plans to join.');
-    return;
-  }
-  let result;
-  try {
-    result = await membership.startTrial(group.id, user, rules.minutes);
-  } catch (err) {
-    console.error(`[bot] ${payBotEnv}: could not start a preview — ${err.message}`);
-    await bot.sendMessage(chatId, '⚠️ Could not start your free preview just now. Please try again in a moment.',
-      { reply_markup: SUPPORT_BUTTON });
-    return;
-  }
-  if (!result.ok) {
-    await bot.sendMessage(chatId, result.reason === 'already a member'
-      ? `✅ You already have access to <b>${esc(group.shortName)}</b>. Send /status for your invite link.`
-      : `The free preview is one per person, and yours has been used. Send /plans to join <b>${esc(group.shortName)}</b> properly.`,
-      { parse_mode: 'HTML' });
-    return;
-  }
-
-  await bot.sendMessage(chatId,
-    `🎁 <b>Your free ${rules.minutes}-minute preview of ${esc(group.shortName)} is open.</b>\n\n` +
-    'Tap to join — you are let in automatically:\n' + result.inviteLink + '\n\n' +
-    `You can read everything for ${rules.minutes} minutes. You cannot post during the preview, ` +
-    'and you are removed automatically when it ends — we will remind you before that.',
-    { parse_mode: 'HTML', disable_web_page_preview: true });
-  }
-
-  // ---------------------------------------------------------------------------
   // Buying a pass
   // ---------------------------------------------------------------------------
 
@@ -1129,15 +1082,11 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
 
-  // ---- the free preview ---------------------------------------------------
+  // ---- the free preview (no longer offered) -------------------------------
+  // Old pass messages may still carry the button; say so rather than ignore it.
   if (data.startsWith('trial:')) {
-    const group = familyGroup(data.slice(6));
-    if (!group) {
-      await ack('That group is not available here.');
-      return;
-    }
-    await ack('Opening your preview…');
-    await beginTrial(user.id, group, user);
+    await ack();
+    await bot.sendMessage(user.id, 'The free preview is no longer offered. Send /plans to join.');
     return;
   }
 

@@ -167,7 +167,7 @@ test('the questions come one at a time, and the pass follows the last one', asyn
   assert.match(textOf(three), /₹199/);
   const data = buttons(three).map((b) => b.callback_data);
   assert.ok(data.some((d) => /^buy:upsc:/.test(d)), 'no Pay button after the questions');
-  assert.ok(data.includes('trial:upsc'), 'no free preview offered');
+  assert.ok(!data.includes('trial:upsc'), 'the free preview is no longer offered');
   assert.ok(!data.some((d) => /^smp:/.test(d)), 'it asked for a fourth question');
 });
 
@@ -207,41 +207,11 @@ test('a question Telegram refuses does not strand the student', async () => {
 // The free preview
 // ---------------------------------------------------------------------------
 
-test('a preview is granted once, read-only, with its own invite link', async () => {
-  const { tap, rows, invites } = makeBot();
+test('the free preview is no longer offered, and an old button says so', async () => {
+  const { tap, invites } = makeBot();
   const out = await tap('trial:upsc');
-  assert.match(textOf(out), /free 10-minute preview/);
-  assert.match(textOf(out), /https:\/\/t\.me\/\+preview-invite/);
-  assert.match(textOf(out), /cannot post/);
-  assert.equal(invites.length, 1);
-
-  const row = rows['upsc:900'];
-  assert.equal(row.plan, 'trial');
-  assert.equal(row.status, 'trial');
-  assert.equal(row.amount, 0);
-  const minutes = (membership.parseIst(row.expiry_date) - membership.parseIst(row.start_date)) / 60000;
-  assert.equal(Math.round(minutes), 10);
-
-  // The second attempt is refused: one preview per person, per group.
-  const again = await tap('trial:upsc');
-  assert.match(textOf(again), /one per person/);
-  assert.equal(invites.length, 1, 'a second invite was minted');
-});
-
-test('someone who already has the pass is told so, not given a preview', async () => {
-  const rows = { 'upsc:900': { telegram_id: '900', status: 'active', plan: 'exam_pass', expiry_date: '30-11-2099, 11:59:59 PM IST' } };
-  const { tap, invites } = makeBot({ rows });
-  const out = await tap('trial:upsc');
-  assert.match(textOf(out), /already have access/);
-  assert.equal(invites.length, 0);
-});
-
-test('the admin can switch the preview off, and then it is not offered or granted', async () => {
-  const { tap } = makeBot({ settings: { trial_enabled: 'no' } });
-  const pass = await tap('smp:upsc:99');   // past the last question: straight to the pass
-  assert.ok(!buttons(pass).some((b) => b.callback_data === 'trial:upsc'), 'the preview was still offered');
-  const out = await tap('trial:upsc');
-  assert.match(textOf(out), /not running at the moment/);
+  assert.match(textOf(out), /no longer offered/);
+  assert.equal(invites.length, 0, 'an invite was minted');
 });
 
 test('a preview is let into the group and muted for exactly its length', async () => {

@@ -344,18 +344,9 @@ what the group posts every day and *then* shows the pass. How many questions
 (`sample_questions`, 0 switches them off) is set on the Pass & Coupons page. A group with
 no usable questions goes straight to the pass rather than showing an empty taster.
 
-**The free preview.** Under the price is a preview of the group itself: ten minutes,
-read-only, one per person per group ever. It is a real Subscribers row (`plan: trial`), so
-the join request is approved the usual way and Telegram mutes them for the length of the
-preview. A minute-by-minute sweep warns them (with a real payment link) and then removes
-them and invites them to join. Length, warning time and whether it runs at all are on the
-Pass & Coupons page.
-
-> The preview needs `/api/cron/trials` called about once a minute. Vercel's free plan only
-> schedules daily crons, so use any free pinger — cron-job.org, for example: URL
-> `https://<your domain>/api/cron/trials`, every minute, with the header
-> `Authorization: Bearer <CRON_SECRET>`. The nightly sweep calls it too, so a preview is
-> never left open for more than a day even if the pinger stops.
+**The free preview** is no longer offered: the pass shows only Pay and Apply coupon. An old
+pass message's preview button now replies that it has ended. `/api/cron/trials` and the
+nightly sweep still close any preview that was already open.
 
 **Speed.** A bot that is slow to answer is rejected by Telegram's ad review. `/start` never
 waits on a spreadsheet: the settings it could use (the welcome note) are read behind the
@@ -410,8 +401,8 @@ code. It replaced the member-to-member referral system, which was hard to track 
 | **Admin** — on the **🤝 Influencers** dashboard | approves an application with terms, or rejects it · pays a withdrawal from RazorpayX using the **Pay to** details beside it, then marks it paid with the reference · sees every influencer's payout details and whether they are complete · opens a code to see every student who joined with it and everyone who opened the link but has not paid · pauses, resumes or re-terms a code |
 | **Student** — in the exam's payment bot | types the code at **🎟 Apply coupon or promo code**, or opens the influencer's link, which starts the bot with the code applied |
 
-**One code, one exam.** Influencers apply per exam — APPSC Newspaper, Sadhana APPSC, UPSC,
-EPFO: one per payment bot — and a code is honoured only by that exam's bot, for either
+**One code, one exam.** Influencers apply per exam — one per payment bot; only APPSC
+Newspaper is open to applications for now — and a code is honoured only by that exam's bot, for either
 language. The UPSC influencer's code typed into the EPFO bot is refused with *"That code is
 for UPSC and cannot be used here."* An influencer can apply for more than one exam; each is
 approved separately and gets its own code.
