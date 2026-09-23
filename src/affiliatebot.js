@@ -6,9 +6,9 @@
 // pass, or the other way round.
 //
 // An influencer can:
-//   /apply     — pick an exam (one per payment bot) and describe where they
-//                will promote it; the admin gets an alert and decides on the
-//                Influencers dashboard
+//   /apply     — pick an exam (one per payment bot) and give an email and
+//                mobile number, changeable until the admin decides; the admin
+//                gets an alert and decides on the Influencers dashboard
 //   /codes     — every code they hold: its terms, share link, sales, and
 //                what is earned, requested and paid
 //   /withdraw  — ask for a code's available earnings (weekly or monthly, as
@@ -165,9 +165,9 @@ function createAffiliateBot({ polling = false } = {}) {
       esc(botCommands.AFFILIATE_ABOUT) + '\n\n' +
       '<b>How it works</b>\n' +
       '1. Tap <b>Apply</b> and choose the exam you want to promote.\n' +
-      '2. Tell us where you will promote it. An admin reviews your application.\n' +
+      '2. Give your email and mobile number. An admin reviews your application.\n' +
       '3. Once approved you get your own promo code and link. Your followers get a discount.\n' +
-      '4. You earn on every student who pays with your code, and withdraw over UPI.\n\n' +
+      '4. You earn on every student who pays with your code, and withdraw by UPI or bank transfer.\n\n' +
       'The discount, your commission and how often you can withdraw are set by the admin when approving.',
       { reply_markup: MAIN_MENU });
   }
@@ -201,10 +201,12 @@ function createAffiliateBot({ polling = false } = {}) {
         'You will get a message here as soon as it is decided.');
       return;
     }
-    const held = codes.find((c) => c.telegram_id === id && c.exam === exam.id && c.status === 'active');
+    const held = codes.find((c) => c.telegram_id === id && c.exam === exam.id);
     if (held) {
-      await reply(chatId, `You already have the code <code>${esc(held.code)}</code> for <b>${esc(exam.label)}</b>. ` +
-        'Send /codes to see it.');
+      await reply(chatId, held.status === 'active'
+        ? `You already have the code <code>${esc(held.code)}</code> for <b>${esc(exam.label)}</b>. Send /codes to see it.`
+        : `Your code <code>${esc(held.code)}</code> for <b>${esc(exam.label)}</b> is ${esc(held.status)}. ` +
+          'Send /support to ask the admin about it.');
       return;
     }
     // Remembered on their row, so an email or mobile sent without tapping
@@ -266,8 +268,7 @@ function createAffiliateBot({ polling = false } = {}) {
 
   /** Both details are in: the application goes to the admin. */
   async function submitApplication(chatId, user, exam, influencer) {
-  const result = await store.createRequest(user, exam.id,
-    `Email: ${influencer.email} · Mobile: ${influencer.phone}`);
+  const result = await store.createRequest(user, exam.id, store.contactDetails(influencer));
   if (!result.ok) {
     await reply(chatId, `❌ ${esc(result.reason)}`);
     return;
@@ -278,12 +279,16 @@ function createAffiliateBot({ polling = false } = {}) {
     `✅ <b>Application sent for ${esc(exam.label)}.</b>\n\n` +
     `Reference: <code>${esc(result.request.request_id)}</code>\n` +
     `Email: <b>${esc(influencer.email)}</b> · Mobile: <b>${esc(influencer.phone)}</b>\n\n` +
-    'An admin will review it and you will get a message here with your promo code and terms.\n\n' +
+    'An admin will review it and you will get a message here with your promo code and terms.\n' +
+    'Until then you can change your email or mobile below. Once approved they are fixed.\n\n' +
     (details.complete
       ? '💳 Your payout details are all set up, so you can be paid as soon as you earn.'
       : `💳 To get paid, we still need: <b>${esc(details.missingLabels.join(', '))}</b>. ` +
         'Tap below to add them while you wait.'),
-    details.complete ? {} : { reply_markup: PAYOUT_BUTTON });
+    { reply_markup: { inline_keyboard: [
+      CHANGE_CONTACT_ROW,
+      [{ text: details.complete ? '💳 Payout details' : '💳 Add payout details', callback_data: 'aff:payout' }]
+    ] } });
   await notify.alertAdmins(notify.applicationAlert(result.request));
   }
 
@@ -292,11 +297,20 @@ function createAffiliateBot({ polling = false } = {}) {
   // with a tick or a cross so it is obvious what is left and how to change it.
 
   const PAYOUT_BUTTON = { inline_keyboard: [[{ text: '💳 Payout details', callback_data: 'aff:payout' }]] };
+  const CHANGE_CONTACT_ROW = [
+    { text: '✉️ Change email', callback_data: 'aff:set:email' },
+    { text: '📱 Change mobile', callback_data: 'aff:set:phone' }
+  ];
 
   async function sendPayoutCard(chatId, user, heading = '') {
     if (!(await requireStore(chatId))) return;
-    const i = (await store.getInfluencer(user.id)) || {};
+    const [i, locked] = await Promise.all([
+      store.getInfluencer(user.id).then((row) => row || {}),
+      store.contactLocked(user.id)
+    ]);
     const status = affiliates.payoutDetails(i);
+    // Locked only once set: a missing email or mobile can still be added.
+    const fixed = (field) => locked && Boolean(i[field]);
     const line = (label, value, required = true) =>
       `${value ? '✅' : required ? '❌' : '➖'} ${label}: ${value ? `<b>${esc(value)}</b>` : '<i>not set</i>'}`;
     const bank = i.account_number
@@ -307,8 +321,8 @@ function createAffiliateBot({ polling = false } = {}) {
       'We pay by RazorpayX, which needs all of these.',
       '',
       line('Name as on bank account', i.legal_name),
-      line('Mobile', i.phone),
-      line('Email', i.email),
+      line('Mobile', i.phone) + (fixed('phone') ? ' 🔒' : ''),
+      line('Email', i.email) + (fixed('email') ? ' 🔒' : ''),
       '',
       `Pay me by: <b>${status.method === 'bank' ? '🏦 Bank transfer' : '💳 UPI'}</b>`,
       line('UPI ID', i.upi_id, status.method === 'upi'),
@@ -319,12 +333,18 @@ function createAffiliateBot({ polling = false } = {}) {
         ? '✅ <b>All set</b> — you can withdraw as soon as your cycle allows.'
         : `Still needed: <b>${esc(status.missingLabels.join(', '))}</b>. Tap below to add ${status.missing.length > 1 ? 'them' : 'it'}.`
     ].filter((l, idx) => idx !== 0 || l);
+    if (fixed('email') || fixed('phone')) {
+      lines.push('', '🔒 Your email and mobile were approved with your application, so they cannot be changed here. ' +
+        'Send /support to ask the admin.');
+    }
     const set = (text, field) => ({ text, callback_data: `aff:set:${field}` });
     await reply(chatId, lines.join('\n'), {
       reply_markup: {
         inline_keyboard: [
-          [set(i.legal_name ? '✏️ Change name' : '✏️ Add name', 'legal_name'), set(i.phone ? '📱 Change mobile' : '📱 Add mobile', 'phone')],
-          [set(i.email ? '✉️ Change email' : '✉️ Add email', 'email'), set(i.pan ? '🪪 Change PAN' : '🪪 Add PAN', 'pan')],
+          [set(i.legal_name ? '✏️ Change name' : '✏️ Add name', 'legal_name'),
+            fixed('phone') ? null : set(i.phone ? '📱 Change mobile' : '📱 Add mobile', 'phone')].filter(Boolean),
+          [fixed('email') ? null : set(i.email ? '✉️ Change email' : '✉️ Add email', 'email'),
+            set(i.pan ? '🪪 Change PAN' : '🪪 Add PAN', 'pan')].filter(Boolean),
           [set(i.upi_id ? '💳 Change UPI ID' : '💳 Add UPI ID', 'upi_id'), set(i.account_number ? '🏦 Change bank account' : '🏦 Add bank account', 'bank')],
           [
             { text: (status.method === 'upi' ? '● ' : '○ ') + 'Pay me by UPI', callback_data: 'aff:method:upi' },
@@ -349,6 +369,10 @@ function createAffiliateBot({ polling = false } = {}) {
     }
     const [promptKey, ask, example] = FIELD_PROMPTS[field] || [];
     if (!promptKey) return;
+    if ((field === 'email' || field === 'phone') && i[field] && await store.contactLocked(user.id)) {
+      await reply(chatId, `🔒 ${esc(store.CONTACT_LOCKED_REASON)}`, { reply_markup: PAYOUT_BUTTON });
+      return;
+    }
     await reply(chatId,
       `${PROMPT[promptKey]}\n\n${ask}\n<i>Example: ${esc(example)}</i>` +
       (i[field] ? `\n\nCurrent: <code>${esc(i[field])}</code>` : ''),
@@ -362,7 +386,10 @@ function createAffiliateBot({ polling = false } = {}) {
         { reply_markup: { inline_keyboard: [[{ text: '↩️ Try again', callback_data: `aff:set:${field}` }]] } });
       return;
     }
-    await sendPayoutCard(msg.chat.id, msg.from, `✅ Saved: <b>${esc(affiliates.PAYOUT_FIELDS[field].label)}</b>\n`);
+    const waiting = (field === 'email' || field === 'phone') &&
+      (await store.listRequests()).some((r) => r.telegram_id === String(msg.from.id) && r.status === 'pending');
+    await sendPayoutCard(msg.chat.id, msg.from, `✅ Saved: <b>${esc(affiliates.PAYOUT_FIELDS[field].label)}</b>` +
+      (waiting ? ' — your application now shows the new one.' : '') + '\n');
   }
 
   async function saveBank(msg) {

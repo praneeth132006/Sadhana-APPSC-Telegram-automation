@@ -168,8 +168,18 @@ function approvedMessage(code) {
       : 'Students type your code at checkout in the payment bot.',
     '',
     `<i>Your code works only in the ${esc(examLabel(code.exam))} payment bot. ` +
-      'Send /codes any time to see your sales and earnings.</i>'
+      'Send /codes any time to see your sales and earnings.</i>',
+    '',
+    '🔒 <i>Your email and mobile number are now fixed. To change them, send /support.</i>'
   ].join('\n');
+}
+
+/** A code paused or resumed by the admin. */
+function codeStatusMessage(code) {
+  return code.status === 'paused'
+    ? `⏸ <b>Your code ${esc(code.code)} has been paused</b> by the admin, so students cannot use it for now.\n\n` +
+      'What you have already earned stays yours, and you can still withdraw it. Send /support to ask why.'
+    : `▶️ <b>Your code ${esc(code.code)} is active again.</b> Students can use it from now.`;
 }
 
 function rejectedMessage(request) {
@@ -188,16 +198,23 @@ function saleMessage(sale, stats) {
 }
 
 function payoutPaidMessage(payout) {
+  // Said the way it was paid: a bank transfer has no UPI ID to name.
+  const bank = payout.payout_method === 'bank';
+  const account = String(payout.account_number || '');
+  const masked = account.length > 4 ? 'X'.repeat(Math.min(account.length - 4, 8)) + account.slice(-4) : account;
   return `✅ <b>Paid: ${pricing.rupees(payout.amount_paise)}</b>\n\n` +
-    `Sent to <code>${esc(payout.upi_id)}</code> for code ${esc(payout.code)}.\n` +
-    `UPI reference: <code>${esc(payout.reference)}</code>\n\n` +
+    (bank
+      ? `Sent to your bank account <code>${esc(masked)}</code> for code ${esc(payout.code)}.\n` +
+        `Bank reference (UTR): <code>${esc(payout.reference)}</code>\n\n`
+      : `Sent to <code>${esc(payout.upi_id)}</code> for code ${esc(payout.code)}.\n` +
+        `UPI reference: <code>${esc(payout.reference)}</code>\n\n`) +
     'Thank you for promoting us!';
 }
 
 function payoutRejectedMessage(payout) {
   return `⚠️ <b>Your withdrawal ${esc(payout.payout_id)} was not paid.</b>` +
     (payout.reason ? `\n\nReason: ${esc(payout.reason)}` : '') +
-    '\n\nThe amount is back in your balance. Fix anything mentioned above (for example your UPI ID with /upi), ' +
+    '\n\nThe amount is back in your balance. Fix anything mentioned above (for example your UPI ID or bank account with /payout), ' +
     'then send /withdraw again.';
 }
 
@@ -218,5 +235,6 @@ module.exports = {
   rejectedMessage,
   saleMessage,
   payoutPaidMessage,
-  payoutRejectedMessage
+  payoutRejectedMessage,
+  codeStatusMessage
 };

@@ -1001,7 +1001,9 @@ async function handleAffiliateRoute(pathname, method, req, res, user) {
       sendJSON(res, 404, { success: false, error: result.error });
       return true;
     }
-    sendJSON(res, 200, { success: true, code: result.code, message: `${code} is ${wanted}.` });
+    const notified = await affiliateNotify.tellInfluencer(result.code.telegram_id, affiliateNotify.codeStatusMessage(result.code));
+    sendJSON(res, 200, { success: true, code: result.code,
+      message: `${code} is ${wanted}` + (notified ? ' and the influencer was told.' : '.') });
     return true;
   }
 

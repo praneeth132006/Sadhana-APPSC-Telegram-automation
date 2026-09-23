@@ -170,7 +170,9 @@ test('a code can be paused, resumed, and given new terms — and the influencer 
 
   assert.equal((await api('/api/affiliates/code', { method: 'POST', body: { code: 'RAVI10', status: 'paused' } })).json.code.status, 'paused');
   assert.equal((await store.getCode('RAVI10')).status, 'paused');
+  assert.match(told.at(-1).text, /code RAVI10 has been paused/);
   assert.equal((await api('/api/affiliates/code', { method: 'POST', body: { code: 'RAVI10', status: 'active' } })).json.code.status, 'active');
+  assert.match(told.at(-1).text, /code RAVI10 is active again/);
 
   const changed = await api('/api/affiliates/code', { method: 'POST', body: { code: 'RAVI10', terms: Object.assign({}, TERMS, { commission_value: 30 }) } });
   assert.equal(changed.status, 200, JSON.stringify(changed.json));

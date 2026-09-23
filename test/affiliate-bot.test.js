@@ -138,7 +138,7 @@ test('applying: choose an exam, give email and mobile, and the admin is alerted'
   assert.match(done[1].args[1], /ravi@gmail\.com/);
   assert.match(done[1].args[1], /9876543210/);
   assert.match(done[1].args[1], /we still need: <b>Name as on your bank account, UPI ID/);
-  assert.equal(buttons(done)[0].callback_data, 'aff:payout');
+  assert.deepEqual(buttons(done).map((b) => b.callback_data), ['aff:set:email', 'aff:set:phone', 'aff:payout']);
 
   // The contact details are on their row, ready for a payout.
   const person = await store.getInfluencer(501);
@@ -189,7 +189,52 @@ test('details already given are not asked for again, and a finished payout setup
   assert.equal(out.length, 1, 'it asked for a detail it already had');
   assert.match(out[0].args[1], /Application sent for APPSC Newspaper/);
   assert.match(out[0].args[1], /payout details are all set up/);
-  assert.ok(!buttons(out).length, 'offered payout details that are already complete');
+  assert.deepEqual(buttons(out).map((b) => b.text), ['✉️ Change email', '📱 Change mobile', '💳 Payout details']);
+});
+
+test('email and mobile can be changed while the application waits, and the admin sees the new ones', async () => {
+  const { tap, answer, book } = makeBot();
+  await tap('aff:exam:news');
+  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
+  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
+
+  const prompt = await tap('aff:set:email');
+  assert.ok(prompt[0].args[1].startsWith(PROMPT.email));
+  const saved = await answer(PROMPT.email, 'ravi.new@gmail.com');
+  assert.match(textOf(saved), /your application now shows the new one/);
+  await answer(PROMPT.phone, '9123456780');
+
+  const [header, row] = book.Requests;
+  assert.equal(row[header.indexOf('Details')], 'Email: ravi.new@gmail.com · Mobile: 9123456780');
+});
+
+test('once approved, email and mobile are locked; the rest can still change', async () => {
+  const { tap, answer, say } = makeBot();
+  await tap('aff:exam:news');
+  await answer(`${PROMPT.applyEmail}APPSC Newspaper`, 'ravi@gmail.com');
+  await answer(`${PROMPT.applyPhone}APPSC Newspaper`, '9876543210');
+  const [request] = await store.listRequests();
+  const terms = affiliates.validateTerms({ discount_type: 'percent', discount_value: 10, commission_type: 'percent',
+    commission_value: 20, payout_cycle: 'weekly', min_payout: 0 }).value;
+  await store.approveRequest(request.request_id, Object.assign({}, terms, { code: 'RAVI10' }), 'Admin');
+
+  // The card shows them locked, with no button to change them.
+  const card = await tap('aff:payout');
+  assert.match(textOf(card), /cannot be changed here/);
+  const data = buttons(card).map((b) => b.callback_data);
+  assert.ok(!data.includes('aff:set:email') && !data.includes('aff:set:phone'), 'offered to change a locked detail');
+  assert.ok(data.includes('aff:set:upi_id'));
+
+  // An old button, a stale prompt or a typed address is refused all the same.
+  assert.match(textOf(await tap('aff:set:email')), /cannot be changed once your application is approved/);
+  assert.match(textOf(await answer(PROMPT.phone, '9123456780')), /cannot be changed/);
+  assert.match(textOf(await say('other@gmail.com')), /cannot be changed/);
+  const person = await store.getInfluencer(501);
+  assert.equal(person.email, 'ravi@gmail.com');
+  assert.equal(person.phone, '9876543210');
+
+  // Other payout details are unaffected.
+  assert.match(textOf(await answer(PROMPT.upi, 'ravi@okicici')), /Saved: <b>UPI ID/);
 });
 
 test('a second application for the same exam is stopped before anything is typed', async () => {

@@ -286,7 +286,14 @@ async function upsertInfluencer(user, patch = {}) {
 async function setPayoutField(user, field, raw) {
   const checked = affiliates.checkPayoutField(field, raw);
   if (!checked.ok) return { ok: false, reason: checked.reason };
-  const current = (await getInfluencer(user.id || user.telegram_id)) || {};
+  const id = String(user.id || user.telegram_id);
+  const current = (await getInfluencer(id)) || {};
+  // Email and mobile are what the admin approved: once a code exists they
+  // can be filled in if missing, but not changed from the bot.
+  if (CONTACT_FIELDS.includes(field) && current[field] && current[field] !== checked.value &&
+      await contactLocked(id)) {
+    return { ok: false, locked: true, reason: CONTACT_LOCKED_REASON };
+  }
   const patch = { [field]: checked.value };
   // Giving a UPI ID or bank account also says how they want to be paid,
   // unless they already chose the other with its details in place.
@@ -296,7 +303,34 @@ async function setPayoutField(user, field, raw) {
   const saved = await upsertInfluencer(user, patch);
   await log(`Influencer ${saved.telegram_id}`, `${field}_set`, saved.telegram_id,
     field === 'account_number' ? affiliates.maskAccount(checked.value) : checked.value);
+  if (CONTACT_FIELDS.includes(field)) await refreshPendingDetails(saved);
   return { ok: true, influencer: saved, value: checked.value };
+}
+
+/** The details the admin approves an application on. */
+const CONTACT_FIELDS = ['email', 'phone'];
+const CONTACT_LOCKED_REASON = 'Your email and mobile number cannot be changed once your application is approved. ' +
+  'To change them, send /support and ask the admin.';
+
+/** An application's Details line, from the influencer's row. */
+function contactDetails(influencer) {
+  return `Email: ${influencer.email || '—'} · Mobile: ${influencer.phone || '—'}`;
+}
+
+/** True once the admin has approved any application: they hold a code. */
+async function contactLocked(telegramId) {
+  const id = String(telegramId);
+  return (await listCodes()).some((c) => c.telegram_id === id);
+}
+
+/** Keeps a waiting application's Details in step with a changed email or mobile. */
+async function refreshPendingDetails(influencer) {
+  const { rows, columns } = await read('requests');
+  const details = contactDetails(influencer);
+  const updates = rows
+    .filter((r) => r.telegram_id === String(influencer.telegram_id) && r.status === 'pending' && r.details !== details)
+    .map((r) => ({ row: r._row, object: Object.assign({}, r, { details }) }));
+  if (updates.length) await update('requests', columns, updates);
 }
 
 /** Kept for the /upi command and older callers. */
@@ -365,9 +399,11 @@ async function createRequest(user, examId, details) {
     if (rows.some((r) => r.telegram_id === id && r.exam === exam.id && r.status === 'pending')) {
       return { ok: false, reason: `Your application for ${exam.label} is already with the admin.` };
     }
-    const held = codes.find((c) => c.telegram_id === id && c.exam === exam.id && c.status === 'active');
+    const held = codes.find((c) => c.telegram_id === id && c.exam === exam.id);
     if (held) {
-      return { ok: false, reason: `You already have the code ${held.code} for ${exam.label}. Send /codes to see it.` };
+      return { ok: false, reason: held.status === 'active'
+        ? `You already have the code ${held.code} for ${exam.label}. Send /codes to see it.`
+        : `Your code ${held.code} for ${exam.label} is ${held.status}. Send /support to ask the admin about it.` };
     }
 
     await upsertInfluencer(user);
@@ -870,6 +906,9 @@ module.exports = {
   upsertInfluencer,
   setUpi,
   setPayoutField,
+  contactLocked,
+  contactDetails,
+  CONTACT_LOCKED_REASON,
   setBankAccount,
   setPayoutMethod,
   recordLinkOpen,

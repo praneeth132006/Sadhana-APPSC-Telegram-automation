@@ -411,3 +411,23 @@ test('a link open is recorded once per student, never for the influencer or an u
   const [open] = await store.listOpens();
   assert.deepEqual([open.code, open.student_id, open.student_name], [code.code, '900', 'Kiran']);
 });
+
+test('a paused code for an exam stops a fresh application for it', async () => {
+  fresh();
+  const code = await approvedCode();
+  await store.setCodeStatus(code.code, 'paused', 'Admin');
+  const again = await store.createRequest(RAVI, 'news', 'Email: ravi@gmail.com · Mobile: 9876543210');
+  assert.equal(again.ok, false);
+  assert.match(again.reason, /is paused/);
+});
+
+test('the paid message names a bank transfer as one, not as UPI', () => {
+  const notify = require('../src/affiliate-notify');
+  const bank = notify.payoutPaidMessage({ payout_method: 'bank', account_number: '123456789012', amount_paise: 5000,
+    code: 'RAVI10', reference: 'UTR123', upi_id: '' });
+  assert.match(bank, /bank account <code>XXXXXXXX9012/);
+  assert.match(bank, /Bank reference \(UTR\): <code>UTR123/);
+  assert.doesNotMatch(bank, /UPI/);
+  const upi = notify.payoutPaidMessage({ payout_method: 'upi', upi_id: 'ravi@okicici', amount_paise: 5000, code: 'RAVI10', reference: 'R1' });
+  assert.match(upi, /Sent to <code>ravi@okicici/);
+});
