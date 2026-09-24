@@ -513,6 +513,8 @@ async function sampleQuestions(ctx, subject, count = 3) {
     .filter((q) => q.question_text && q.option_a && q.option_b && q.option_c && q.option_d &&
       /^[ABCD]$/.test(String(q.correct_answer || '').toUpperCase()) &&
       !['Rejected', 'Archived', 'Deleted', 'Draft'].includes(String(q.status || '')))
+    // Oldest first by sheet row, so the taster is the same every time.
+    .sort((a, b) => (Number(a.excel_row) || 0) - (Number(b.excel_row) || 0))
     .slice(0, count);
 }
 

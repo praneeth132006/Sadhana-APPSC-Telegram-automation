@@ -636,3 +636,23 @@ test('a marked question can still be put back deliberately', async () => {
   const queue = await DIRECT.getUnpostedQuestions(ctx, 'Physics', 10, true);
   assert.deepEqual(queue.map((q) => q.excel_row), [2], 'it is eligible again, on purpose');
 });
+
+test('sample questions are the oldest complete ones, so new posts never change the taster', async () => {
+  const book = { Physics: [HEADERS,
+    question(1, { Status: 'Draft' }),                 // not ready
+    question(2, { 'Option C': '' }),                  // incomplete
+    question(3, { 'Correct Answer': 'E' }),           // unreadable answer
+    question(4, { Status: 'Posted', Posted: 'YES' }), // posted is fine: it is a real question
+    question(5),
+    question(6),
+    question(7)
+  ] };
+  fakeSheets(book);
+  const first = await DIRECT.sampleQuestions(ctx, 'Physics', 3);
+  assert.deepEqual(first.map((q) => q.question_id), ['PHY-4', 'PHY-5', 'PHY-6']);
+
+  // New questions are appended; the three stay the same.
+  book.Physics.push(question(8), question(9));
+  const later = await DIRECT.sampleQuestions(ctx, 'Physics', 3);
+  assert.deepEqual(later.map((q) => q.question_id), ['PHY-4', 'PHY-5', 'PHY-6']);
+});

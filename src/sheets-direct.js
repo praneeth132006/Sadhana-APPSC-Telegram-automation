@@ -447,8 +447,9 @@ async function getBotSettings(ctx) {
 async function sampleQuestions(ctx, subject, count = 3) {
   const { map, rows } = await readTab(ctx, subject);
   const out = [];
-  // Newest first: the most recent questions are the ones worth showing off.
-  for (let i = rows.length - 1; i >= 0 && out.length < count; i--) {
+  // Oldest first: the taster must be the same questions every time, and new
+  // questions are appended at the bottom, so the top of the tab never moves.
+  for (let i = 0; i < rows.length && out.length < count; i++) {
     const q = rowToQuestion(rows[i], map, subject, i);
     const options = [q.option_a, q.option_b, q.option_c, q.option_d].map((o) => String(o || '').trim());
     if (!q.question_text || options.some((o) => !o)) continue;

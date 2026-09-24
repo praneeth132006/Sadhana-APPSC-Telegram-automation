@@ -183,6 +183,91 @@ test('the questions come one at a time, and the pass follows the last one', asyn
   assert.ok(!data.some((d) => /^smp:/.test(d)), 'it asked for a fourth question');
 });
 
+// ---------------------------------------------------------------------------
+// The same three, every time
+// ---------------------------------------------------------------------------
+
+/** A sheet with real subjects: each tab's questions oldest first, as sheets-direct reads them. */
+function subjectSheet(tabs, order = Object.keys(tabs)) {
+  const calls = [];
+  return {
+    calls,
+    forGroup: (groupId) => ({
+      groupId,
+      getBotSettings: async () => ({}),
+      readConfig: async () => order.map((subject) => ({ subject })),
+      sampleQuestions: async (subject, count) => {
+        calls.push(subject);
+        if (tabs[subject] instanceof Error) throw tabs[subject];
+        return (tabs[subject] || []).slice(0, count);
+      },
+      getSubscriber: async () => null,
+      getCoupon: async () => null
+    })
+  };
+}
+const q = (id, subject) => ({ question_id: id, subject, question_text: `${id} question?`, option_a: 'A1', option_b: 'B1',
+  option_c: 'C1', option_d: 'D1', correct_answer: 'A', explanation: 'x', status: 'Posted' });
+const TABS = {
+  Polity: [q('POL-1', 'Polity'), q('POL-2', 'Polity'), q('POL-3', 'Polity')],
+  Economy: [q('ECO-1', 'Economy'), q('ECO-2', 'Economy')],
+  History: [q('HIS-1', 'History')],
+  Geography: [q('GEO-1', 'Geography')]
+};
+
+/** The three questions one student sees, start to finish, each tap on a brand-new server. */
+async function threeQuestions(sheet) {
+  const seen = [];
+  const pollText = (out) => polls(out).map((p) => p.args[1]).join('');
+  sheets.forGroup = sheet.forGroup;
+  seen.push(pollText(await makeBotOver(sheet).tap('go:plans')));
+  seen.push(pollText(await makeBotOver(sheet).tap('smp:upsc:1')));
+  seen.push(pollText(await makeBotOver(sheet).tap('smp:upsc:2')));
+  return seen.map((t) => (t.match(/[A-Z]{3}-\d+/) || [''])[0]);
+}
+function makeBotOver(sheet) {
+  const bot = makeBot();
+  sheets.forGroup = sheet.forGroup;
+  return bot;
+}
+
+test('every student sees the same three questions, one from each of the first subjects, oldest first', async () => {
+  const sheet = subjectSheet(TABS);
+  const first = await threeQuestions(sheet);
+  assert.deepEqual(first, ['POL-1', 'ECO-1', 'HIS-1'], 'one per subject, in Config order, oldest of each');
+  for (let run = 0; run < 5; run++) {
+    assert.deepEqual(await threeQuestions(sheet), first, `run ${run} saw different questions`);
+  }
+  assert.ok(!sheet.calls.includes('Geography'), 'it read a fourth subject it did not need');
+});
+
+test('posting new questions does not change the three', async () => {
+  const tabs = JSON.parse(JSON.stringify(TABS));
+  const before = await threeQuestions(subjectSheet(tabs));
+  // New questions are appended at the bottom of each tab.
+  tabs.Polity.push(q('POL-99', 'Polity'));
+  tabs.Economy.push(q('ECO-99', 'Economy'));
+  tabs.History.push(q('HIS-99', 'History'));
+  assert.deepEqual(await threeQuestions(subjectSheet(tabs)), before);
+});
+
+test('an empty or unreadable subject is skipped, and the next one fills in', async () => {
+  const tabs = Object.assign({}, TABS, { Economy: [], History: new Error('tab missing') });
+  assert.deepEqual(await threeQuestions(subjectSheet(tabs, ['Polity', 'Economy', 'History', 'Geography'])),
+    ['POL-1', 'GEO-1', 'POL-2']);
+});
+
+test('with fewer subjects than questions, it goes round again rather than repeating one', async () => {
+  const tabs = { Polity: TABS.Polity, Economy: TABS.Economy };
+  assert.deepEqual(await threeQuestions(subjectSheet(tabs)), ['POL-1', 'ECO-1', 'POL-2']);
+});
+
+test('the same question listed under two subjects is shown once', async () => {
+  const dup = q('POL-1', 'Polity');
+  const tabs = { Polity: [dup, q('POL-2', 'Polity')], Current: [dup, q('CUR-1', 'Current')] };
+  assert.deepEqual(await threeQuestions(subjectSheet(tabs)), ['POL-1', 'POL-2', 'CUR-1']);
+});
+
 test('the admin can ask for a different number of questions, or none at all', async () => {
   const two = makeBot({ settings: { sample_questions: '2' } });
   const out = await two.tap('go:plans');

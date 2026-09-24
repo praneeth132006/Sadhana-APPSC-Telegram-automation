@@ -974,15 +974,29 @@ function createPaymentBot({ payBotEnv, polling = false }) {
   const SAMPLE_CACHE_MS = 10 * 60 * 1000;
 
   /**
-   * samplesFor — a few complete questions from this group's sheet.
+   * samplesFor — the same few complete questions from this group's sheet,
+   * every time, for every student.
    *
-   * Subjects are tried in a random order so two students rarely see the same
-   * three, and an empty subject is simply skipped. Never throws: no samples
-   * means the pass is shown straight away, which is where this started.
+   * Fixed on purpose: the taster is the bot's shop window, and it used to be
+   * a different three on every /start (subjects shuffled, newest questions
+   * first, chosen per server). Worse, Next could land on another server that
+   * had chosen a different set, so a student could see a question twice or
+   * skip one. Now the choice is a pure function of the sheet:
+   *
+   *   - subjects in the Config tab's order;
+   *   - from each, its OLDEST complete question — so posting new questions
+   *     every day never changes it;
+   *   - one per subject, taking from the next subject for variety, and going
+   *     round again only if there are fewer subjects than questions wanted.
+   *
+   * An empty or unreadable subject is skipped. Never throws: no samples means
+   * the pass is shown straight away.
    */
   async function samplesFor(group, wanted) {
   const held = sampleCache.get(group.id);
-  if (held && Date.now() - held.at < SAMPLE_CACHE_MS && held.questions.length >= wanted) return held.questions;
+  if (held && Date.now() - held.at < SAMPLE_CACHE_MS && held.questions.length >= wanted) {
+    return held.questions.slice(0, wanted);
+  }
 
   const sheet = sheetFor(group.id);
   let subjects = [];
@@ -992,15 +1006,31 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     console.error(`[bot] ${payBotEnv}: could not read subjects for samples — ${err.message}`);
     return [];
   }
-  const shuffled = subjects.sort(() => Math.random() - 0.5);
-  const out = [];
-  for (const subject of shuffled.slice(0, 4)) {
+
+  // Candidates per subject, in Config order, until there are enough subjects.
+  const perSubject = [];
+  for (const subject of subjects) {
+    if (perSubject.length >= wanted) break;
     try {
-      out.push(...await sheet.sampleQuestions(subject, wanted - out.length));
+      const questions = await sheet.sampleQuestions(subject, wanted);
+      if (questions && questions.length) perSubject.push(questions);
     } catch (err) {
       // A subject tab that will not read is not worth failing the welcome over.
     }
-    if (out.length >= wanted) break;
+  }
+
+  // Round-robin: the first of each subject, then the second of each, …
+  const out = [];
+  const seen = new Set();
+  for (let round = 0; out.length < wanted && perSubject.some((qs) => qs.length > round); round++) {
+    for (const questions of perSubject) {
+      const q = questions[round];
+      if (!q || out.length >= wanted) continue;
+      const key = q.question_id || `${q.subject}|${q.question_text}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(q);
+    }
   }
   sampleCache.set(group.id, { at: Date.now(), questions: out });
   return out;
