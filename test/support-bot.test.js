@@ -232,23 +232,29 @@ test('a screenshot reply is copied to the admin chat under the ticket header', a
   assert.equal(copy.args[3].parse_mode, undefined, 'captions are plain text');
 });
 
-test('a free-typed message is offered to support, and tapping Send raises it', async () => {
+test('a free-typed message is never offered to support — it points back to joining', async () => {
   const { deliver, sheet, messages } = makeBot();
-  const typed = privateMessage('my link does not work');
+  const typed = privateMessage('hi');
   await deliver(typed);
 
-  const [offer] = messages(STUDENT.id);
-  assert.equal(offer.args[2].reply_to_message_id, typed.message.message_id);
-  assert.ok(offer.args[2].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === 'sup:send'));
+  const [reply] = messages(STUDENT.id);
+  assert.match(reply.args[1], /To join, tap <b>Continue<\/b> below 👇/);
+  assert.doesNotMatch(reply.args[1], /support/i, 'students were being invited to message support');
+  assert.equal(reply.args[2].reply_to_message_id, typed.message.message_id);
+  const buttons = reply.args[2].reply_markup.inline_keyboard.flat();
+  assert.deepEqual(buttons.map((b) => [b.text, b.callback_data]), [['Continue ⬇️', 'go:plans']]);
+  assert.equal(sheet.calls.filter((c) => c.name === 'createTicket').length, 0, 'a ticket was raised from chatter');
+});
 
+test('an old "Send to support" button from before still raises the ticket it offered', async () => {
+  const { deliver, sheet } = makeBot();
+  const typed = privateMessage('my link does not work');
   await deliver(tap('sup:send', {
     message_id: 555, from: BOT, chat: { id: STUDENT.id, type: 'private' }, text: 'Would you like…',
     reply_to_message: typed.message
   }));
-
   const created = sheet.calls.find((c) => c.name === 'createTicket');
   assert.equal(created.args[0].message, 'my link does not work');
-  assert.equal(created.args[0].category, 'other');
 });
 
 test('Send refuses a message that belongs to someone else', async () => {
@@ -348,7 +354,7 @@ test('a recently closed ticket is reopened when the student types again; a stale
   const fresh = makeBot({ sheet: stale });
   await fresh.deliver(privateMessage('new problem'));
   assert.equal(stale.calls.filter((c) => c.name === 'appendTicketMessage').length, 0);
-  assert.match(fresh.messages(STUDENT.id)[0].args[1], /send this message to our support team/);
+  assert.match(fresh.messages(STUDENT.id)[0].args[1], /To join, tap <b>Continue<\/b>/);
 });
 
 test('an open ticket is preferred over a recently closed one', async () => {
@@ -362,11 +368,11 @@ test('an open ticket is preferred over a recently closed one', async () => {
   await deliver(privateMessage('any update?'));
   assert.equal(sheet.calls.find((c) => c.name === 'appendTicketMessage').args[0], 'T-260917-OPEN');
 });
-test('if the sheet cannot say whether a ticket is open, the student is still offered support', async () => {
+test('if the sheet cannot say whether a ticket is open, the student is still answered', async () => {
   const sheet = fakeSheet({ listTickets: () => { throw new Error('Unknown GET action: listTickets'); } });
   const { deliver, messages } = makeBot({ sheet });
   await deliver(privateMessage('hello'));
-  assert.match(messages(STUDENT.id)[0].args[1], /send this message to our support team/);
+  assert.match(messages(STUDENT.id)[0].args[1], /To join, tap <b>Continue<\/b>/);
 });
 
 test('a reply to a message some other bot sent is not treated as a ticket', async () => {

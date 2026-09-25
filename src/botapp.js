@@ -2559,19 +2559,16 @@ function createPaymentBot({ payBotEnv, polling = false }) {
     return;
   }
 
-  // Otherwise offer to turn it into a ticket. The offer replies to the
-  // message, so the tap can find it again without any stored state.
+  // Otherwise point the way back to joining. This used to offer to send the
+  // message to support ("Would you like to send this message to our support
+  // team?"), and students who only typed "hi" or "ok" while deciding filed
+  // tickets by accident. Support is still one command away: /support.
   await bot.sendMessage(msg.chat.id,
-    'Would you like to send this message to our support team?',
+    '👋 To join, tap <b>Continue</b> below 👇 to see the questions and the pass.',
     {
+      parse_mode: 'HTML',
       reply_to_message_id: msg.message_id,
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📨 Send to support', callback_data: 'sup:send' }],
-          [{ text: '🆘 Browse help topics', callback_data: 'sup:menu' }],
-          [{ text: '✖️ No thanks', callback_data: 'sup:dismiss' }]
-        ]
-      }
+      reply_markup: { inline_keyboard: [[{ text: 'Continue ⬇️', callback_data: 'go:plans' }]] }
     });
   });
 
